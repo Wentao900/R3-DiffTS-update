@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.idea/
+.vscode/
+
+# Model/cache folders
+Qwen2.5-7B-Instruct/
+gpt2-medium/
+bert-base-uncased/
+
+# Training artifacts
+save/
+logs/
+
+# Weights/checkpoints
+*.pt
+*.pth
+*.bin

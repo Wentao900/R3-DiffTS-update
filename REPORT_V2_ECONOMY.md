@@ -4,23 +4,24 @@
 
 当前仓库已固定为 `Economy V2` 主线版本，`V3 / V3.1` 的文本候选路由方案已从可运行主路径中移除。
 
-固定配置文件：
+当前推荐配置文件：
 
-- `config/economy_36_12_v2_locked.yaml`
+- `config/economy_36_12_scale_router_guide.yaml`
 
-固定评测设置：
+当前评测设置：
 
 - `seq_len = 36`
 - `pred_len = 12`
 - `text_len = 36`
-- `guide_w = 0.5`
+- `guide_w` 由验证集从候选集合中自动选择
 
-当前保留结果：
+当前最新结果：
 
-- Checkpoint: `save/forecasting_Economy_20260312_190617`
-- Metric file: `save/forecasting_Economy_20260312_190617/eval_metrics_guide_0p5.json`
-- `MSE = 0.25936130784515643`
-- `MAE = 0.37253749880016357`
+- Checkpoint: `save/forecasting_Economy_20260312_194619`
+- Metric file: `save/forecasting_Economy_20260312_194619/eval_metrics_guide_1p4.json`
+- 验证集选出的 `guide_w = 1.4`
+- `MSE = 0.2496992787744245`
+- `MAE = 0.3801771555191431`
 
 最终建议：`Economy` 任务后续全部以 `V2` 为基线，不再继续 `V3 / V3.1` 方向。
 
@@ -244,10 +245,16 @@ $$
 g_i = r_i \cdot g_0
 $$
 
-固定基准引导系数为：
+当前这次最新实验中，验证候选集合为：
 
 $$
-g_0 = 0.5
+\mathcal{G} = \{0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4\}
+$$
+
+最终选中的基准引导系数为：
+
+$$
+g_0 = 1.4
 $$
 
 最终采样公式变成：
@@ -325,37 +332,36 @@ $$
 
 ## 5. 固定配置
 
-最终固定配置文件：
+当前使用配置文件：
 
-- `config/economy_36_12_v2_locked.yaml`
+- `config/economy_36_12_scale_router_guide.yaml`
 
-该配置明确锁定：
+该配置当前关键项为：
 
-- `guide_w_candidates: [0.5]`
-- `guide_w_default: 0.5`
+- `guide_w_default: 0.8`
+- `guide_w_candidates: [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4]`
 - `seq_len: 36`
 - `pred_len: 12`
 - `text_len: 36`
 
-这意味着后续复现实验时不会再因为 guide sweep 或参数漂移而跑到其他版本。
+实际运行时，本次实验最终由验证集自动选择 `guide_w = 1.4`。
 
 ## 6. 复现实验命令
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python exe_forecasting.py \
-  --config economy_36_12_v2_locked.yaml \
-  --datatype multimodal \
-  --data custom \
-  --root_path /root/autodl-tmp/Time-MMD-main \
+python -u exe_forecasting.py \
+  --root_path ../Time-MMD-main \
   --data_path Economy/Economy.csv \
-  --device cuda:0 \
-  --seed 2025 \
-  --nsample 15
+  --config economy_36_12_scale_router_guide.yaml \
+  --seq_len 36 \
+  --pred_len 12 \
+  --text_len 36 \
+  --freq m
 ```
 
 注意：
 
-- 正确数据根目录是 `/root/autodl-tmp/Time-MMD-main`
+- 当前命令使用相对路径 `../Time-MMD-main`
 - `data_path` 应写为 `Economy/Economy.csv`
 - 不要再写成 `Time-MMD-main/numerical/Economy/Economy.csv`
 
@@ -379,4 +385,3 @@ CUDA_VISIBLE_DEVICES=0 python exe_forecasting.py \
 1. 以当前 `V2` 作为唯一基线版本
 2. 只在 `guide_w=0.5` 固定条件下继续做细化 ablation
 3. 后续若要继续优化，优先动 `router` 和 `multi-resolution loss`，不要再回到文本候选路由
-

@@ -69,6 +69,43 @@ CoT is promoted from a text condition to a diffusion-path modulation signal.
 - `--guide_w -1` triggers the built-in sweep list (includes `4.5`).
 - To override, pass a fixed `--guide_w` or run your own loop.
 
+## Current Economy V2 baseline
+- Active config: `config/economy_36_12_scale_router_guide.yaml`
+- Task setup: `seq_len=36`, `pred_len=12`, `text_len=36`, `freq=m`
+- Current report only records validation-time guide selection, not test metrics.
+- Validation selection file: `save/forecasting_Economy_20260312_194619/selected_guide_w.json`
+- Selected guide weight on validation: `1.4`
+- Best validation MSE: `0.14063129197983515`
+
+Validation guide sweep:
+- `0.4 -> 0.1933452288309733`
+- `0.5 -> 0.18269025257655552`
+- `0.6 -> 0.17350386664980932`
+- `0.7 -> 0.16563423247564407`
+- `0.8 -> 0.15907128197806222`
+- `0.9 -> 0.15369917097545804`
+- `1.0 -> 0.1493416014171782`
+- `1.2 -> 0.14333132335117885`
+- `1.4 -> 0.14063129197983515`
+
+Recommended Economy command:
+```bash
+python -u exe_forecasting.py \
+  --root_path ../Time-MMD-main \
+  --data_path Economy/Economy.csv \
+  --config economy_36_12_scale_router_guide.yaml \
+  --seq_len 36 \
+  --pred_len 12 \
+  --text_len 36 \
+  --freq m
+```
+
+Notes:
+- Use `../Time-MMD-main` as `root_path`.
+- Use `Economy/Economy.csv` as `data_path`.
+- Do not pass `Time-MMD-main/numerical/Economy/Economy.csv`.
+- Detailed method notes are documented in `REPORT_V2_ECONOMY.md`.
+
 ## Debug
 Use `debug_two_stage_rag.py` to inspect Q1/E0/z0/Q2/E1 and the composed text preview.
 

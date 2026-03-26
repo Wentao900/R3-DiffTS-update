@@ -1,6 +1,6 @@
-# R3-DiffTS full pipeline config: traffic seq=36 pred=6
-# Includes: RAG+CoT, Two-Stage RAG, Trend-aware CFG, Multi-res Loss, Scale Router
-
+seq_len: 36
+pred_len: 6
+text_len: 36
 train:
   epochs: 150
   batch_size: 32
@@ -22,6 +22,22 @@ train:
   scale_router_use_text_mask: true
   scale_router_teacher_weight: 0.1
   scale_router_warmup_steps: 400
+  multi_res_horizons:
+  - 1
+  - 2
+  - 4
+  - 6
+  multi_res_weight_mode: 'off'
+  multi_res_weight_focus: hard
+  multi_res_weight_beta: 0.95
+  multi_res_weight_temp: 1.0
+  multi_res_weight_strength: 0.3
+  multi_res_weight_alpha: 0.7
+  multi_res_weight_floor: 0.15
+  multi_res_weight_warmup_steps: 400
+  scale_router_temp: 1.0
+  scale_router_teacher_mix: 0.2
+  scale_router_teacher_hard_only: false
 diffusion:
   layers: 4
   channels: 64
@@ -64,3 +80,21 @@ model:
   rag_stage2_topk: 3
   cot_temperature: 0.4
   cot_max_new_tokens: 64
+  cot_model: ./gpt2-medium
+  dynamic_text_len: true
+  dynamic_text_lens:
+  - 6
+  - 18
+  - 36
+  scale_aware_rag: true
+  guide_w_default: 0.8
+  guide_w_candidates:
+  - 0.4
+  - 0.5
+  - 0.6
+  - 0.7
+  - 0.8
+  - 0.9
+  - 1.0
+  - 1.2
+  - 1.4

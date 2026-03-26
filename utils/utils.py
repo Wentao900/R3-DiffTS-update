@@ -14,8 +14,18 @@ def train(
     valid_loader=None,
     valid_epoch_interval=10,
     foldername="",
+    use_amp=True,
 ):
     optimizer = Adam(model.parameters(), lr=float(config["lr"]), weight_decay=1e-6)
+
+    # FP16 mixed precision setup
+    device_is_cuda = next(model.parameters()).is_cuda if len(list(model.parameters())) > 0 else False
+    amp_enabled = use_amp and device_is_cuda
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    if amp_enabled:
+        print("[AMP] FP16 mixed precision training ENABLED")
+    else:
+        print("[AMP] Mixed precision training disabled (CPU or use_amp=False)")
     if foldername != "":
         output_path = foldername + "/model.pth"
 
@@ -33,10 +43,14 @@ def train(
             for batch_no, train_batch in enumerate(it, start=1):
                 optimizer.zero_grad()
 
-                loss = model(train_batch)
-                loss.backward()
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    loss = model(train_batch)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
                 avg_loss += loss.item()
-                optimizer.step()
                 it.set_postfix(
                     ordered_dict={
                         "avg_epoch_loss": avg_loss / batch_no,
@@ -54,7 +68,8 @@ def train(
             with torch.no_grad():
                 with tqdm(valid_loader, mininterval=5.0, maxinterval=50.0) as it:
                     for batch_no, valid_batch in enumerate(it, start=1):
-                        loss = model(valid_batch, is_train=0)
+                        with torch.amp.autocast("cuda", enabled=amp_enabled):
+                            loss = model(valid_batch, is_train=0)
                         avg_loss_valid += loss.item()
                         it.set_postfix(
                             ordered_dict={

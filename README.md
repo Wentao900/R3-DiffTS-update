@@ -1,201 +1,270 @@
 # R3-DiffTS
 
-**Retrieval-Reasoning-Routing Enhanced Diffusion for Time Series Forecasting**
-
-R3-DiffTS 是一个基于扩散模型的多模态时间序列预测框架。它将文本信息（新闻、报告、事件描述等）与数值时间序列深度融合，通过检索增强生成（RAG）、思维链推理（CoT）和趋势感知扩散路径调制等机制，实现更准确、更可解释的预测。
-
-> R3-DiffTS is a multimodal diffusion-based time series forecasting framework. It deeply integrates textual information (news, reports, event descriptions) with numerical time series via Retrieval-Augmented Generation (RAG), Chain-of-Thought (CoT) reasoning, and trend-aware diffusion path modulation for more accurate and interpretable forecasting.
-
-<p align="center">
-  <img src="docs/paper_style_scale_aware_architecture.svg" width="80%" alt="R3-DiffTS Architecture"/>
-</p>
+**R**etrieval · **R**easoning · **R**outing Enhanced **Diff**usion for **T**ime **S**eries Forecasting
 
 ---
 
-## ✨ Key Features
+## Overview
 
-| Module | Description |
-|--------|-------------|
-| **Multimodal Conditioned Diffusion** | CSDI-based diffusion backbone with classifier-free guidance (CFG), fusing time series and text modalities via cross-attention |
-| **RAG + CoT Guidance** | TF-IDF retrieval of relevant text evidence + Chain-of-Thought generation for structured trend reasoning |
-| **Two-Stage RAG** | Stage-1 retrieves initial evidence; Stage-2 refines retrieval using CoT-generated trend hypotheses |
-| **Trend-aware CFG** | CoT is parsed into a structured trend prior (direction/strength/volatility) that dynamically modulates CFG weights along the diffusion path |
-| **Multi-resolution Loss** | Auxiliary multi-horizon supervision within the prediction window for better scale awareness |
-| **Scale Router** | Lightweight learned router that adaptively weights multi-resolution loss bands based on time series characteristics |
-| **Timestamp-Assisted Attention (TAA)** | Joint self-attention between time series and timestamp features with learnable weighting |
-| **Text-to-Time Fusion (TTF)** | Cross-attention from text embeddings to time series representations |
+在多模态时间序列预测任务中，文本信息（新闻、宏观报告、事件描述）与数值序列的有效融合是核心挑战。现有方法通常将文本作为静态条件输入，忽略了两个关键问题：**文本质量参差不齐**、**文本影响应随去噪阶段动态变化**。
+
+R3-DiffTS 提出三阶段渐进增强策略：
+
+```
+        ┌─────────────────────────────────────────────────────┐
+        │              R3-DiffTS Pipeline                      │
+        │                                                      │
+        │   Historical Series + Raw Text                       │
+        │         │                                            │
+        │         ▼                                            │
+        │   ┌──────────┐    ┌──────────┐    ┌──────────┐      │
+        │   │Retrieval │───▶│Reasoning │───▶│ Routing  │      │
+        │   │(R)       │    │(R)       │    │(R)       │      │
+        │   │          │    │          │    │          │      │
+        │   │ TF-IDF   │    │ CoT →    │    │ Scale    │      │
+        │   │ Two-Stage│    │ Trend    │    │ Router + │      │
+        │   │ RAG      │    │ Prior →  │    │ Multi-Res│      │
+        │   │          │    │ Dynamic  │    │ Loss     │      │
+        │   │          │    │ CFG      │    │          │      │
+        │   └──────────┘    └──────────┘    └──────────┘      │
+        │         │                │               │           │
+        │         └────────────────┴───────────────┘           │
+        │                         │                            │
+        │                         ▼                            │
+        │              CSDI Diffusion Backbone                 │
+        │         (TAA + TTF + CFG Denoising)                  │
+        │                         │                            │
+        │                         ▼                            │
+        │                   Prediction ŷ                       │
+        └─────────────────────────────────────────────────────┘
+```
+
+| 阶段 | 模块 | 核心思想 |
+|------|------|---------|
+| **Retrieval** | Two-Stage RAG | 两阶段检索：先获取初始证据，再用 CoT 生成的趋势假设做二次精准检索 |
+| **Reasoning** | CoT → Trend-aware CFG | 将 CoT 推理结果从"静态文本条件"提升为"扩散去噪路径的动态控制信号" |
+| **Routing** | Multi-Res Loss + Scale Router | 轻量路由网络根据序列特征自适应分配多分辨率损失权重 |
 
 ---
 
-## 📦 Installation
+## Method Details
+
+### 1. Retrieval — Two-Stage RAG
+
+```
+Stage-1: TF-IDF(query=数值摘要) → 初始证据 E₀
+                ↓
+         CoT → 趋势假设 z_trend
+                ↓
+Stage-2: TF-IDF(query=趋势假设) → 补充证据 E₁
+                ↓
+         Merge(E₀, E₁) → 精选 top-k 证据
+```
+
+- 安全门控：文本为空或检索失败时自动回退到 one-shot 模式
+
+### 2. Reasoning — Trend-aware Diffusion Control
+
+CoT 输出被解析为结构化趋势先验：
+
+```
+z_trend = [direction ∈ {-1, 0, +1},  strength ∈ ℝ⁺,  volatility ∈ ℝ⁺]
+```
+
+该先验动态调制 Classifier-Free Guidance 权重：
+
+```
+ŷ_k = y_uncond + w_trend(k, z_trend) · (y_cond − y_uncond)
+
+其中：
+  w_trend(k) = α · g(k) · h(z_trend)
+  g(k) = (1 − k/K)^p + floor        ← 时间调制：后期去噪时文本影响更强
+  h(z) = (1 + s·strength) / (1 + v·volatility)  ← 趋势调制：强趋势→强引导，高波动→抑制引导
+```
+
+### 3. Routing — Scale-aware Multi-resolution Supervision
+
+将预测窗口划分为多个 band（如 `[1-3, 4-6, 7-12]`），Scale Router 根据序列特征自适应分配各 band 权重：
+
+```
+Router 输入: [slope, volatility, diff_std, accel, mean_abs, log_scale, trend_prior, text_mask]
+       ↓
+    MLP → Softmax → band weights w₁, w₂, ..., wₙ
+       ↓
+    L_multi_res = Σᵢ wᵢ · Huber(pred_bandᵢ − gt_bandᵢ)
+```
+
+---
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**Dependencies**: PyTorch ≥ 2.5, Transformers ≥ 4.51, scikit-learn, pandas, numpy, linear-attention-transformer
+**核心依赖**: PyTorch ≥ 2.5, Transformers ≥ 4.51, scikit-learn, pandas, linear-attention-transformer
 
 ---
 
-## 📊 Dataset
+## Dataset
 
-We use the [Time-MMD](https://github.com/adityalab/time-mmd) benchmark, which contains 8 multimodal time series datasets:
+基准测试集：[Time-MMD](https://github.com/adityalab/time-mmd)（8 个多模态时间序列数据集）
 
-| Domain | Dataset | Frequency | Recommended `seq_len` |
-|--------|---------|-----------|----------------------|
-| Economy | Economy | Monthly | 36 |
-| Traffic | Traffic | Monthly | 36 |
-| Agriculture | Agriculture | Monthly | 36 |
-| Social Good | SocialGood | Monthly | 36 |
-| Energy | Energy | Weekly | 96 |
-| Health | Health_US | Weekly | 96 |
-| Climate | Climate | Weekly | 96 |
-| Environment | Environment | Daily | 336 |
+| 数据集 | 频率 | `seq_len` | `pred_len` | `freq` |
+|--------|------|-----------|------------|--------|
+| Economy | 月 | 36 | 6 / 12 / 18 | m |
+| Traffic | 月 | 36 | 6 / 12 / 18 | m |
+| Agriculture | 月 | 36 | 6 / 12 / 18 | m |
+| SocialGood | 月 | 36 | 6 / 12 / 18 | m |
+| Energy | 周 | 96 | 12 / 24 / 48 | w |
+| Health_US | 周 | 96 | 12 / 24 / 48 | w |
+| Climate | 周 | 96 | 12 / 24 / 48 | w |
+| Environment | 日 | 336 | 48 / 96 / 192 | d |
 
-Download [Time-MMD](https://github.com/adityalab/time-mmd) and place it at `../Time-MMD-main` relative to this repository.
+```bash
+# 将数据集放置在仓库同级目录
+git clone https://github.com/adityalab/time-mmd ../Time-MMD-main
+```
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-### Train & Evaluate (all datasets, baseline)
+### Baseline（全部 8 个数据集）
 
 ```bash
 bash run.sh
 ```
 
-### Train & Evaluate (all datasets, full pipeline)
+### Full Pipeline（全部模块开启）
 
 ```bash
 bash run_full.sh
 ```
 
-> This uses `*_full.yaml` configs which enable all modules: RAG+CoT, Two-Stage RAG, Trend-aware CFG, Multi-resolution Loss, and Scale Router.
-
-### Single dataset example
+### 单个数据集
 
 ```bash
+# Baseline
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
   --data_path Economy/Economy.csv \
   --config economy_36_12.yaml \
   --seq_len 36 --pred_len 12 --text_len 36 --freq m
-```
 
-### With RAG + CoT guidance
-
-```bash
+# Full pipeline
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
   --data_path Economy/Economy.csv \
-  --config economy_36_12.yaml \
-  --seq_len 36 --pred_len 12 --text_len 36 --freq m \
-  --use_rag_cot
-```
-
-### With Trend-aware CFG
-
-```bash
-python -u exe_forecasting.py \
-  --root_path ../Time-MMD-main \
-  --data_path Economy/Economy.csv \
-  --config economy_36_12.yaml \
-  --seq_len 36 --pred_len 12 --text_len 36 --freq m \
-  --use_rag_cot --trend_cfg \
-  --trend_cfg_power 1.0 --trend_strength_scale 0.35 \
-  --trend_volatility_scale 1.0 --trend_time_floor 0.30
+  --config economy_36_12_full.yaml \
+  --seq_len 36 --pred_len 12 --text_len 36 --freq m
 ```
 
 ---
 
-## ⚙️ Key Configuration
+## Ablation Experiments
 
-### YAML Config (`config/*.yaml`)
+提供 6 组消融实验 + 1 组对照，验证 3 大创新点的独立贡献：
+
+| ID | 配置 | R (文本增强) | D (趋势调制) | S (多尺度) |
+|----|------|:---:|:---:|:---:|
+| E0 | Baseline | ❌ | ❌ | ❌ |
+| E1 | +R | ✅ | ❌ | ❌ |
+| E2 | +R+D | ✅ | ✅ | ❌ |
+| E3 | Full | ✅ | ✅ | ✅ |
+| E4 | w/o D | ✅ | ❌ | ✅ |
+| E5 | w/o R | ❌ | ✅ | ✅ |
+| E2' | +R+D_random | ✅ | 🎲 | ❌ |
+
+```bash
+# 跑全部消融
+bash run_ablation.sh
+
+# 跑指定实验
+bash run_ablation.sh e3              # 全部数据集的 Full
+bash run_ablation.sh e2 economy      # Economy 上的 +R+D
+bash run_ablation.sh all traffic     # Traffic 全部消融
+```
+
+---
+
+## Configuration
+
+### Config 文件分类
+
+```
+config/
+├── {dataset}_{seq}_{pred}.yaml          # Baseline 配置
+├── {dataset}_{seq}_{pred}_full.yaml     # 全模块配置
+└── {dataset}_{seq}_{pred}_abl_{id}.yaml # 消融配置
+```
+
+### 关键参数速查
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--use_rag_cot` | False | 启用 RAG + CoT 文本引导 |
+| `--use_two_stage_rag` | False | 启用两阶段检索 |
+| `--trend_cfg` | False | 启用趋势感知 CFG 调制 |
+| `--trend_strength_scale` | 1.0 | 趋势强度缩放因子 |
+| `--trend_time_floor` | 0.0 | 时间调制下限 |
+| `--guide_w` | -1 | CFG 权重（-1 为验证集自动选择） |
+
+### YAML 中的多尺度配置
 
 ```yaml
 train:
-  epochs: 150
-  batch_size: 32
-  lr: 0.0025
-
-diffusion:
-  layers: 6
-  channels: 64
-  nheads: 8
-  num_steps: 300
-  cfg: True            # Enable classifier-free guidance
-  c_mask_prob: 0.05    # Unconditional dropout probability
-
-model:
-  llm: "bert"          # Text encoder: bert / gpt2 / llama
-  with_texts: True     # Enable text modality
-  timestep_emb_cat: True
-  timestep_branch: True
+  multi_res_band_boundaries: [3, 6, 12]  # 预测窗口 band 划分
+  multi_res_loss_weight: 0.1              # 辅助损失权重
+  use_scale_router: true                  # 启用 Scale Router
 ```
-
-### Command-line Arguments (selected)
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--use_rag_cot` | `False` | Enable RAG + CoT text guidance |
-| `--cot_only` | `False` | Use CoT without retrieval |
-| `--use_two_stage_rag` | `False` | Enable two-stage retrieval |
-| `--trend_cfg` | `False` | Enable trend-aware CFG modulation |
-| `--trend_cfg_power` | `1.0` | Power for time schedule |
-| `--trend_strength_scale` | `1.0` | Scale for trend strength |
-| `--trend_volatility_scale` | `1.0` | Scale for volatility penalty |
-| `--trend_time_floor` | `0.0` | Floor for time schedule |
-| `--guide_w` | `-1` | CFG weight (`-1` for auto sweep) |
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 R3-DiffTS/
-├── main_model.py          # Core model: CSDI_base, ScaleRouter, multi-res loss
-├── diff_models.py         # Diffusion backbone: ResidualBlock, diff_CSDI
-├── exe_forecasting.py     # Training & evaluation entry point
-├── dataset_forecasting.py # Dataset loading dispatcher
-├── run.sh                 # Run all datasets
-├── requirements.txt       # Python dependencies
-├── config/                # YAML configs for each dataset × horizon
-│   ├── economy_36_12.yaml
-│   ├── traffic_36_12.yaml
-│   └── ...
-├── data_provider/         # Data loading & preprocessing
+├── main_model.py            # 核心模型 (CSDI_base, ScaleRouter, 多尺度损失)
+├── diff_models.py           # 扩散骨架 (ResidualBlock, diff_CSDI)
+├── exe_forecasting.py       # 训练 & 评估入口
+├── dataset_forecasting.py   # 数据集调度
+├── run.sh                   # Baseline 全数据集运行
+├── run_full.sh              # Full pipeline 全数据集运行
+├── run_ablation.sh          # 消融实验运行
+├── EXPERIMENT_ROADMAP.md    # 科研实验路线
+├── requirements.txt
+├── LICENSE
+├── config/                  # YAML 配置 (base / full / ablation)
+├── data_provider/           # 数据加载与预处理
 │   ├── data_factory.py
 │   └── data_loader.py
 ├── utils/
-│   ├── utils.py           # Train/evaluate loops
-│   ├── rag_cot.py         # RAG retrieval + CoT generation
-│   ├── trend_prior.py     # Trend prior extraction from CoT
-│   ├── prepare4llm.py     # LLM loading utilities
+│   ├── utils.py             # 训练/评估循环
+│   ├── rag_cot.py           # RAG 检索 + CoT 生成
+│   ├── trend_prior.py       # 趋势先验抽取
+│   ├── prepare4llm.py       # LLM 加载工具
 │   ├── SelfAttention_Family.py
 │   ├── timefeatures.py
 │   └── masking.py
-├── scripts/               # Training scripts for different modes
+├── scripts/                 # 模式训练脚本
 │   ├── train_baseline.sh
 │   ├── train_rag_cot.sh
 │   ├── train_rag_only.sh
 │   ├── train_cot_only.sh
 │   └── run_all_datasets_trendcfg.sh
-├── docs/                  # Architecture diagrams (SVG)
-└── LICENSE
+└── docs/                    # 架构图 (SVG)
 ```
 
 ---
 
-## 🙏 Acknowledgements
+## Acknowledgements
 
-This codebase builds upon:
-- [CSDI](https://github.com/ermongroup/CSDI) — Conditional Score-based Diffusion Model for Imputation
-- [Time-LLM](https://github.com/KimMeen/Time-LLM) — Large Language Models for Time Series
-- [MM-TSF / Time-MMD](https://github.com/adityalab/time-mmd) — Multimodal Time Series Forecasting Benchmark
+- [CSDI](https://github.com/ermongroup/CSDI) — Conditional Score-based Diffusion
+- [Time-LLM](https://github.com/KimMeen/Time-LLM) — LLM for Time Series
+- [Time-MMD](https://github.com/adityalab/time-mmd) — Multimodal TSF Benchmark
 - [Autoformer](https://github.com/thuml/Autoformer) — Decomposition Transformers
 
----
+## License
 
-## 📄 License
-
-This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.

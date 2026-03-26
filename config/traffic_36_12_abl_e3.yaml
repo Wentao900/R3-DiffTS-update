@@ -1,0 +1,71 @@
+# Ablation E3: Full(R+D+S)
+# Dataset: traffic seq=36 pred=12
+
+diffusion:
+  beta_end: 0.7
+  beta_start: 0.0001
+  c_mask_prob: 0.2
+  cfg: true
+  channels: 64
+  ddim: true
+  diffusion_embedding_dim: 128
+  is_linear: false
+  layers: 4
+  nheads: 8
+  noise_esti: false
+  num_steps: 275
+  pre_norm: false
+  sample_method: quad
+  sample_steps: 120
+  schedule: quad
+  time_weight: 0.1
+  trend_cfg: true
+  trend_cfg_power: 1.0
+  trend_strength_scale: 0.35
+  trend_volatility_scale: 1.0
+  trend_time_floor: 0.3
+  trend_cfg_random: false
+model:
+  cot_model: ./gpt2-medium
+  cot_temperature: 0.4
+  cot_max_new_tokens: 64
+  decomp: false
+  featureemb: 16
+  guide_w_default: 4.5
+  is_unconditional: 0
+  llm: bert
+  llm_layers: 0
+  multiscale_branch: false
+  num_sample_features: 64
+  rag_stage1_topk: 9
+  rag_stage2_topk: 3
+  rag_topk: 3
+  relative_size_emb_cat: false
+  target_strategy: test
+  timeemb: 128
+  timestep_branch: true
+  timestep_emb_cat: true
+  with_texts: true
+  use_rag_cot: true
+  use_two_stage_rag: true
+train:
+  batch_size: 8
+  epochs: 150
+  itr_per_epoch: 100000000.0
+  lr: 0.0001
+  multi_res_band_boundaries:
+  - 3
+  - 6
+  - 12
+  multi_res_loss_weight: 0.1
+  multi_res_use_huber: true
+  multi_res_huber_delta: 1.0
+  multi_res_mode: static_band
+  use_scale_router: true
+  scale_router_hidden_dim: 32
+  scale_router_dropout: 0.1
+  scale_router_entropy_weight: 0.001
+  scale_router_use_trend_prior: true
+  scale_router_use_text_mask: true
+  scale_router_teacher_weight: 0.1
+  scale_router_warmup_steps: 400

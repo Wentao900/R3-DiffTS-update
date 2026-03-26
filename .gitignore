@@ -23,3 +23,7 @@ logs/
 *.pt
 *.pth
 *.bin
+
+# Papers and experiment spreadsheets
+*.pdf
+*.xlsx

@@ -1,139 +1,201 @@
-# MCD-TSF
-Implementation for our paper "Multimodal Conditioned Diffusive Time Series Forecasting".
+# R3-DiffTS
 
-## Requirements
+**Retrieval-Reasoning-Routing Enhanced Diffusion for Time Series Forecasting**
+
+R3-DiffTS 是一个基于扩散模型的多模态时间序列预测框架。它将文本信息（新闻、报告、事件描述等）与数值时间序列深度融合，通过检索增强生成（RAG）、思维链推理（CoT）和趋势感知扩散路径调制等机制，实现更准确、更可解释的预测。
+
+> R3-DiffTS is a multimodal diffusion-based time series forecasting framework. It deeply integrates textual information (news, reports, event descriptions) with numerical time series via Retrieval-Augmented Generation (RAG), Chain-of-Thought (CoT) reasoning, and trend-aware diffusion path modulation for more accurate and interpretable forecasting.
+
+<p align="center">
+  <img src="docs/paper_style_scale_aware_architecture.svg" width="80%" alt="R3-DiffTS Architecture"/>
+</p>
+
+---
+
+## ✨ Key Features
+
+| Module | Description |
+|--------|-------------|
+| **Multimodal Conditioned Diffusion** | CSDI-based diffusion backbone with classifier-free guidance (CFG), fusing time series and text modalities via cross-attention |
+| **RAG + CoT Guidance** | TF-IDF retrieval of relevant text evidence + Chain-of-Thought generation for structured trend reasoning |
+| **Two-Stage RAG** | Stage-1 retrieves initial evidence; Stage-2 refines retrieval using CoT-generated trend hypotheses |
+| **Trend-aware CFG** | CoT is parsed into a structured trend prior (direction/strength/volatility) that dynamically modulates CFG weights along the diffusion path |
+| **Multi-resolution Loss** | Auxiliary multi-horizon supervision within the prediction window for better scale awareness |
+| **Scale Router** | Lightweight learned router that adaptively weights multi-resolution loss bands based on time series characteristics |
+| **Timestamp-Assisted Attention (TAA)** | Joint self-attention between time series and timestamp features with learnable weighting |
+| **Text-to-Time Fusion (TTF)** | Cross-attention from text embeddings to time series representations |
+
+---
+
+## 📦 Installation
+
 ```bash
 pip install -r requirements.txt
 ```
 
-## Datasets
-Public benchmark: [Time-MMD](https://github.com/adityalab/time-mmd)
+**Dependencies**: PyTorch ≥ 2.5, Transformers ≥ 4.51, scikit-learn, pandas, numpy, linear-attention-transformer
 
-> Note: the repository contains configs and runnable paths for multiple datasets, but the current experiment comparisons and metric-based analysis reported in this repo are only validated on `Economy`. Other datasets should be treated as reusable capabilities/examples unless a separate report states otherwise.
+---
 
-## Experiment
+## 📊 Dataset
+
+We use the [Time-MMD](https://github.com/adityalab/time-mmd) benchmark, which contains 8 multimodal time series datasets:
+
+| Domain | Dataset | Frequency | Recommended `seq_len` |
+|--------|---------|-----------|----------------------|
+| Economy | Economy | Monthly | 36 |
+| Traffic | Traffic | Monthly | 36 |
+| Agriculture | Agriculture | Monthly | 36 |
+| Social Good | SocialGood | Monthly | 36 |
+| Energy | Energy | Weekly | 96 |
+| Health | Health_US | Weekly | 96 |
+| Climate | Climate | Weekly | 96 |
+| Environment | Environment | Daily | 336 |
+
+Download [Time-MMD](https://github.com/adityalab/time-mmd) and place it at `../Time-MMD-main` relative to this repository.
+
+---
+
+## 🚀 Quick Start
+
+### Train & Evaluate (all datasets, baseline)
+
 ```bash
-bash ./run.sh
+bash run.sh
 ```
 
-## Retrieval-augmented / CoT guidance
-- `--use_rag_cot`: enable text guidance with TF-IDF retrieval + CoT generation.
-- `--cot_only`: disable retrieval; generate CoT from numeric summary + raw text only.
-- Common knobs: `--rag_topk`, `--cot_model`, `--cot_max_new_tokens`, `--cot_temperature`,
-  `--cot_cache_size`, `--cot_device`.
-- Default behavior: CoT text is concatenated with raw reports and fed into the text encoder.
-- When `--trend_cfg` is enabled, CoT is parsed into a trend prior and no longer concatenated
-  into text; it is used to modulate CFG weights along the diffusion path.
-- Optional quantized loading: `--cot_load_in_8bit` / `--cot_load_in_4bit` (requires bitsandbytes).
+### Train & Evaluate (all datasets, full pipeline)
 
-## Multi-resolution auxiliary loss (minimal change enhancement)
-Introduce a lightweight, multi-horizon supervision term inspired by multi-resolution forecasting:
-the model is encouraged to fit several horizons (e.g., {1, 3, 6, 12}) within the prediction window.
-This adds training signal without changing the model architecture.
-- Config keys (under `train`):
-  - `multi_res_horizons`: list of horizons to supervise (clipped by `pred_len`).
-  - `multi_res_loss_weight`: weight for the auxiliary loss (set to 0 to disable).
-  - `multi_res_use_huber`: use Huber loss (recommended for stability).
-  - `multi_res_huber_delta`: delta for Huber loss.
-- Example (YAML):
-  ```yaml
-  train:
-    multi_res_horizons: [1, 3, 6, 12]
-    multi_res_loss_weight: 0.1
-    multi_res_use_huber: true
-    multi_res_huber_delta: 1.0
-  ```
+```bash
+bash run_full.sh
+```
 
-## Two-stage RAG (minimal change enhancement)
-- Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
-- Stage-1: reuse the original one-shot query to retrieve E0.
-- Trend hypothesis: generated by CoT; on failure, uses a numeric template.
-- Stage-2: convert the trend hypothesis into a natural language query, retrieve E1,
-  then merge E1 with E0 (deduplicate, keep top-k).
-- Stability: gate/fallback to one-shot if raw text is empty or retrieval fails.
-- Output template is fixed:
-  `[RAW TEXT] / [NUMERICAL SUMMARY] / [TREND HYPOTHESIS] / [RETRIEVED EVIDENCE - REFINED]`.
-- Tunables: `--rag_stage1_topk`, `--rag_stage2_topk`, `--two_stage_gate`, `--trend_slope_eps`.
-- Numeric stats (`slope/std/mean`) are appended to `key_factors` to improve Stage-2 retrieval.
+> This uses `*_full.yaml` configs which enable all modules: RAG+CoT, Two-Stage RAG, Trend-aware CFG, Multi-resolution Loss, and Scale Router.
 
-## Trend-aware CFG (CoT -> trend prior)
-CoT is promoted from a text condition to a diffusion-path modulation signal.
-- Switch: `--trend_cfg`
-- Time schedule: `--trend_cfg_power`, `--trend_time_floor`
-- Trend mapping:
-  - strength: `1 + trend_strength_scale * (strength - 1)`
-  - volatility: `1 / (1 + trend_volatility_scale * volatility)`
-- Tunables: `--trend_strength_scale`, `--trend_volatility_scale`, `--trend_time_floor`,
-  `--trend_cfg_random`
-- Save priors: `--save_trend_prior` outputs `trend_priors.npy` and `trend_text_marks.npy`
+### Single dataset example
 
-## Guide weight sweep
-- `--guide_w -1` triggers the built-in sweep list (includes `4.5`).
-- To override, pass a fixed `--guide_w` or run your own loop.
-
-## Current Economy V2 baseline
-- Scope boundary: the current comparison tables, guide-weight selection results, and metric interpretation in this repository are for `Economy` only.
-- Active config: `config/economy_36_12_scale_router_guide.yaml`
-- Task setup: `seq_len=36`, `pred_len=12`, `text_len=36`, `freq=m`
-- Current report only records validation-time guide selection, not test metrics.
-- Validation selection file: `save/forecasting_Economy_20260312_194619/selected_guide_w.json`
-- Selected guide weight on validation: `1.4`
-- Best validation MSE: `0.14063129197983515`
-
-Validation guide sweep:
-- `0.4 -> 0.1933452288309733`
-- `0.5 -> 0.18269025257655552`
-- `0.6 -> 0.17350386664980932`
-- `0.7 -> 0.16563423247564407`
-- `0.8 -> 0.15907128197806222`
-- `0.9 -> 0.15369917097545804`
-- `1.0 -> 0.1493416014171782`
-- `1.2 -> 0.14333132335117885`
-- `1.4 -> 0.14063129197983515`
-
-Recommended Economy command:
 ```bash
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
   --data_path Economy/Economy.csv \
-  --config economy_36_12_scale_router_guide.yaml \
-  --seq_len 36 \
-  --pred_len 12 \
-  --text_len 36 \
-  --freq m
+  --config economy_36_12.yaml \
+  --seq_len 36 --pred_len 12 --text_len 36 --freq m
 ```
 
-Notes:
-- Use `../Time-MMD-main` as `root_path`.
-- Use `Economy/Economy.csv` as `data_path`.
-- Do not pass `Time-MMD-main/numerical/Economy/Economy.csv`.
-- Detailed method notes are documented in `REPORT_V2_ECONOMY.md`.
-
-## Debug
-Use `debug_two_stage_rag.py` to inspect Q1/E0/z0/Q2/E1 and the composed text preview.
-
-## Additional runnable example
-This section is only a capability example. It is not part of the current reported `Economy` comparison results.
+### With RAG + CoT guidance
 
 ```bash
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
-  --data_path Traffic/Traffic.csv \
-  --config traffic_36_12.yaml \
+  --data_path Economy/Economy.csv \
+  --config economy_36_12.yaml \
   --seq_len 36 --pred_len 12 --text_len 36 --freq m \
-  --use_rag_cot --use_two_stage_rag \
-  --trend_cfg --trend_cfg_power 1.0 \
-  --trend_strength_scale 0.35 --trend_volatility_scale 1.0 --trend_time_floor 0.30 \
-  --guide_w -1
+  --use_rag_cot
 ```
 
-## Scripts
-- Full run with trend CFG: `scripts/run_all_datasets_trendcfg.sh`
-- Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
+### With Trend-aware CFG
 
-## Acknowledgements
-Codes are based on:
-[CSDI](https://github.com/ermongroup/CSDI),
-[Time-LLM](https://github.com/KimMeen/Time-LLM/tree/main),
-[MM-TSF](https://github.com/adityalab/time-mmd),
-[Autoformer](https://github.com/thuml/Autoformer)
+```bash
+python -u exe_forecasting.py \
+  --root_path ../Time-MMD-main \
+  --data_path Economy/Economy.csv \
+  --config economy_36_12.yaml \
+  --seq_len 36 --pred_len 12 --text_len 36 --freq m \
+  --use_rag_cot --trend_cfg \
+  --trend_cfg_power 1.0 --trend_strength_scale 0.35 \
+  --trend_volatility_scale 1.0 --trend_time_floor 0.30
+```
+
+---
+
+## ⚙️ Key Configuration
+
+### YAML Config (`config/*.yaml`)
+
+```yaml
+train:
+  epochs: 150
+  batch_size: 32
+  lr: 0.0025
+
+diffusion:
+  layers: 6
+  channels: 64
+  nheads: 8
+  num_steps: 300
+  cfg: True            # Enable classifier-free guidance
+  c_mask_prob: 0.05    # Unconditional dropout probability
+
+model:
+  llm: "bert"          # Text encoder: bert / gpt2 / llama
+  with_texts: True     # Enable text modality
+  timestep_emb_cat: True
+  timestep_branch: True
+```
+
+### Command-line Arguments (selected)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--use_rag_cot` | `False` | Enable RAG + CoT text guidance |
+| `--cot_only` | `False` | Use CoT without retrieval |
+| `--use_two_stage_rag` | `False` | Enable two-stage retrieval |
+| `--trend_cfg` | `False` | Enable trend-aware CFG modulation |
+| `--trend_cfg_power` | `1.0` | Power for time schedule |
+| `--trend_strength_scale` | `1.0` | Scale for trend strength |
+| `--trend_volatility_scale` | `1.0` | Scale for volatility penalty |
+| `--trend_time_floor` | `0.0` | Floor for time schedule |
+| `--guide_w` | `-1` | CFG weight (`-1` for auto sweep) |
+
+---
+
+## 📁 Project Structure
+
+```
+R3-DiffTS/
+├── main_model.py          # Core model: CSDI_base, ScaleRouter, multi-res loss
+├── diff_models.py         # Diffusion backbone: ResidualBlock, diff_CSDI
+├── exe_forecasting.py     # Training & evaluation entry point
+├── dataset_forecasting.py # Dataset loading dispatcher
+├── run.sh                 # Run all datasets
+├── requirements.txt       # Python dependencies
+├── config/                # YAML configs for each dataset × horizon
+│   ├── economy_36_12.yaml
+│   ├── traffic_36_12.yaml
+│   └── ...
+├── data_provider/         # Data loading & preprocessing
+│   ├── data_factory.py
+│   └── data_loader.py
+├── utils/
+│   ├── utils.py           # Train/evaluate loops
+│   ├── rag_cot.py         # RAG retrieval + CoT generation
+│   ├── trend_prior.py     # Trend prior extraction from CoT
+│   ├── prepare4llm.py     # LLM loading utilities
+│   ├── SelfAttention_Family.py
+│   ├── timefeatures.py
+│   └── masking.py
+├── scripts/               # Training scripts for different modes
+│   ├── train_baseline.sh
+│   ├── train_rag_cot.sh
+│   ├── train_rag_only.sh
+│   ├── train_cot_only.sh
+│   └── run_all_datasets_trendcfg.sh
+├── docs/                  # Architecture diagrams (SVG)
+└── LICENSE
+```
+
+---
+
+## 🙏 Acknowledgements
+
+This codebase builds upon:
+- [CSDI](https://github.com/ermongroup/CSDI) — Conditional Score-based Diffusion Model for Imputation
+- [Time-LLM](https://github.com/KimMeen/Time-LLM) — Large Language Models for Time Series
+- [MM-TSF / Time-MMD](https://github.com/adityalab/time-mmd) — Multimodal Time Series Forecasting Benchmark
+- [Autoformer](https://github.com/thuml/Autoformer) — Decomposition Transformers
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.

@@ -53,5 +53,5 @@ model:
   decomp: False
   llm: "bert"
   llm_layers: 0
-  use_rag_cot: false
-  use_two_stage_rag: false
+  use_rag_cot: true
+  use_two_stage_rag: true

@@ -20,14 +20,14 @@ diffusion:
   trend_cfg_power: 1.0
   trend_strength_scale: 0.35
   trend_volatility_scale: 1.0
-  trend_time_floor: 0.30
+  trend_time_floor: 0.3
 model:
   cot_model: ./gpt2-medium
   cot_temperature: 0.4
   cot_max_new_tokens: 64
   decomp: false
   featureemb: 16
-  guide_w_default: 4.5
+  guide_w_default: 3.0
   is_unconditional: 0
   llm: bert
   llm_layers: 0
@@ -49,3 +49,16 @@ train:
   epochs: 20
   itr_per_epoch: 100000000.0
   lr: 0.0001
+  multi_res_horizons:
+  - 1
+  - 3
+  - 6
+  - 12
+  multi_res_loss_weight: 0.03
+  multi_res_use_huber: true
+  multi_res_huber_delta: 1.0
+  multi_res_dynamic: true
+  multi_res_dynamic_by_t: true
+  multi_res_dynamic_by_epoch: true
+  multi_res_dynamic_by_trend: false
+  multi_res_dynamic_min_weight: 0.3

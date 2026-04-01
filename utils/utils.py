@@ -27,6 +27,8 @@ def train(
     best_valid_loss = 1e10
     for epoch_no in range(config["epochs"]):
         avg_loss = 0
+        model.current_epoch = epoch_no
+        model.total_epochs = max(int(config["epochs"]), 1)
         model.train()
         with tqdm(train_loader, mininterval=1.0, maxinterval=50.0) as it:
             for batch_no, train_batch in enumerate(it, start=1):

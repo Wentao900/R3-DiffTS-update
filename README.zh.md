@@ -52,6 +52,11 @@ bash ./run.sh
   - `multi_res_loss_weight`：辅助损失权重（设为 0 即关闭）
   - `multi_res_use_huber`：是否使用 Huber（推荐）
   - `multi_res_huber_delta`：Huber 的 delta
+  - `multi_res_dynamic`：是否启用 A 版动态多视距加权
+  - `multi_res_dynamic_by_t`：按 diffusion step 动态调整 horizon 权重
+  - `multi_res_dynamic_by_epoch`：按训练 epoch 做 curriculum
+  - `multi_res_dynamic_by_trend`：按 `trend_prior` 的强度/波动度调整 horizon 权重
+  - `multi_res_dynamic_min_weight`：动态权重下限，避免某个 horizon 被完全压掉
 - 示例（YAML）：
   ```yaml
   train:
@@ -59,6 +64,11 @@ bash ./run.sh
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    multi_res_dynamic: true
+    multi_res_dynamic_by_t: true
+    multi_res_dynamic_by_epoch: true
+    multi_res_dynamic_by_trend: true
+    multi_res_dynamic_min_weight: 0.2
   ```
 
 ## Guide weight 扫描

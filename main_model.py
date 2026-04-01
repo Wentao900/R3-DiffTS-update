@@ -100,10 +100,17 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
+        self.multi_res_dynamic_by_t = bool(train_cfg.get("multi_res_dynamic_by_t", True))
+        self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
+        self.multi_res_dynamic_by_trend = bool(train_cfg.get("multi_res_dynamic_by_trend", True))
+        self.multi_res_dynamic_min_weight = float(train_cfg.get("multi_res_dynamic_min_weight", 0.2))
         if isinstance(self.multi_res_horizons, int):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
             self.multi_res_horizons = []
+        self.current_epoch = 0
+        self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -244,18 +251,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -301,21 +308,71 @@ class CSDI_base(nn.Module):
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
-            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask)
+            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
             loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
 
-    def _calc_multi_res_loss(self, observed_data, predicted, target_mask):
+    def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
+        components = []
+
+        if self.multi_res_dynamic_by_t and t is not None:
+            if not torch.is_tensor(t):
+                t = torch.tensor(t, device=self.device)
+            t = t.float().reshape(-1)
+            if t.numel() == 1:
+                t = t.repeat(batch_size)
+            step_conf = 1.0 - t / max(self.num_steps - 1, 1)
+            components.append(step_conf.clamp(0.0, 1.0))
+
+        if self.multi_res_dynamic_by_epoch:
+            if self.total_epochs <= 1:
+                epoch_conf = 1.0
+            else:
+                epoch_conf = float(self.current_epoch) / float(self.total_epochs - 1)
+            components.append(torch.full((batch_size,), epoch_conf, device=self.device))
+
+        if self.multi_res_dynamic_by_trend and trend_prior is not None:
+            strength = trend_prior[:, 1].clamp(min=0.5, max=1.5)
+            strength_conf = (strength - 0.5) / 1.0
+            volatility = trend_prior[:, 2].clamp(min=0.0, max=1.0)
+            stability_conf = 1.0 - volatility
+            trend_conf = 0.5 * (strength_conf + stability_conf)
+            components.append(trend_conf.clamp(0.0, 1.0))
+
+        if len(components) == 0:
+            return torch.full((batch_size,), 0.5, device=self.device)
+
+        return torch.stack(components, dim=0).mean(dim=0)
+
+    def _get_multi_res_horizon_weights(self, horizons, batch_size, t=None, trend_prior=None):
+        horizon_tensor = torch.tensor(horizons, device=self.device, dtype=torch.float32)
+        if len(horizons) <= 1:
+            return torch.ones((batch_size, len(horizons)), device=self.device)
+
+        if not self.multi_res_dynamic:
+            return torch.ones((batch_size, len(horizons)), device=self.device)
+
+        confidence = self._get_multi_res_confidence(batch_size, t=t, trend_prior=trend_prior).unsqueeze(1)
+        horizon_pos = (horizon_tensor - horizon_tensor.min()) / max((horizon_tensor.max() - horizon_tensor.min()).item(), 1.0)
+        horizon_pos = horizon_pos.unsqueeze(0).expand(batch_size, -1)
+
+        min_w = min(max(self.multi_res_dynamic_min_weight, 0.0), 1.0)
+        weights = min_w + (1.0 - min_w) * (1.0 - torch.abs(horizon_pos - confidence))
+        return weights.clamp(min=1e-6)
+
+    def _calc_multi_res_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None):
         if self.pred_len <= 0:
             return torch.zeros((), device=observed_data.device)
         horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
         if len(horizons) == 0:
             return torch.zeros((), device=observed_data.device)
         max_pred = int(self.pred_len)
-        horizons = [min(h, max_pred) for h in horizons]
-        loss_sum = 0.0
-        count = 0
-        for h in horizons:
+        horizons = sorted(set(min(h, max_pred) for h in horizons))
+        batch_size = observed_data.shape[0]
+        horizon_weights = self._get_multi_res_horizon_weights(horizons, batch_size, t=t, trend_prior=trend_prior)
+        weighted_loss_sum = torch.zeros((batch_size,), device=observed_data.device)
+        weight_sum = torch.zeros((batch_size,), device=observed_data.device)
+        for h_idx, h in enumerate(horizons):
             if h <= 0:
                 continue
             horizon_mask = torch.zeros_like(target_mask)
@@ -323,8 +380,9 @@ class CSDI_base(nn.Module):
             end = int(self.lookback_len + h)
             horizon_mask[:, :, start:end] = 1.0
             horizon_mask = horizon_mask * target_mask
-            num_eval = horizon_mask.sum()
-            if num_eval <= 0:
+            num_eval = horizon_mask.sum(dim=(1, 2))
+            valid = num_eval > 0
+            if not valid.any():
                 continue
             residual = (observed_data - predicted) * horizon_mask
             if self.multi_res_use_huber:
@@ -335,14 +393,16 @@ class CSDI_base(nn.Module):
                     0.5 * residual ** 2,
                     delta * abs_res - 0.5 * (delta ** 2),
                 )
-                loss_h = huber.sum() / num_eval
+                loss_h = huber.sum(dim=(1, 2)) / num_eval.clamp(min=1.0)
             else:
-                loss_h = (residual ** 2).sum() / num_eval
-            loss_sum += loss_h
-            count += 1
-        if count == 0:
+                loss_h = (residual ** 2).sum(dim=(1, 2)) / num_eval.clamp(min=1.0)
+            weight_h = horizon_weights[:, h_idx] * valid.float()
+            weighted_loss_sum = weighted_loss_sum + weight_h * loss_h
+            weight_sum = weight_sum + weight_h
+        valid_samples = weight_sum > 0
+        if not valid_samples.any():
             return torch.zeros((), device=observed_data.device)
-        return loss_sum / count
+        return (weighted_loss_sum[valid_samples] / weight_sum[valid_samples]).mean()
 
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional == True:
@@ -779,7 +839,7 @@ class CSDI_Forecasting(CSDI_base):
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior)
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)

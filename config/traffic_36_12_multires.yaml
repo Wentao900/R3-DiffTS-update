@@ -53,3 +53,8 @@ train:
   multi_res_loss_weight: 0.1
   multi_res_use_huber: true
   multi_res_huber_delta: 1.0
+  multi_res_dynamic: true
+  multi_res_dynamic_by_t: true
+  multi_res_dynamic_by_epoch: true
+  multi_res_dynamic_by_trend: true
+  multi_res_dynamic_min_weight: 0.2

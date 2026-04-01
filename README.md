@@ -33,6 +33,11 @@ This adds training signal without changing the model architecture.
   - `multi_res_loss_weight`: weight for the auxiliary loss (set to 0 to disable).
   - `multi_res_use_huber`: use Huber loss (recommended for stability).
   - `multi_res_huber_delta`: delta for Huber loss.
+  - `multi_res_dynamic`: enable A-version dynamic multi-horizon weighting.
+  - `multi_res_dynamic_by_t`: adapt horizon weights by diffusion step.
+  - `multi_res_dynamic_by_epoch`: adapt horizon weights by training epoch.
+  - `multi_res_dynamic_by_trend`: adapt horizon weights by trend prior strength/volatility.
+  - `multi_res_dynamic_min_weight`: lower bound for each dynamic horizon weight.
 - Example (YAML):
   ```yaml
   train:
@@ -40,6 +45,11 @@ This adds training signal without changing the model architecture.
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    multi_res_dynamic: true
+    multi_res_dynamic_by_t: true
+    multi_res_dynamic_by_epoch: true
+    multi_res_dynamic_by_trend: true
+    multi_res_dynamic_min_weight: 0.2
   ```
 
 ## Two-stage RAG (minimal change enhancement)

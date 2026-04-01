@@ -7,14 +7,14 @@ train:
   lr: 0.00075
   itr_per_epoch: 1.0e+8
   multi_res_horizons: [1, 2, 4, 6]
-  multi_res_loss_weight: 0.1
+  multi_res_loss_weight: 0.03
   multi_res_use_huber: true
   multi_res_huber_delta: 1.0
   multi_res_dynamic: true
   multi_res_dynamic_by_t: true
   multi_res_dynamic_by_epoch: true
-  multi_res_dynamic_by_trend: true
-  multi_res_dynamic_min_weight: 0.2
+  multi_res_dynamic_by_trend: false
+  multi_res_dynamic_min_weight: 0.3
 
 diffusion:
   layers: 4

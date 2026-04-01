@@ -71,6 +71,26 @@ bash ./run.sh
     multi_res_dynamic_min_weight: 0.2
   ```
 
+## 约束采样（最小改动落地）
+在采样阶段加入轻量约束，不改扩散主干结构。
+- 配置项（位于 `diffusion`）：
+  - `constraint_sampling`：是否启用约束采样总开关
+  - `constraint_history_hard`：每个 reverse step 后将历史观测位硬投影回真值
+  - `cfg_rescale`：对 `pred_cond - pred_uncond` 做范数裁剪，稳定大 guidance
+  - `cfg_rescale_max_ratio`：允许的最大 guidance 增益比例
+  - `cfg_late_decay`：对标准 CFG 启用后期衰减
+  - `cfg_late_decay_power`：后期衰减幂次
+- 示例（YAML）：
+  ```yaml
+  diffusion:
+    constraint_sampling: true
+    constraint_history_hard: true
+    cfg_rescale: true
+    cfg_rescale_max_ratio: 1.5
+    cfg_late_decay: true
+    cfg_late_decay_power: 1.0
+  ```
+
 ## Guide weight 扫描
 - `--guide_w -1` 会使用内置列表自动扫描（包含 `4.5`）。
 - 如需固定某个值，直接传 `--guide_w`。

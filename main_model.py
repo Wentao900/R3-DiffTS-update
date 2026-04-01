@@ -88,6 +88,12 @@ class CSDI_base(nn.Module):
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 1.0)
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
+        self.constraint_sampling = bool(config["diffusion"].get("constraint_sampling", False))
+        self.constraint_history_hard = bool(config["diffusion"].get("constraint_history_hard", True))
+        self.cfg_rescale = bool(config["diffusion"].get("cfg_rescale", False))
+        self.cfg_rescale_max_ratio = float(config["diffusion"].get("cfg_rescale_max_ratio", 1.5))
+        self.cfg_late_decay = bool(config["diffusion"].get("cfg_late_decay", False))
+        self.cfg_late_decay_power = float(config["diffusion"].get("cfg_late_decay_power", 1.0))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -422,6 +428,47 @@ class CSDI_base(nn.Module):
 
         return total_input
 
+    def get_cfg_decay_ratio(self, step_index, time_steps=None):
+        if self.ddim and time_steps is not None:
+            current_step = float(time_steps[step_index])
+        else:
+            current_step = float(step_index)
+        denom = max(self.num_steps - 1, 1)
+        ratio = min(max(current_step / denom, 0.0), 1.0)
+        return ratio ** self.cfg_late_decay_power
+
+    def apply_cfg_guidance(self, predicted_cond, predicted_uncond, guide_w, step_index, time_steps=None, trend_prior=None, text_mask=None):
+        delta = predicted_cond - predicted_uncond
+        if self.cfg_rescale:
+            base_norm = predicted_uncond.reshape(predicted_uncond.shape[0], -1).norm(dim=1).clamp(min=1e-6)
+            delta_norm = delta.reshape(delta.shape[0], -1).norm(dim=1).clamp(min=1e-6)
+            max_delta = self.cfg_rescale_max_ratio * base_norm
+            scale = torch.clamp(max_delta / delta_norm, max=1.0)
+            delta = delta * scale[:, None, None]
+
+        if self.trend_cfg:
+            if self.trend_cfg_random:
+                trend_prior = self.sample_random_trend_prior(predicted_cond.shape[0], predicted_cond.device)
+            if trend_prior is not None:
+                step_ratio = self.get_trend_step_ratio(step_index, time_steps)
+                guide_scale = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
+            else:
+                guide_scale = torch.full((predicted_cond.shape[0],), guide_w, device=predicted_cond.device)
+        else:
+            guide_scale = torch.full((predicted_cond.shape[0],), guide_w, device=predicted_cond.device)
+            if self.cfg_late_decay:
+                decay = self.get_cfg_decay_ratio(step_index, time_steps)
+                guide_scale = guide_scale * decay
+
+        return predicted_uncond + guide_scale[:, None, None] * delta
+
+    def apply_sampling_constraints(self, current_sample, observed_data, cond_mask):
+        if not self.constraint_sampling:
+            return current_sample
+        if self.constraint_history_hard:
+            current_sample = cond_mask * observed_data + (1.0 - cond_mask) * current_sample
+        return current_sample
+
     def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None):
         B, K, L = observed_data.shape
         if self.ddim:
@@ -493,17 +540,15 @@ class CSDI_base(nn.Module):
                             predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                 if self.cfg:
                     predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
-                    if self.trend_cfg:
-                        if self.trend_cfg_random:
-                            trend_prior = self.sample_random_trend_prior(B, observed_data.device)
-                        if trend_prior is not None:
-                            step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
-                            trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
-                            predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
-                        else:
-                            predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
-                    else:
-                        predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                    predicted = self.apply_cfg_guidance(
+                        predicted_cond,
+                        predicted_uncond,
+                        guide_w,
+                        t,
+                        time_steps=time_steps if self.ddim else None,
+                        trend_prior=trend_prior,
+                        text_mask=text_mask,
+                    )
 
                 if self.noise_esti:
                     # noise prediction
@@ -545,11 +590,13 @@ class CSDI_base(nn.Module):
                             aaa_ * current_sample +
                             ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
                         )
+                current_sample = self.apply_sampling_constraints(current_sample, observed_data, cond_mask)
 
             imputed_samples[:, i] = current_sample.detach()
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 imputed_samples[:, i] = 0.9 * imputed_samples[:, i] + 0.1 * predicted_from_timestep.detach()
+            imputed_samples[:, i] = self.apply_sampling_constraints(imputed_samples[:, i], observed_data, cond_mask)
             if not self.noise_esti:
                 imputed_samples[:, i] = imputed_samples[:, i] * stdev + means
         if self.save_attn:

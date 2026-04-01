@@ -52,6 +52,26 @@ This adds training signal without changing the model architecture.
     multi_res_dynamic_min_weight: 0.2
   ```
 
+## Constraint Sampling (minimal-change implementation)
+Add lightweight constraints during sampling without changing the diffusion backbone.
+- Config keys (under `diffusion`):
+  - `constraint_sampling`: master switch for constrained sampling.
+  - `constraint_history_hard`: hard-project observed history after each reverse step.
+  - `cfg_rescale`: norm-rescale `pred_cond - pred_uncond` to stabilize large guidance.
+  - `cfg_rescale_max_ratio`: maximum allowed guidance gain ratio.
+  - `cfg_late_decay`: decay standard CFG in late reverse steps.
+  - `cfg_late_decay_power`: power used for the late-step decay.
+- Example (YAML):
+  ```yaml
+  diffusion:
+    constraint_sampling: true
+    constraint_history_hard: true
+    cfg_rescale: true
+    cfg_rescale_max_ratio: 1.5
+    cfg_late_decay: true
+    cfg_late_decay_power: 1.0
+  ```
+
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
 - Stage-1: reuse the original one-shot query to retrieve E0.

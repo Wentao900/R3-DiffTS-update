@@ -130,7 +130,7 @@ git clone https://github.com/adityalab/time-mmd ../Time-MMD-main
 
 ## Quick Start
 
-### Baseline（全部 8 个数据集）
+### Main Config（全部 8 个数据集）
 
 ```bash
 bash run.sh
@@ -145,7 +145,7 @@ bash run_full.sh
 ### 单个数据集
 
 ```bash
-# Baseline
+# Main config
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
   --data_path Economy/Economy.csv \
@@ -194,8 +194,8 @@ bash run_ablation.sh all traffic     # Traffic 全部消融
 
 ```
 config/
-├── {dataset}_{seq}_{pred}.yaml          # Baseline 配置
-├── {dataset}_{seq}_{pred}_full.yaml     # 全模块配置
+├── {dataset}_{seq}_{pred}.yaml          # 每个任务的主实验默认配置
+├── {dataset}_{seq}_{pred}_full.yaml     # 扩展 / 对照用全模块配置
 └── {dataset}_{seq}_{pred}_abl_{id}.yaml # 消融配置
 ```
 
@@ -214,9 +214,13 @@ config/
 
 ```yaml
 train:
-  multi_res_band_boundaries: [3, 6, 12]  # 预测窗口 band 划分
-  multi_res_loss_weight: 0.1              # 辅助损失权重
+  multi_res_horizons: [1, 3, 6, 12]       # 辅助监督窗口
+  multi_res_band_boundaries: [1, 3, 6, 12]
+  multi_res_loss_weight: 0.03             # 调轻后的辅助损失权重
+  multi_res_mode: dynamic_band            # 动态 band 加权
+  multi_res_weight_floor: 0.3             # 权重下限
   use_scale_router: true                  # 启用 Scale Router
+  scale_router_use_trend_prior: false     # 关闭 trend prior 路由偏置
 ```
 
 ---

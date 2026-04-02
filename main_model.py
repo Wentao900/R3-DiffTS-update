@@ -88,6 +88,9 @@ class CSDI_base(nn.Module):
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 1.0)
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
+        self.self_condition = bool(config["diffusion"].get("self_condition", False))
+        self.self_condition_prob = float(config["diffusion"].get("self_condition_prob", 0.5))
+        self.self_condition_target_only = bool(config["diffusion"].get("self_condition_target_only", True))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -168,7 +171,10 @@ class CSDI_base(nn.Module):
         config_diff["time_weight"] = config["diffusion"]["time_weight"]
         config_diff["save_attn"] = config["model"]["save_attn"]
 
-        input_dim = 1 if self.is_unconditional == True else 2
+        if self.is_unconditional == True:
+            input_dim = 1
+        else:
+            input_dim = 3 if self.self_condition else 2
         mode_num = 1
 
         if self.decomp:
@@ -279,22 +285,29 @@ class CSDI_base(nn.Module):
         noise = torch.randn_like(observed_data)
         noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
 
-        total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask) 
-
         if self.cfg:
             cfg_mask = torch.bernoulli(torch.ones((B, )) - self.c_mask_prob).to(self.device) 
         else:
             cfg_mask = None
 
-        if self.decomp:
-            predicted_seasonal, _ = self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb)
-            predicted_trend = self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb)
-            predicted, _ = predicted_seasonal + predicted_trend
-        else:
-            if self.save_attn:
-                predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context) 
-            else:
-                predicted = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context) 
+        self_cond = None
+        use_self_condition = (
+            self.self_condition
+            and (not self.is_unconditional)
+            and (is_train != 1 or np.random.rand() < self.self_condition_prob)
+        )
+        if use_self_condition:
+            with torch.no_grad():
+                preview_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask, self_cond=None)
+                preview_pred = self._forward_diffmodel(preview_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
+                if self.timestep_branch and timesteps is not None:
+                    predicted_from_timestep = self.timestep_pred(timesteps)
+                    preview_pred = 0.9 * preview_pred + 0.1 * predicted_from_timestep
+                self_cond = self._build_self_condition(preview_pred, cond_mask)
+
+        total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask, self_cond=self_cond) 
+
+        predicted = self._forward_diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
 
         if self.timestep_branch and timesteps is not None:
             predicted_from_timestep = self.timestep_pred(timesteps)
@@ -404,21 +417,57 @@ class CSDI_base(nn.Module):
             return torch.zeros((), device=observed_data.device)
         return (weighted_loss_sum[valid_samples] / weight_sum[valid_samples]).mean()
 
-    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
+    def _forward_diffmodel(self, total_input, side_info, diffusion_step, cfg_mask, timestep_emb=None, size_emb=None, context=None):
+        if self.decomp:
+            predicted_seasonal = self.diffmodel_sesonal(total_input[0], side_info, diffusion_step, cfg_mask, timestep_emb, size_emb)
+            predicted_trend = self.diffmodel_trend(total_input[1], side_info, diffusion_step, cfg_mask, timestep_emb, size_emb)
+            if isinstance(predicted_seasonal, tuple):
+                predicted_seasonal = predicted_seasonal[0]
+            if isinstance(predicted_trend, tuple):
+                predicted_trend = predicted_trend[0]
+            return predicted_seasonal + predicted_trend
+        if self.save_attn:
+            predicted, _ = self.diffmodel(total_input, side_info, diffusion_step, cfg_mask, timestep_emb, size_emb, context)
+            return predicted
+        return self.diffmodel(total_input, side_info, diffusion_step, cfg_mask, timestep_emb, size_emb, context)
+
+    def _build_self_condition(self, predicted, cond_mask):
+        if predicted is None:
+            return None
+        self_cond = predicted.detach()
+        if self.self_condition_target_only:
+            self_cond = self_cond * (1.0 - cond_mask)
+        return self_cond
+
+    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask, self_cond=None):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)  
         else:
             cond_obs = cond_mask * observed_data
             noisy_target = noisy_data.unsqueeze(1) 
+            if self.self_condition:
+                if self_cond is None:
+                    self_cond = torch.zeros_like(observed_data)
+                elif self.self_condition_target_only:
+                    self_cond = self_cond * (1.0 - cond_mask)
+                self_cond = self_cond.unsqueeze(1)
             if self.decomp:
                 res, moving_mean = self.decomposition(cond_obs) 
                 res, moving_mean = res.unsqueeze(1), moving_mean.unsqueeze(1) 
-                res_input = torch.cat([res, noisy_target], dim=1)  
-                moving_mean_input = torch.cat([moving_mean, noisy_target], dim=1) 
+                res_parts = [res, noisy_target]
+                moving_mean_parts = [moving_mean, noisy_target]
+                if self.self_condition:
+                    res_parts.append(self_cond)
+                    moving_mean_parts.append(self_cond)
+                res_input = torch.cat(res_parts, dim=1)  
+                moving_mean_input = torch.cat(moving_mean_parts, dim=1) 
                 total_input = [res_input, moving_mean_input]
             else:
                 cond_obs = cond_obs.unsqueeze(1) 
-                total_input = torch.cat([cond_obs, noisy_target], dim=1) 
+                input_parts = [cond_obs, noisy_target]
+                if self.self_condition:
+                    input_parts.append(self_cond)
+                total_input = torch.cat(input_parts, dim=1) 
 
         return total_input
 
@@ -463,6 +512,7 @@ class CSDI_base(nn.Module):
                     noisy_cond_history.append(noisy_obs * cond_mask)
 
             current_sample = torch.randn_like(observed_data)
+            self_cond = None
             for t in range(self.sample_steps - 1, -1, -1):
                 if self.is_unconditional == True:
                     diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
@@ -473,18 +523,38 @@ class CSDI_base(nn.Module):
                         noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1) # (B, 1, K, L)
                         res, moving_mean = self.decomposition(cond_obs) # (B, K, L), (B, K, L)
                         res, moving_mean = res.unsqueeze(1), moving_mean.unsqueeze(1) # (B, 1, K, L), (B, 1, K, L)
-                        res_input = torch.cat([res, noisy_target], dim=1)  # (B,2,K,L)
-                        moving_mean_input = torch.cat([moving_mean, noisy_target], dim=1)  # (B,2,K,L)
+                        res_parts = [res, noisy_target]
+                        moving_mean_parts = [moving_mean, noisy_target]
+                        if self.self_condition:
+                            if self_cond is None:
+                                self_cond_input = torch.zeros_like(res)
+                            else:
+                                self_cond_input = self_cond.unsqueeze(1)
+                            res_parts.append(self_cond_input)
+                            moving_mean_parts.append(self_cond_input)
+                        res_input = torch.cat(res_parts, dim=1)
+                        moving_mean_input = torch.cat(moving_mean_parts, dim=1)
                         if self.cfg:
-                            res_input = res_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
-                            moving_mean_input = moving_mean_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
+                            res_input = res_input.repeat(2, 1, 1, 1)
+                            moving_mean_input = moving_mean_input.repeat(2, 1, 1, 1)
                         predicted_seasonal = self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                         predicted_trend = self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
+                        if isinstance(predicted_seasonal, tuple):
+                            predicted_seasonal = predicted_seasonal[0]
+                        if isinstance(predicted_trend, tuple):
+                            predicted_trend = predicted_trend[0]
                         predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
                     else:
                         cond_obs = (cond_mask * observed_data).unsqueeze(1) # (B, 1, K, L)
                         noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1) # (B, 1, K, L)
-                        diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B, 2, K, L)
+                        input_parts = [cond_obs, noisy_target]
+                        if self.self_condition:
+                            if self_cond is None:
+                                self_cond_input = torch.zeros_like(cond_obs)
+                            else:
+                                self_cond_input = self_cond.unsqueeze(1)
+                            input_parts.append(self_cond_input)
+                        diff_input = torch.cat(input_parts, dim=1)  # (B, C, K, L)
                         if self.cfg:
                             diff_input = diff_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
                         if self.save_attn:
@@ -504,6 +574,8 @@ class CSDI_base(nn.Module):
                             predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
                     else:
                         predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                if self.self_condition and (not self.is_unconditional):
+                    self_cond = self._build_self_condition(predicted, cond_mask)
 
                 if self.noise_esti:
                     # noise prediction

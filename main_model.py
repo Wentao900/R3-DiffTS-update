@@ -61,6 +61,7 @@ class CSDI_series_decomp(nn.Module):
 class CSDI_base(nn.Module):
     def __init__(self, target_dim, config, device, window_lens):
         super().__init__()
+        self.config = config
         self.device = device
         self.target_dim = target_dim
 

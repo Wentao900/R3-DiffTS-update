@@ -88,6 +88,9 @@ class CSDI_base(nn.Module):
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 1.0)
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
+        self.boundary_smooth_constraint = bool(config["diffusion"].get("boundary_smooth_constraint", False))
+        self.boundary_smooth_scale = float(config["diffusion"].get("boundary_smooth_scale", 0.0))
+        self.boundary_smooth_decay_power = float(config["diffusion"].get("boundary_smooth_decay_power", 1.0))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -249,6 +252,39 @@ class CSDI_base(nn.Module):
             side_info = torch.cat([side_info, side_mask], dim=1)
 
         return side_info
+
+    def _get_sampling_step_ratio(self, step_index, time_steps=None):
+        if self.ddim and time_steps is not None:
+            current_step = float(time_steps[step_index])
+        else:
+            current_step = float(step_index)
+        denom = max(self.num_steps - 1, 1)
+        ratio = 1.0 - current_step / denom
+        power = max(self.boundary_smooth_decay_power, 0.0)
+        if power != 1.0:
+            ratio = ratio ** power
+        return min(max(ratio, 0.0), 1.0)
+
+    def _apply_boundary_smooth_constraint(self, current_sample, observed_data, step_index, time_steps=None):
+        if (not self.boundary_smooth_constraint) or self.boundary_smooth_scale <= 0.0:
+            return current_sample
+        if self.lookback_len <= 0 or self.pred_len <= 0:
+            return current_sample
+
+        boundary_idx = int(self.lookback_len)
+        history_idx = boundary_idx - 1
+        if history_idx < 0 or boundary_idx >= current_sample.shape[-1]:
+            return current_sample
+
+        step_ratio = self._get_sampling_step_ratio(step_index, time_steps=time_steps)
+        eta = min(max(self.boundary_smooth_scale * step_ratio, 0.0), 1.0)
+        if eta <= 0.0:
+            return current_sample
+
+        history_last = observed_data[:, :, history_idx]
+        forecast_first = current_sample[:, :, boundary_idx]
+        current_sample[:, :, boundary_idx] = history_last + (1.0 - eta) * (forecast_first - history_last)
+        return current_sample
 
     def calc_loss_valid(
         self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None
@@ -545,6 +581,12 @@ class CSDI_base(nn.Module):
                             aaa_ * current_sample +
                             ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
                         )
+                current_sample = self._apply_boundary_smooth_constraint(
+                    current_sample,
+                    observed_data,
+                    t,
+                    time_steps=time_steps if self.ddim else None,
+                )
 
             imputed_samples[:, i] = current_sample.detach()
             if self.timestep_branch and timesteps is not None:

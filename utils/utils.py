@@ -128,12 +128,14 @@ def _get_rerank_config(model):
     rerank_topk = int(model_cfg.get("rerank_topk", 1))
     rerank_boundary_weight = float(model_cfg.get("rerank_boundary_weight", 1.0))
     rerank_volatility_weight = float(model_cfg.get("rerank_volatility_weight", 0.25))
+    rerank_consensus_weight = float(model_cfg.get("rerank_consensus_weight", 0.5))
     rerank_use_median = bool(model_cfg.get("rerank_use_median", True))
     return {
         "enabled": rerank_enabled,
         "topk": rerank_topk,
         "boundary_weight": rerank_boundary_weight,
         "volatility_weight": rerank_volatility_weight,
+        "consensus_weight": rerank_consensus_weight,
         "use_median": rerank_use_median,
     }
 
@@ -141,13 +143,13 @@ def _get_rerank_config(model):
 def rerank_samples(samples, observed_points, model):
     rerank_cfg = _get_rerank_config(model)
     if (not rerank_cfg["enabled"]) or samples.shape[1] <= 1:
-        return samples.median(dim=1)
+        return samples.median(dim=1).values
 
     topk = max(1, min(int(rerank_cfg["topk"]), samples.shape[1]))
     lookback_len = int(getattr(model, "lookback_len", 0))
     pred_len = int(getattr(model, "pred_len", 0))
     if lookback_len <= 0 or pred_len <= 0 or lookback_len >= samples.shape[2]:
-        return samples.median(dim=1)
+        return samples.median(dim=1).values
 
     history_last = observed_points[:, lookback_len - 1, :].unsqueeze(1)
     forecast_first = samples[:, :, lookback_len, :]
@@ -160,9 +162,13 @@ def rerank_samples(samples, observed_points, model):
     else:
         future_volatility = torch.zeros_like(boundary_jump)
 
+    consensus_center = future.median(dim=1).values.unsqueeze(1)
+    consensus_distance = (future - consensus_center).abs().mean(dim=(2, 3))
+
     score = (
         rerank_cfg["boundary_weight"] * boundary_jump
         + rerank_cfg["volatility_weight"] * future_volatility
+        + rerank_cfg["consensus_weight"] * consensus_distance
     )
     topk_idx = torch.topk(score, k=topk, dim=1, largest=False).indices
     topk_idx = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, samples.shape[2], samples.shape[3])

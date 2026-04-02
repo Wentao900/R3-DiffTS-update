@@ -120,6 +120,64 @@ def calc_quantile_CRPS_sum(target, forecast, eval_points, mean_scaler, scaler):
         CRPS += q_loss / denom
     return CRPS.item() / len(quantiles)
 
+
+def _get_rerank_config(model):
+    cfg = getattr(model, "config", None)
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    rerank_enabled = bool(model_cfg.get("rerank_samples", False))
+    rerank_topk = int(model_cfg.get("rerank_topk", 1))
+    rerank_boundary_weight = float(model_cfg.get("rerank_boundary_weight", 1.0))
+    rerank_volatility_weight = float(model_cfg.get("rerank_volatility_weight", 0.25))
+    rerank_consensus_weight = float(model_cfg.get("rerank_consensus_weight", 0.5))
+    rerank_use_median = bool(model_cfg.get("rerank_use_median", True))
+    return {
+        "enabled": rerank_enabled,
+        "topk": rerank_topk,
+        "boundary_weight": rerank_boundary_weight,
+        "volatility_weight": rerank_volatility_weight,
+        "consensus_weight": rerank_consensus_weight,
+        "use_median": rerank_use_median,
+    }
+
+
+def rerank_samples(samples, observed_points, model):
+    rerank_cfg = _get_rerank_config(model)
+    if (not rerank_cfg["enabled"]) or samples.shape[1] <= 1:
+        return samples.median(dim=1).values
+
+    topk = max(1, min(int(rerank_cfg["topk"]), samples.shape[1]))
+    lookback_len = int(getattr(model, "lookback_len", 0))
+    pred_len = int(getattr(model, "pred_len", 0))
+    if lookback_len <= 0 or pred_len <= 0 or lookback_len >= samples.shape[2]:
+        return samples.median(dim=1).values
+
+    history_last = observed_points[:, lookback_len - 1, :].unsqueeze(1)
+    forecast_first = samples[:, :, lookback_len, :]
+    boundary_jump = (forecast_first - history_last).abs().mean(dim=2)
+
+    future = samples[:, :, lookback_len:, :]
+    if future.shape[2] > 1:
+        future_diffs = future[:, :, 1:, :] - future[:, :, :-1, :]
+        future_volatility = future_diffs.abs().mean(dim=(2, 3))
+    else:
+        future_volatility = torch.zeros_like(boundary_jump)
+
+    consensus_center = future.median(dim=1).values.unsqueeze(1)
+    consensus_distance = (future - consensus_center).abs().mean(dim=(2, 3))
+
+    score = (
+        rerank_cfg["boundary_weight"] * boundary_jump
+        + rerank_cfg["volatility_weight"] * future_volatility
+        + rerank_cfg["consensus_weight"] * consensus_distance
+    )
+    topk_idx = torch.topk(score, k=topk, dim=1, largest=False).indices
+    topk_idx = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, samples.shape[2], samples.shape[3])
+    selected_samples = torch.gather(samples, 1, topk_idx)
+
+    if rerank_cfg["use_median"]:
+        return selected_samples.median(dim=1).values
+    return selected_samples.mean(dim=1)
+
 def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", window_lens=[1, 1], guide_w=0, save_attn=False, save_token=False, save_trend_prior=False):
     model.load_state_dict(torch.load(foldername + "/model.pth"))
     with torch.no_grad():
@@ -161,7 +219,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 eval_points = eval_points.permute(0, 2, 1)
                 observed_points = observed_points.permute(0, 2, 1)
 
-                samples_median = samples.median(dim=1)
+                aggregated_samples = rerank_samples(samples, observed_points, model)
                 all_target.append(c_target)
                 all_evalpoint.append(eval_points)
                 all_observed_point.append(observed_points)
@@ -181,16 +239,16 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     all_tokens.extend(tokens)
 
                 mse_current = (
-                    ((samples_median.values - c_target) * eval_points) ** 2
+                    ((aggregated_samples - c_target) * eval_points) ** 2
                 ) * (scaler ** 2)
                 mae_current = (
-                    torch.abs((samples_median.values - c_target) * eval_points) 
+                    torch.abs((aggregated_samples - c_target) * eval_points) 
                 ) * scaler
                 nmse_current = (
-                    ((samples_median.values - c_target) * eval_points) ** 2
+                    ((aggregated_samples - c_target) * eval_points) ** 2
                 )
                 nmae_current = (
-                    torch.abs((samples_median.values - c_target) * eval_points) 
+                    torch.abs((aggregated_samples - c_target) * eval_points) 
                 )
 
                 mse_total += mse_current.sum().item()

@@ -91,6 +91,9 @@ class CSDI_base(nn.Module):
         self.boundary_smooth_constraint = bool(config["diffusion"].get("boundary_smooth_constraint", False))
         self.boundary_smooth_scale = float(config["diffusion"].get("boundary_smooth_scale", 0.0))
         self.boundary_smooth_decay_power = float(config["diffusion"].get("boundary_smooth_decay_power", 1.0))
+        self.boundary_smooth_late_start_ratio = float(config["diffusion"].get("boundary_smooth_late_start_ratio", 0.0))
+        self.boundary_smooth_jump_std_scale = float(config["diffusion"].get("boundary_smooth_jump_std_scale", 0.0))
+        self.boundary_smooth_min_jump = float(config["diffusion"].get("boundary_smooth_min_jump", 0.0))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -277,13 +280,33 @@ class CSDI_base(nn.Module):
             return current_sample
 
         step_ratio = self._get_sampling_step_ratio(step_index, time_steps=time_steps)
+        late_start = min(max(self.boundary_smooth_late_start_ratio, 0.0), 1.0)
+        if step_ratio < late_start:
+            return current_sample
         eta = min(max(self.boundary_smooth_scale * step_ratio, 0.0), 1.0)
         if eta <= 0.0:
             return current_sample
 
         history_last = observed_data[:, :, history_idx]
         forecast_first = current_sample[:, :, boundary_idx]
-        current_sample[:, :, boundary_idx] = history_last + (1.0 - eta) * (forecast_first - history_last)
+        jump = forecast_first - history_last
+
+        threshold = jump.new_full(jump.shape, max(self.boundary_smooth_min_jump, 0.0))
+        if self.lookback_len >= 2 and self.boundary_smooth_jump_std_scale > 0.0:
+            history = observed_data[:, :, :boundary_idx]
+            history_diffs = history[:, :, 1:] - history[:, :, :-1]
+            local_std = history_diffs.std(dim=2, unbiased=False)
+            threshold = torch.maximum(
+                threshold,
+                self.boundary_smooth_jump_std_scale * local_std,
+            )
+
+        trigger_mask = (jump.abs() > threshold).float()
+        if trigger_mask.sum() <= 0:
+            return current_sample
+
+        smoothed = history_last + (1.0 - eta) * jump
+        current_sample[:, :, boundary_idx] = trigger_mask * smoothed + (1.0 - trigger_mask) * forecast_first
         return current_sample
 
     def calc_loss_valid(

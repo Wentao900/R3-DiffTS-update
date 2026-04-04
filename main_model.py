@@ -105,6 +105,9 @@ class CSDI_base(nn.Module):
         self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
         self.multi_res_dynamic_by_trend = bool(train_cfg.get("multi_res_dynamic_by_trend", True))
         self.multi_res_dynamic_min_weight = float(train_cfg.get("multi_res_dynamic_min_weight", 0.2))
+        self.event_loss_weight = float(train_cfg.get("event_loss_weight", 0.0))
+        self.event_jump_scale = float(train_cfg.get("event_jump_scale", 1.5))
+        self.event_turning_weight = float(train_cfg.get("event_turning_weight", 1.0))
         if isinstance(self.multi_res_horizons, int):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
@@ -307,10 +310,52 @@ class CSDI_base(nn.Module):
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        if (not self.noise_esti) and self.event_loss_weight > 0:
+            event_loss = self._calc_event_aware_loss(observed_data, predicted, target_mask)
+            loss = loss + self.event_loss_weight * event_loss
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
             loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
+
+    def _build_oracle_event_mask(self, future_true, future_mask):
+        B, K, L = future_true.shape
+        if L <= 1:
+            return future_mask
+
+        diff = future_true[:, :, 1:] - future_true[:, :, :-1]
+        diff_mask = future_mask[:, :, 1:] * future_mask[:, :, :-1]
+        masked_abs_diff = diff.abs() * diff_mask
+        diff_std = masked_abs_diff.sum(dim=2, keepdim=True) / diff_mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+        jump_mask = (masked_abs_diff > (self.event_jump_scale * diff_std + 1e-6)).float() * diff_mask
+
+        event_mask = torch.zeros_like(future_true)
+        event_mask[:, :, 1:] = torch.maximum(event_mask[:, :, 1:], jump_mask)
+        event_mask[:, :, :-1] = torch.maximum(event_mask[:, :, :-1], jump_mask)
+
+        if L > 2 and self.event_turning_weight > 0:
+            sign_prev = torch.sign(diff[:, :, :-1])
+            sign_next = torch.sign(diff[:, :, 1:])
+            turning_mask = ((sign_prev * sign_next) < 0).float()
+            turning_mask = turning_mask * diff_mask[:, :, :-1] * diff_mask[:, :, 1:]
+            event_mask[:, :, 1:-1] = torch.maximum(event_mask[:, :, 1:-1], self.event_turning_weight * turning_mask)
+
+        return event_mask * future_mask
+
+    def _calc_event_aware_loss(self, observed_data, predicted, target_mask):
+        if self.pred_len <= 1:
+            return torch.zeros((), device=observed_data.device)
+
+        start = int(self.lookback_len)
+        end = int(self.lookback_len + self.pred_len)
+        future_true = observed_data[:, :, start:end]
+        future_pred = predicted[:, :, start:end]
+        future_mask = target_mask[:, :, start:end]
+        event_mask = self._build_oracle_event_mask(future_true, future_mask)
+        if event_mask.sum() <= 0:
+            return torch.zeros((), device=observed_data.device)
+        residual = (future_true - future_pred) * event_mask
+        return (residual ** 2).sum() / event_mask.sum().clamp(min=1.0)
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []

@@ -1,0 +1,83 @@
+#type: args
+
+train:
+  epochs: 150
+  batch_size: 64
+  lr: 0.0025
+  itr_per_epoch: 1.0e+8
+  multi_res_horizons: [1, 3, 6, 12]
+  multi_res_loss_weight: 0.03
+  multi_res_use_huber: true
+  multi_res_huber_delta: 1.0
+  multi_res_dynamic: true
+  multi_res_dynamic_by_t: true
+  multi_res_dynamic_by_epoch: true
+  multi_res_dynamic_by_trend: false
+  multi_res_dynamic_min_weight: 0.3
+  event_loss_weight: 0.02
+  event_jump_scale: 2.0
+  event_turning_weight: 1.0
+  revin_affine: true
+  revin_eps: 1.0e-5
+
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.6
+  num_steps: 300
+  schedule: "quad"
+  is_linear: False
+  noise_esti: False
+  cfg: True
+  c_mask_prob: 0.2
+  ddim: True
+  sample_steps: 90
+  sample_method: "quad"
+  pre_norm: False
+  trend_cfg: false
+  trend_cfg_power: 1.0
+  trend_cfg_random: false
+  trend_strength_scale: 1.0
+  trend_volatility_scale: 1.0
+  trend_time_floor: 0.0
+
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: "test"
+  num_sample_features: 64
+  timestep_branch: true
+  timestep_emb_cat: true
+  with_texts: true
+  relative_size_emb_cat: false
+  decomp: false
+  llm: "bert"
+  llm_layers: 0
+  timestep_dim: 4
+  context_dim: 768
+  lookback_len: 96
+  pred_len: 12
+  domain: "Energy"
+  text_len: 36
+  save_attn: false
+  save_token: false
+  rag_topk: 3
+  cot_temperature: 0.7
+  use_rag_cot: false
+  cot_only: false
+  use_two_stage_rag: false
+  rag_stage1_topk: -1
+  rag_stage2_topk: -1
+  two_stage_gate: true
+  trend_slope_eps: 0.001
+  cot_model: null
+  cot_max_new_tokens: 96
+  cot_cache_size: 1024
+  cot_device: null
+  cot_load_in_8bit: false
+  cot_load_in_4bit: false
+  save_trend_prior: false

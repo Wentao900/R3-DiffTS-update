@@ -108,12 +108,20 @@ class CSDI_base(nn.Module):
         self.event_loss_weight = float(train_cfg.get("event_loss_weight", 0.0))
         self.event_jump_scale = float(train_cfg.get("event_jump_scale", 1.5))
         self.event_turning_weight = float(train_cfg.get("event_turning_weight", 1.0))
+        self.revin_affine = bool(train_cfg.get("revin_affine", False))
+        self.revin_eps = float(train_cfg.get("revin_eps", 1e-5))
         if isinstance(self.multi_res_horizons, int):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
             self.multi_res_horizons = []
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
+        if self.revin_affine and not self.noise_esti:
+            self.revin_weight = nn.Parameter(torch.ones(self.target_dim_base))
+            self.revin_bias = nn.Parameter(torch.zeros(self.target_dim_base))
+        else:
+            self.revin_weight = None
+            self.revin_bias = None
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -254,25 +262,24 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, feature_id=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, feature_id=feature_id
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, feature_id=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
         if not self.noise_esti:
-            means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
-            stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
-            observed_data = (observed_data - means) / stdev
+            means, stdev = self._compute_revin_stats(observed_data, cond_mask)
+            observed_data = self._apply_revin_norm(observed_data, means, stdev, feature_id=feature_id)
 
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
@@ -317,6 +324,41 @@ class CSDI_base(nn.Module):
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
             loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
+
+    def _compute_revin_stats(self, observed_data, cond_mask):
+        denom = cond_mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+        means = torch.sum(observed_data * cond_mask, dim=2, keepdim=True) / denom
+        var = torch.sum(((observed_data - means) ** 2) * cond_mask, dim=2, keepdim=True) / denom
+        stdev = torch.sqrt(var + self.revin_eps)
+        return means, stdev
+
+    def _get_revin_affine(self, feature_id, batch_size, target_dim, device):
+        if self.revin_weight is None or self.revin_bias is None:
+            return None, None
+        if feature_id is None:
+            weight = self.revin_weight[:target_dim].view(1, target_dim, 1).expand(batch_size, -1, -1)
+            bias = self.revin_bias[:target_dim].view(1, target_dim, 1).expand(batch_size, -1, -1)
+        else:
+            weight = self.revin_weight[feature_id]
+            bias = self.revin_bias[feature_id]
+            weight = weight.unsqueeze(-1)
+            bias = bias.unsqueeze(-1)
+        return weight.to(device), bias.to(device)
+
+    def _apply_revin_norm(self, observed_data, means, stdev, feature_id=None):
+        normalized = (observed_data - means) / stdev
+        weight, bias = self._get_revin_affine(feature_id, observed_data.shape[0], observed_data.shape[1], observed_data.device)
+        if weight is not None and bias is not None:
+            normalized = normalized * weight + bias
+        return normalized
+
+    def _apply_revin_denorm(self, observed_data, means, stdev, feature_id=None):
+        restored = observed_data
+        weight, bias = self._get_revin_affine(feature_id, observed_data.shape[0], observed_data.shape[1], observed_data.device)
+        if weight is not None and bias is not None:
+            restored = (restored - bias) / weight.clamp(min=1e-6)
+        restored = restored * stdev + means
+        return restored
 
     def _build_oracle_event_mask(self, future_true, future_mask):
         B, K, L = future_true.shape
@@ -467,7 +509,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, feature_id=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -482,9 +524,8 @@ class CSDI_base(nn.Module):
         else:
             self.sample_steps = self.num_steps
         if not self.noise_esti:
-            means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
-            stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
-            observed_data = (observed_data - means) / stdev
+            means, stdev = self._compute_revin_stats(observed_data, cond_mask)
+            observed_data = self._apply_revin_norm(observed_data, means, stdev, feature_id=feature_id)
         
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
         if self.cfg:
@@ -596,7 +637,7 @@ class CSDI_base(nn.Module):
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 imputed_samples[:, i] = 0.9 * imputed_samples[:, i] + 0.1 * predicted_from_timestep.detach()
             if not self.noise_esti:
-                imputed_samples[:, i] = imputed_samples[:, i] * stdev + means
+                imputed_samples[:, i] = self._apply_revin_denorm(imputed_samples[:, i], means, stdev, feature_id=feature_id)
         if self.save_attn:
             return imputed_samples, attn 
         else:
@@ -884,7 +925,7 @@ class CSDI_Forecasting(CSDI_base):
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior)
+        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, feature_id=feature_id)
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
@@ -956,9 +997,9 @@ class CSDI_Forecasting(CSDI_base):
                 context = None
             text_mask_f = text_mask.float() if text_mask is not None else None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, feature_id=feature_id)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, feature_id=feature_id)
 
         if self.save_attn:
             if self.save_token:

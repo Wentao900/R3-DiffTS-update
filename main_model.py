@@ -117,8 +117,8 @@ class CSDI_base(nn.Module):
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
         if self.revin_affine and not self.noise_esti:
-            self.revin_weight = nn.Parameter(torch.ones(self.target_dim_base))
-            self.revin_bias = nn.Parameter(torch.zeros(self.target_dim_base))
+            self.revin_weight = nn.Parameter(torch.ones(target_dim))
+            self.revin_bias = nn.Parameter(torch.zeros(target_dim))
         else:
             self.revin_weight = None
             self.revin_bias = None

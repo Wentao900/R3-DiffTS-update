@@ -120,6 +120,28 @@ CASE_PRESETS = OrderedDict(
                 },
             },
         ),
+        (
+            "router_guidance",
+            {
+                "description": "router_full plus sample-level guidance scaling from scale_route during inference.",
+                "updates": {
+                    "train": {
+                        "multi_res_partition_mode": "disjoint",
+                        "multi_res_use_scale_router": True,
+                        "scale_route_horizons": [1, 3, 6, 12],
+                    },
+                    "model": {
+                        "use_scale_router": True,
+                        "scale_window_candidates": [9, 18, 27, 36],
+                        "scale_route_temperature": 0.20,
+                    },
+                    "diffusion": {
+                        "scale_guidance": True,
+                        "scale_guidance_alpha": [0.9, 1.0, 1.1, 1.2],
+                    },
+                },
+            },
+        ),
     ]
 )
 

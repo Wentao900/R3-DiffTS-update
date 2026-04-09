@@ -68,6 +68,15 @@ adapt the text window and optionally the multi-resolution loss.
   - optional weighting of disjoint multi-resolution bins
 - The implementation is heuristic and low-risk: no new trainable module is added yet.
 
+## Scale-guided CFG
+Optionally convert `scale_route` into a sample-level guidance multiplier during inference.
+- Switch: `--scale_guidance`
+- Per-bin multipliers: `--scale_guidance_alpha` (for example `0.9,1.0,1.1,1.2`)
+- Behavior:
+  - when disabled, CFG uses the original global `guide_w`
+  - when enabled, each sample uses `guide_w_i = guide_w * <scale_route, alpha>`
+  - if `trend_cfg` is also enabled, the scale factor multiplies the trend-aware guidance weight
+
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
 - Stage-1: reuse the original one-shot query to retrieve E0.
@@ -116,7 +125,7 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`
 
 ## Acknowledgements
 Codes are based on:

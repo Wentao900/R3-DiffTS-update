@@ -37,6 +37,32 @@ def _parse_int_list(value):
             continue
     return [item for item in parsed if item > 0]
 
+
+def _parse_float_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parsed = []
+        for item in value:
+            try:
+                parsed.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return parsed
+    text = str(value).strip()
+    if not text:
+        return []
+    parsed = []
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            parsed.append(float(item))
+        except ValueError:
+            continue
+    return parsed
+
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
 parser.add_argument("--datatype", type=str, default="multimodal")
@@ -81,6 +107,8 @@ parser.add_argument('--use_scale_router', action='store_true', help='enable heur
 parser.add_argument('--scale_route_horizons', type=str, default='', help='comma-separated horizon endpoints for scale routing; empty uses train.multi_res_horizons or auto')
 parser.add_argument('--scale_window_candidates', type=str, default='', help='comma-separated candidate text windows; empty uses evenly spaced windows up to text_len')
 parser.add_argument('--scale_route_temperature', type=float, default=0.20, help='temperature for heuristic scale-routing soft assignment')
+parser.add_argument('--scale_guidance', action='store_true', help='modulate sample-level CFG strength with scale routing during inference')
+parser.add_argument('--scale_guidance_alpha', type=str, default='', help='comma-separated guidance multipliers aligned with scale bins, e.g. 0.9,1.0,1.1,1.2')
 parser.add_argument('--multi_res_partition_mode', type=str, default='', help='override multi-res partition mode: cumulative or disjoint')
 parser.add_argument('--multi_res_use_scale_router', action='store_true', help='weight multi-res bins with sample-level scale routing')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
@@ -159,6 +187,10 @@ args.scale_route_temperature = config["model"].get("scale_route_temperature", ar
 args.scale_window_candidates = _parse_int_list(
     config["model"].get("scale_window_candidates", args.scale_window_candidates)
 )
+args.scale_guidance = config["diffusion"].get("scale_guidance", args.scale_guidance)
+args.scale_guidance_alpha = _parse_float_list(
+    config["diffusion"].get("scale_guidance_alpha", args.scale_guidance_alpha)
+)
 args.scale_route_horizons = _parse_int_list(
     config["train"].get("scale_route_horizons", args.scale_route_horizons)
 )
@@ -225,6 +257,8 @@ config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
 config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale
 config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
+config["diffusion"]["scale_guidance"] = args.scale_guidance
+config["diffusion"]["scale_guidance_alpha"] = args.scale_guidance_alpha
 config["train"]["scale_route_horizons"] = args.scale_route_horizons
 config["train"]["multi_res_partition_mode"] = args.multi_res_partition_mode
 config["train"]["multi_res_use_scale_router"] = args.multi_res_use_scale_router

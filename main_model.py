@@ -88,6 +88,8 @@ class CSDI_base(nn.Module):
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 1.0)
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
+        self.scale_guidance = config["diffusion"].get("scale_guidance", False)
+        self.scale_guidance_alpha = config["diffusion"].get("scale_guidance_alpha", [])
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -445,6 +447,32 @@ class CSDI_base(nn.Module):
             return torch.zeros((), device=observed_data.device)
         return (weighted_loss_sum[valid_samples] / weight_sum[valid_samples]).mean()
 
+    def get_scale_guidance_factor(self, scale_route, batch_size, device):
+        if (not self.scale_guidance) or scale_route is None:
+            return torch.ones((batch_size,), device=device)
+
+        route = scale_route
+        if route.ndim == 1:
+            route = route.unsqueeze(0)
+        if route.shape[0] != batch_size:
+            route = route[:batch_size]
+        if route.numel() == 0:
+            return torch.ones((batch_size,), device=device)
+
+        alpha_cfg = self.scale_guidance_alpha
+        if not isinstance(alpha_cfg, (list, tuple)) or len(alpha_cfg) == 0:
+            alpha_cfg = [0.9, 1.0, 1.1, 1.2]
+        alpha = torch.tensor(alpha_cfg, device=device, dtype=route.dtype)
+        if alpha.numel() != route.shape[1]:
+            alpha = nn.functional.interpolate(
+                alpha.view(1, 1, -1),
+                size=route.shape[1],
+                mode="linear",
+                align_corners=True,
+            ).view(-1)
+        factor = (route * alpha.unsqueeze(0)).sum(dim=1)
+        return factor.clamp(min=0.0)
+
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)  
@@ -463,7 +491,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, scale_route=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -493,6 +521,7 @@ class CSDI_base(nn.Module):
             cfg_mask[:B] = 1.
         else:
             cfg_mask = None
+        scale_guide = self.get_scale_guidance_factor(scale_route, B, observed_data.device)
 
         for i in range(n_samples):
             if self.is_unconditional == True:
@@ -540,11 +569,14 @@ class CSDI_base(nn.Module):
                         if trend_prior is not None:
                             step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
                             trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
+                            trend_weight = trend_weight * scale_guide
                             predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
                         else:
-                            predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                            effective_guide = guide_w * scale_guide
+                            predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
                     else:
-                        predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                        effective_guide = guide_w * scale_guide
+                        predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -976,9 +1008,9 @@ class CSDI_Forecasting(CSDI_base):
                 context = None
             text_mask_f = text_mask.float() if text_mask is not None else None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, scale_route=scale_route)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, scale_route=scale_route)
 
         if self.save_attn:
             if self.save_token:

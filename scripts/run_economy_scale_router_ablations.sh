@@ -16,7 +16,7 @@ GUIDE_W=${GUIDE_W:--1}
 EPOCHS=${EPOCHS:--1}
 BATCH_SIZE=${BATCH_SIZE:--1}
 LR=${LR:--1}
-CASES=${CASES:-no_multires,cum_base,disjoint_only,router_window_only,router_loss_only,router_full}
+CASES=${CASES:-no_multires,cum_base,disjoint_only,router_window_only,router_loss_only,router_full,router_guidance}
 LABEL=${LABEL:-economy_scale_router_ablation}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 

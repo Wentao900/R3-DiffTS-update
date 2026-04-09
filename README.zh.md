@@ -88,6 +88,16 @@ bash ./run.sh
   - 可选的 disjoint multi-res loss 加权
 - 当前实现是启发式版本，不引入新的可训练 router，风险较低，便于先做消融。
 
+## 尺度引导 CFG
+可选地把 `scale_route` 转成推理期的样本级 guidance 倍数。
+- 开关：`--scale_guidance`
+- 各尺度倍率：`--scale_guidance_alpha`
+  - 例如：`0.9,1.0,1.1,1.2`
+- 行为：
+  - 关闭时，仍使用原来的全局 `guide_w`
+  - 开启时，每个样本使用 `guide_w_i = guide_w * <scale_route, alpha>`
+  - 若同时开启 `trend_cfg`，该尺度倍数会继续乘到 trend-aware guidance 上
+
 ## Guide weight 扫描
 - `--guide_w -1` 会使用内置列表自动扫描（包含 `4.5`）。
 - 如需固定某个值，直接传 `--guide_w`。
@@ -113,7 +123,7 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`
 
 ## 致谢
 代码基于：

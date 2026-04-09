@@ -88,6 +88,9 @@ parser.add_argument('--rag_stage1_topk', type=int, default=-1, help='stage-1 top
 parser.add_argument('--rag_stage2_topk', type=int, default=-1, help='stage-2 topk for two-stage RAG (-1 for auto)')
 parser.add_argument('--two_stage_gate', action='store_true', default=True, help='enable safety gate for two-stage RAG')
 parser.add_argument('--trend_slope_eps', type=float, default=1e-3, help='slope epsilon for two-stage RAG gating')
+parser.add_argument('--rag_consistency', action='store_true', help='compute evidence consistency from retrieved snippets')
+parser.add_argument('--consistency_unknown_penalty', type=float, default=1.0, help='penalty strength for unknown evidence stances')
+parser.add_argument('--consistency_conflict_penalty', type=float, default=0.5, help='penalty strength for conflicting evidence stances')
 parser.add_argument('--cot_model', type=str, default=None, help='local causal LM id/path for CoT generation (set None to use template)')
 parser.add_argument('--cot_max_new_tokens', type=int, default=96, help='max new tokens for CoT generator')
 parser.add_argument('--cot_temperature', type=float, default=0.7, help='sampling temperature for CoT generator')
@@ -109,6 +112,8 @@ parser.add_argument('--scale_window_candidates', type=str, default='', help='com
 parser.add_argument('--scale_route_temperature', type=float, default=0.20, help='temperature for heuristic scale-routing soft assignment')
 parser.add_argument('--scale_guidance', action='store_true', help='modulate sample-level CFG strength with scale routing during inference')
 parser.add_argument('--scale_guidance_alpha', type=str, default='', help='comma-separated guidance multipliers aligned with scale bins, e.g. 0.9,1.0,1.1,1.2')
+parser.add_argument('--consistency_guidance', action='store_true', help='multiply inference guidance by evidence consistency')
+parser.add_argument('--consistency_threshold', type=float, default=0.0, help='zero-out consistency guidance below this threshold')
 parser.add_argument('--multi_res_partition_mode', type=str, default='', help='override multi-res partition mode: cumulative or disjoint')
 parser.add_argument('--multi_res_use_scale_router', action='store_true', help='weight multi-res bins with sample-level scale routing')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
@@ -164,6 +169,9 @@ args.rag_stage1_topk = config["model"].get("rag_stage1_topk", args.rag_stage1_to
 args.rag_stage2_topk = config["model"].get("rag_stage2_topk", args.rag_stage2_topk)
 args.two_stage_gate = config["model"].get("two_stage_gate", args.two_stage_gate)
 args.trend_slope_eps = config["model"].get("trend_slope_eps", args.trend_slope_eps)
+args.rag_consistency = config["model"].get("rag_consistency", args.rag_consistency)
+args.consistency_unknown_penalty = config["model"].get("consistency_unknown_penalty", args.consistency_unknown_penalty)
+args.consistency_conflict_penalty = config["model"].get("consistency_conflict_penalty", args.consistency_conflict_penalty)
 if args.cot_only:
     args.use_rag_cot = True
     args.rag_topk = 0
@@ -191,6 +199,8 @@ args.scale_guidance = config["diffusion"].get("scale_guidance", args.scale_guida
 args.scale_guidance_alpha = _parse_float_list(
     config["diffusion"].get("scale_guidance_alpha", args.scale_guidance_alpha)
 )
+args.consistency_guidance = config["diffusion"].get("consistency_guidance", args.consistency_guidance)
+args.consistency_threshold = config["diffusion"].get("consistency_threshold", args.consistency_threshold)
 args.scale_route_horizons = _parse_int_list(
     config["train"].get("scale_route_horizons", args.scale_route_horizons)
 )
@@ -240,6 +250,9 @@ config["model"]["rag_stage1_topk"] = args.rag_stage1_topk
 config["model"]["rag_stage2_topk"] = args.rag_stage2_topk
 config["model"]["two_stage_gate"] = args.two_stage_gate
 config["model"]["trend_slope_eps"] = args.trend_slope_eps
+config["model"]["rag_consistency"] = args.rag_consistency
+config["model"]["consistency_unknown_penalty"] = args.consistency_unknown_penalty
+config["model"]["consistency_conflict_penalty"] = args.consistency_conflict_penalty
 config["model"]["cot_model"] = args.cot_model
 config["model"]["cot_max_new_tokens"] = args.cot_max_new_tokens
 config["model"]["cot_temperature"] = args.cot_temperature
@@ -259,6 +272,8 @@ config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
 config["diffusion"]["scale_guidance"] = args.scale_guidance
 config["diffusion"]["scale_guidance_alpha"] = args.scale_guidance_alpha
+config["diffusion"]["consistency_guidance"] = args.consistency_guidance
+config["diffusion"]["consistency_threshold"] = args.consistency_threshold
 config["train"]["scale_route_horizons"] = args.scale_route_horizons
 config["train"]["multi_res_partition_mode"] = args.multi_res_partition_mode
 config["train"]["multi_res_use_scale_router"] = args.multi_res_use_scale_router

@@ -4,7 +4,7 @@ import sys
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,9 @@ class RAGCoTConfig:
     rag_stage2_topk: int = -1
     two_stage_gate: bool = True
     trend_slope_eps: float = 1e-3
+    rag_consistency: bool = False
+    consistency_unknown_penalty: float = 1.0
+    consistency_conflict_penalty: float = 0.5
     debug: bool = False
 
 
@@ -68,7 +71,7 @@ class RAGCoTPipeline:
         self.search_df = self._prep_search_df(search_df)
         self.retriever = self._fit_retriever(self.search_df)
         self.generator = self._init_generator(self.config)
-        self.cache: OrderedDict[str, Dict[str, str]] = OrderedDict()
+        self.cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 
     def _resolve_stage2_topk(self, stage2_topk: int) -> int:
         if stage2_topk and stage2_topk > 0:
@@ -161,6 +164,83 @@ class RAGCoTPipeline:
             for i in top_idx
             if sims[i] > 0 and len(self.search_df.iloc[i].fact.strip()) > 0
         ]
+
+    def _infer_evidence_stance(self, text: str) -> str:
+        if not text:
+            return "unknown"
+        normalized = f" {re.sub(r'[^a-z]+', ' ', text.lower())} "
+        up_hits = sum(
+            normalized.count(token)
+            for token in (
+                " up ", " upward ", " increase ", " increased ", " rising ", " rise ",
+                " growth ", " higher ", " gain ", " gains ", " strong ", " expansion ",
+                " accelerate ", " accelerated ", " bullish ", " improve ", " improved ",
+            )
+        )
+        down_hits = sum(
+            normalized.count(token)
+            for token in (
+                " down ", " downward ", " decrease ", " decreased ", " decline ", " declined ",
+                " lower ", " drop ", " dropped ", " contraction ", " weak ", " slowdown ",
+                " slow ", " slower ", " bearish ", " worsen ", " worsened ", " fall ", " fell ",
+            )
+        )
+        flat_hits = sum(
+            normalized.count(token)
+            for token in (
+                " flat ", " stable ", " steady ", " unchanged ", " neutral ", " mixed ",
+                " balanced ", " range-bound ", " sideways ", " constant ",
+            )
+        )
+        scores = {
+            "up": up_hits,
+            "down": down_hits,
+            "flat": flat_hits,
+        }
+        best_label, best_score = max(scores.items(), key=lambda item: item[1])
+        if best_score <= 0:
+            return "unknown"
+        tied = sum(1 for value in scores.values() if value == best_score)
+        if tied > 1:
+            return "unknown"
+        return best_label
+
+    def _score_evidence_consistency(self, retrieved: List[str]) -> Dict[str, Any]:
+        base_result = {
+            "stance_list": [],
+            "stance_probs": {
+                "up": 0.0,
+                "down": 0.0,
+                "flat": 0.0,
+                "unknown": 0.0,
+            },
+            "consistency_score": 1.0,
+        }
+        if (not self.config.rag_consistency) or len(retrieved) == 0:
+            return base_result
+
+        stance_list = [self._infer_evidence_stance(item) for item in retrieved]
+        total = max(len(stance_list), 1)
+        counts = {
+            "up": stance_list.count("up"),
+            "down": stance_list.count("down"),
+            "flat": stance_list.count("flat"),
+            "unknown": stance_list.count("unknown"),
+        }
+        probs = {key: float(value) / float(total) for key, value in counts.items()}
+        dominant = max(probs["up"], probs["down"], probs["flat"])
+        known_probs = sorted([probs["up"], probs["down"], probs["flat"]], reverse=True)
+        runner_up = known_probs[1] if len(known_probs) > 1 else 0.0
+        unknown_penalty = float(np.clip(self.config.consistency_unknown_penalty, 0.0, 1.0))
+        conflict_penalty = float(np.clip(self.config.consistency_conflict_penalty, 0.0, 1.0))
+        consistency = dominant
+        consistency *= max(0.0, 1.0 - unknown_penalty * probs["unknown"])
+        consistency *= max(0.0, 1.0 - conflict_penalty * runner_up)
+        return {
+            "stance_list": stance_list,
+            "stance_probs": probs,
+            "consistency_score": float(np.clip(consistency, 0.0, 1.0)),
+        }
 
     def _summarize_numeric(self, numeric_history: Sequence[float]) -> str:
         arr = np.asarray(numeric_history, dtype=float).flatten()
@@ -434,17 +514,21 @@ class RAGCoTPipeline:
         self,
         numeric_history: Sequence[float],
         base_text: str,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         numeric_summary = self._summarize_numeric(numeric_history)
         query = self._build_query(numeric_summary, base_text)
         retrieved = self._retrieve(query)
         prompt = self._format_prompt(numeric_summary, retrieved)
         cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
         composed_text = self._compose_text(base_text, retrieved, cot_text)
+        consistency_info = self._score_evidence_consistency(retrieved)
         return {
             "cot_text": cot_text,
             "retrieved_text": " ".join(retrieved),
             "composed_text": composed_text,
+            "stance_list": consistency_info["stance_list"],
+            "stance_probs": consistency_info["stance_probs"],
+            "consistency_score": consistency_info["consistency_score"],
         }
 
     def build_guidance_text(
@@ -453,7 +537,7 @@ class RAGCoTPipeline:
         start_date,
         end_date,
         base_text: str,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         cache_key = f"{start_date}-{end_date}"
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -509,11 +593,15 @@ class RAGCoTPipeline:
             trend_hypothesis,
             final_retrieved,
         )
+        consistency_info = self._score_evidence_consistency(final_retrieved)
 
         packaged = {
             "cot_text": trend_hypothesis,
             "retrieved_text": " ".join(final_retrieved),
             "composed_text": composed_text,
+            "stance_list": consistency_info["stance_list"],
+            "stance_probs": consistency_info["stance_probs"],
+            "consistency_score": consistency_info["consistency_score"],
         }
         self.cache[cache_key] = packaged
         if len(self.cache) > self.config.cache_size:

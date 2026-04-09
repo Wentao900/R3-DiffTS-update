@@ -98,6 +98,21 @@ bash ./run.sh
   - 开启时，每个样本使用 `guide_w_i = guide_w * <scale_route, alpha>`
   - 若同时开启 `trend_cfg`，该尺度倍数会继续乘到 trend-aware guidance 上
 
+## 证据一致性引导
+可选地对检索到的证据做一致性打分，并在推理时压低不可靠证据对应的 guidance。
+- 检索侧开关：
+  - `--rag_consistency`
+  - `--consistency_unknown_penalty`
+  - `--consistency_conflict_penalty`
+- 扩散侧开关：
+  - `--consistency_guidance`
+  - `--consistency_threshold`
+- 行为：
+  - 每条 evidence 会被启发式映射到 `up/down/flat/unknown`
+  - 再根据主导立场、unknown 比例、立场冲突计算 `[0,1]` 的 `consistency_score`
+  - 开启后，推理期使用 `guide_w_i = guide_w_i * consistency_score`
+  - 阈值较高时，可对低一致性样本直接把 guidance 置零
+
 ## Guide weight 扫描
 - `--guide_w -1` 会使用内置列表自动扫描（包含 `4.5`）。
 - 如需固定某个值，直接传 `--guide_w`。
@@ -123,7 +138,7 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
 
 ## 致谢
 代码基于：

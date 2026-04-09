@@ -77,6 +77,21 @@ Optionally convert `scale_route` into a sample-level guidance multiplier during 
   - when enabled, each sample uses `guide_w_i = guide_w * <scale_route, alpha>`
   - if `trend_cfg` is also enabled, the scale factor multiplies the trend-aware guidance weight
 
+## Evidence Consistency Guidance
+Optionally score agreement across retrieved evidence and use that score to down-weight unreliable guidance.
+- Retrieval-side switches:
+  - `--rag_consistency`
+  - `--consistency_unknown_penalty`
+  - `--consistency_conflict_penalty`
+- Diffusion-side switches:
+  - `--consistency_guidance`
+  - `--consistency_threshold`
+- Behavior:
+  - each retrieved snippet is heuristically mapped to `up/down/flat/unknown`
+  - a consistency score in `[0,1]` is computed from dominant stance, unknown mass, and stance conflict
+  - when enabled, inference uses `guide_w_i = guide_w_i * consistency`
+  - low thresholds can zero-out guidance entirely for low-consistency samples
+
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
 - Stage-1: reuse the original one-shot query to retrieve E0.
@@ -125,7 +140,7 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
 
 ## Acknowledgements
 Codes are based on:

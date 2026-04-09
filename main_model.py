@@ -90,6 +90,8 @@ class CSDI_base(nn.Module):
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
         self.scale_guidance = config["diffusion"].get("scale_guidance", False)
         self.scale_guidance_alpha = config["diffusion"].get("scale_guidance_alpha", [])
+        self.consistency_guidance = config["diffusion"].get("consistency_guidance", False)
+        self.consistency_threshold = float(config["diffusion"].get("consistency_threshold", 0.0))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -255,18 +257,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, scale_route=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, scale_route=None, consistency_score=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, scale_route=scale_route
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, scale_route=scale_route, consistency_score=consistency_score
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, scale_route=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, scale_route=None, consistency_score=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -473,6 +475,21 @@ class CSDI_base(nn.Module):
         factor = (route * alpha.unsqueeze(0)).sum(dim=1)
         return factor.clamp(min=0.0)
 
+    def get_consistency_guidance_factor(self, consistency_score, batch_size, device):
+        if (not self.consistency_guidance) or consistency_score is None:
+            return torch.ones((batch_size,), device=device)
+
+        score = consistency_score.reshape(-1).to(device)
+        if score.numel() == 1 and batch_size > 1:
+            score = score.repeat(batch_size)
+        elif score.numel() != batch_size:
+            score = score[:batch_size]
+        score = score.clamp(min=0.0, max=1.0)
+        threshold = float(np.clip(self.consistency_threshold, 0.0, 1.0))
+        if threshold > 0.0:
+            score = torch.where(score >= threshold, score, torch.zeros_like(score))
+        return score
+
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)  
@@ -491,7 +508,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, scale_route=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, scale_route=None, consistency_score=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -522,6 +539,8 @@ class CSDI_base(nn.Module):
         else:
             cfg_mask = None
         scale_guide = self.get_scale_guidance_factor(scale_route, B, observed_data.device)
+        consistency_guide = self.get_consistency_guidance_factor(consistency_score, B, observed_data.device)
+        guidance_factor = scale_guide * consistency_guide
 
         for i in range(n_samples):
             if self.is_unconditional == True:
@@ -569,13 +588,13 @@ class CSDI_base(nn.Module):
                         if trend_prior is not None:
                             step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
                             trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
-                            trend_weight = trend_weight * scale_guide
+                            trend_weight = trend_weight * guidance_factor
                             predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
                         else:
-                            effective_guide = guide_w * scale_guide
+                            effective_guide = guide_w * guidance_factor
                             predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
                     else:
-                        effective_guide = guide_w * scale_guide
+                        effective_guide = guide_w * guidance_factor
                         predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
@@ -692,6 +711,7 @@ class CSDI_Forecasting(CSDI_base):
         text_mask = batch["text_mark"].to(self.device).int()
         trend_prior = batch.get("trend_prior")
         scale_route = batch.get("scale_route")
+        consistency_score = batch.get("consistency_score")
         if trend_prior is None:
             trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)
         else:
@@ -700,6 +720,10 @@ class CSDI_Forecasting(CSDI_base):
             scale_route = scale_route.to(self.device).float()
             if scale_route.numel() == 0:
                 scale_route = None
+        if consistency_score is not None:
+            consistency_score = consistency_score.to(self.device).float()
+            if consistency_score.numel() == 0:
+                consistency_score = None
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
@@ -729,6 +753,7 @@ class CSDI_Forecasting(CSDI_base):
             text_mask, 
             trend_prior,
             scale_route,
+            consistency_score,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -840,7 +865,23 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 12:
+        if len(data) == 13:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior,
+                scale_route,
+                consistency_score,
+            ) = data
+        elif len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -855,21 +896,7 @@ class CSDI_Forecasting(CSDI_base):
                 trend_prior,
                 scale_route,
             ) = data
-        elif len(data) == 11:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior,
-            ) = data
-            scale_route = None
+            consistency_score = None
         else:
             (
                 observed_data,
@@ -885,6 +912,7 @@ class CSDI_Forecasting(CSDI_base):
             text_mask = None
             trend_prior = None
             scale_route = None
+            consistency_score = None
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -933,11 +961,28 @@ class CSDI_Forecasting(CSDI_base):
             context=context,
             trend_prior=trend_prior,
             scale_route=scale_route,
+            consistency_score=consistency_score,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 12:
+        if len(data) == 13:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior,
+                scale_route,
+                consistency_score,
+            ) = data
+        elif len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -952,21 +997,7 @@ class CSDI_Forecasting(CSDI_base):
                 trend_prior,
                 scale_route,
             ) = data
-        elif len(data) == 11:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior,
-            ) = data
-            scale_route = None
+            consistency_score = None
         else:
             (
                 observed_data,
@@ -982,6 +1013,7 @@ class CSDI_Forecasting(CSDI_base):
             text_mask = None
             trend_prior = None
             scale_route = None
+            consistency_score = None
 
         with torch.no_grad():
             cond_mask = gt_mask
@@ -1008,9 +1040,9 @@ class CSDI_Forecasting(CSDI_base):
                 context = None
             text_mask_f = text_mask.float() if text_mask is not None else None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, scale_route=scale_route)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, scale_route=scale_route, consistency_score=consistency_score)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, scale_route=scale_route)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, scale_route=scale_route, consistency_score=consistency_score)
 
         if self.save_attn:
             if self.save_token:

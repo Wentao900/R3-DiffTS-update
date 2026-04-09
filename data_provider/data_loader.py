@@ -59,6 +59,8 @@ class Dataset_Custom(Dataset):
                  cot_load_in_8bit=False, cot_load_in_4bit=False, trend_cfg=False,
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
                  two_stage_gate=True, trend_slope_eps=1e-3,
+                 rag_consistency=False, consistency_unknown_penalty=1.0,
+                 consistency_conflict_penalty=0.5,
                  use_scale_router=False, scale_route_horizons=None,
                  scale_window_candidates=None, scale_route_temperature=0.20):
         # size [seq_len, label_len, pred_len]
@@ -98,6 +100,9 @@ class Dataset_Custom(Dataset):
         self.rag_stage2_topk = rag_stage2_topk
         self.two_stage_gate = two_stage_gate
         self.trend_slope_eps = trend_slope_eps
+        self.rag_consistency = rag_consistency
+        self.consistency_unknown_penalty = consistency_unknown_penalty
+        self.consistency_conflict_penalty = consistency_conflict_penalty
         self.use_scale_router = use_scale_router
         self.scale_route_temperature = max(float(scale_route_temperature), 1e-3)
         self.guidance_cache = {}
@@ -154,6 +159,9 @@ class Dataset_Custom(Dataset):
                 rag_stage2_topk=self.rag_stage2_topk,
                 two_stage_gate=self.two_stage_gate,
                 trend_slope_eps=self.trend_slope_eps,
+                rag_consistency=self.rag_consistency,
+                consistency_unknown_penalty=self.consistency_unknown_penalty,
+                consistency_conflict_penalty=self.consistency_conflict_penalty,
             )
             self.rag_cot = RAGCoTPipeline(
                 domain=self.domain,
@@ -418,6 +426,7 @@ class Dataset_Custom(Dataset):
             seq_x_txt, txt_mark = 'NA', 0
             text_dropped = True
         rag_retrieved, cot_text = '', ''
+        consistency_score = 1.0
         if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
             cached = self.guidance_cache.get(index, None)
             if cached is None:
@@ -430,10 +439,11 @@ class Dataset_Custom(Dataset):
                 seq_x_txt = guidance["composed_text"]
                 cot_text = guidance["cot_text"]
                 rag_retrieved = guidance["retrieved_text"]
+                consistency_score = float(guidance.get("consistency_score", 1.0))
                 txt_mark = 1 if len(seq_x_txt.strip()) > 0 else 0
-                self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved)
+                self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved, consistency_score)
             else:
-                seq_x_txt, txt_mark, cot_text, rag_retrieved = cached
+                seq_x_txt, txt_mark, cot_text, rag_retrieved, consistency_score = cached
         if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
             txt_mark = 0
 
@@ -459,6 +469,7 @@ class Dataset_Custom(Dataset):
             'trend_prior': trend_prior,
             'scale_route': scale_route,
             'scale_window': np.int64(dynamic_text_len),
+            'consistency_score': np.float32(consistency_score),
         }
 
         return s

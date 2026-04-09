@@ -39,6 +39,10 @@ def data_provider(args, flag):
         extra_kwargs['rag_stage2_topk'] = getattr(args, "rag_stage2_topk", -1)
         extra_kwargs['two_stage_gate'] = getattr(args, "two_stage_gate", True)
         extra_kwargs['trend_slope_eps'] = getattr(args, "trend_slope_eps", 1e-3)
+        extra_kwargs['use_scale_router'] = getattr(args, "use_scale_router", False)
+        extra_kwargs['scale_route_horizons'] = getattr(args, "scale_route_horizons", [])
+        extra_kwargs['scale_window_candidates'] = getattr(args, "scale_window_candidates", [])
+        extra_kwargs['scale_route_temperature'] = getattr(args, "scale_route_temperature", 0.20)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

@@ -11,6 +11,32 @@ from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate
 
+
+def _parse_int_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parsed = []
+        for item in value:
+            try:
+                parsed.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return [item for item in parsed if item > 0]
+    text = str(value).strip()
+    if not text:
+        return []
+    parsed = []
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            parsed.append(int(item))
+        except ValueError:
+            continue
+    return [item for item in parsed if item > 0]
+
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
 parser.add_argument("--datatype", type=str, default="multimodal")
@@ -51,6 +77,12 @@ parser.add_argument('--trend_strength_scale', type=float, default=1.0, help='aff
 parser.add_argument('--trend_volatility_scale', type=float, default=1.0, help='scale for trend volatility in 1/(1+v*vol) penalty')
 parser.add_argument('--trend_time_floor', type=float, default=0.0, help='minimum value added to trend time schedule')
 parser.add_argument('--save_trend_prior', action='store_true', help='save per-sample trend priors during evaluation')
+parser.add_argument('--use_scale_router', action='store_true', help='enable heuristic sample-level scale routing')
+parser.add_argument('--scale_route_horizons', type=str, default='', help='comma-separated horizon endpoints for scale routing; empty uses train.multi_res_horizons or auto')
+parser.add_argument('--scale_window_candidates', type=str, default='', help='comma-separated candidate text windows; empty uses evenly spaced windows up to text_len')
+parser.add_argument('--scale_route_temperature', type=float, default=0.20, help='temperature for heuristic scale-routing soft assignment')
+parser.add_argument('--multi_res_partition_mode', type=str, default='', help='override multi-res partition mode: cumulative or disjoint')
+parser.add_argument('--multi_res_use_scale_router', action='store_true', help='weight multi-res bins with sample-level scale routing')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
 parser.add_argument('--freq', type=str, default='m', help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -122,6 +154,24 @@ args.trend_strength_scale = config["diffusion"].get("trend_strength_scale", args
 args.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", args.trend_volatility_scale)
 args.trend_time_floor = config["diffusion"].get("trend_time_floor", args.trend_time_floor)
 args.save_trend_prior = config["model"].get("save_trend_prior", args.save_trend_prior)
+args.use_scale_router = config["model"].get("use_scale_router", args.use_scale_router)
+args.scale_route_temperature = config["model"].get("scale_route_temperature", args.scale_route_temperature)
+args.scale_window_candidates = _parse_int_list(
+    config["model"].get("scale_window_candidates", args.scale_window_candidates)
+)
+args.scale_route_horizons = _parse_int_list(
+    config["train"].get("scale_route_horizons", args.scale_route_horizons)
+)
+if len(args.scale_route_horizons) == 0:
+    args.scale_route_horizons = _parse_int_list(config["train"].get("multi_res_horizons", []))
+args.multi_res_partition_mode = config["train"].get(
+    "multi_res_partition_mode",
+    args.multi_res_partition_mode or "cumulative",
+)
+args.multi_res_use_scale_router = config["train"].get(
+    "multi_res_use_scale_router",
+    args.multi_res_use_scale_router,
+)
 if args.embed == 'timeF':
     if config["model"]["timestep_branch"] or config["model"]["timestep_emb_cat"]:
         config["model"]["timestep_dim"] = timestep_dim_dict[args.freq] + extra_timestep_dims
@@ -166,12 +216,18 @@ config["model"]["cot_device"] = args.cot_device
 config["model"]["cot_load_in_8bit"] = args.cot_load_in_8bit
 config["model"]["cot_load_in_4bit"] = args.cot_load_in_4bit
 config["model"]["save_trend_prior"] = args.save_trend_prior
+config["model"]["use_scale_router"] = args.use_scale_router
+config["model"]["scale_window_candidates"] = args.scale_window_candidates
+config["model"]["scale_route_temperature"] = args.scale_route_temperature
 config["diffusion"]["trend_cfg"] = args.trend_cfg
 config["diffusion"]["trend_cfg_power"] = args.trend_cfg_power
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
 config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale
 config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
+config["train"]["scale_route_horizons"] = args.scale_route_horizons
+config["train"]["multi_res_partition_mode"] = args.multi_res_partition_mode
+config["train"]["multi_res_use_scale_router"] = args.multi_res_use_scale_router
 
 if args.c_mask_prob > 0:
     config["diffusion"]["c_mask_prob"] = args.c_mask_prob

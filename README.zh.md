@@ -57,6 +57,8 @@ bash ./run.sh
   - `multi_res_dynamic_by_epoch`：按训练 epoch 做 curriculum
   - `multi_res_dynamic_by_trend`：按 `trend_prior` 的强度/波动度调整 horizon 权重
   - `multi_res_dynamic_min_weight`：动态权重下限，避免某个 horizon 被完全压掉
+  - `multi_res_partition_mode`：`cumulative`（原前缀累计模式）或 `disjoint`（互不重叠区间，如 `[1] [2-3] [4-6] [7-12]`）
+  - `multi_res_use_scale_router`：是否使用样本级尺度路由权重来加权 multi-res 各区间
 - 示例（YAML）：
   ```yaml
   train:
@@ -69,7 +71,22 @@ bash ./run.sh
     multi_res_dynamic_by_epoch: true
     multi_res_dynamic_by_trend: true
     multi_res_dynamic_min_weight: 0.2
+    multi_res_partition_mode: disjoint
+    multi_res_use_scale_router: true
   ```
+
+## 启发式尺度路由（吸收本周周报）
+从数值历史中估计样本级尺度偏好 `r_i`，并用它统一驱动文本窗口和可选的 multi-res 区间权重。
+- 开关：`--use_scale_router`
+- 路由区间：`train.scale_route_horizons`
+  - 若未显式设置，优先复用 `train.multi_res_horizons`，再自动生成
+- 文本窗口候选：`model.scale_window_candidates`
+  - 若未设置，则在 `text_len` 范围内自动均匀生成
+- 软分配温度：`model.scale_route_temperature`
+- 当前接入位置：
+  - dataset 侧动态文本窗口
+  - 可选的 disjoint multi-res loss 加权
+- 当前实现是启发式版本，不引入新的可训练 router，风险较低，便于先做消融。
 
 ## Guide weight 扫描
 - `--guide_w -1` 会使用内置列表自动扫描（包含 `4.5`）。
@@ -94,6 +111,9 @@ python -u exe_forecasting.py \
 ## Scripts
 - 全量跑 trend CFG：`scripts/run_all_datasets_trendcfg.sh`
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
+- Economy 消融：
+  - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`
 
 ## 致谢
 代码基于：

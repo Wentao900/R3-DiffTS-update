@@ -105,6 +105,8 @@ class CSDI_base(nn.Module):
         self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
         self.multi_res_dynamic_by_trend = bool(train_cfg.get("multi_res_dynamic_by_trend", True))
         self.multi_res_dynamic_min_weight = float(train_cfg.get("multi_res_dynamic_min_weight", 0.2))
+        self.multi_res_partition_mode = str(train_cfg.get("multi_res_partition_mode", "cumulative")).lower()
+        self.multi_res_use_scale_router = bool(train_cfg.get("multi_res_use_scale_router", False))
         if isinstance(self.multi_res_horizons, int):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
@@ -251,18 +253,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, scale_route=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, scale_route=scale_route
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, scale_route=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -308,7 +310,14 @@ class CSDI_base(nn.Module):
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
-            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
+            aux_loss = self._calc_multi_res_loss(
+                observed_data,
+                predicted,
+                target_mask,
+                t=t,
+                trend_prior=trend_prior,
+                scale_route=scale_route,
+            )
             loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
 
@@ -344,23 +353,42 @@ class CSDI_base(nn.Module):
 
         return torch.stack(components, dim=0).mean(dim=0)
 
-    def _get_multi_res_horizon_weights(self, horizons, batch_size, t=None, trend_prior=None):
+    def _get_multi_res_horizon_weights(self, horizons, batch_size, t=None, trend_prior=None, scale_route=None):
         horizon_tensor = torch.tensor(horizons, device=self.device, dtype=torch.float32)
         if len(horizons) <= 1:
-            return torch.ones((batch_size, len(horizons)), device=self.device)
+            weights = torch.ones((batch_size, len(horizons)), device=self.device)
+            if self.multi_res_use_scale_router and scale_route is not None and len(horizons) == 1:
+                if scale_route.ndim == 2 and scale_route.shape[1] >= 1:
+                    weights = scale_route[:, :1].clamp(min=1e-6)
+            return weights
 
         if not self.multi_res_dynamic:
-            return torch.ones((batch_size, len(horizons)), device=self.device)
+            weights = torch.ones((batch_size, len(horizons)), device=self.device)
+        else:
+            confidence = self._get_multi_res_confidence(batch_size, t=t, trend_prior=trend_prior).unsqueeze(1)
+            horizon_pos = (horizon_tensor - horizon_tensor.min()) / max((horizon_tensor.max() - horizon_tensor.min()).item(), 1.0)
+            horizon_pos = horizon_pos.unsqueeze(0).expand(batch_size, -1)
 
-        confidence = self._get_multi_res_confidence(batch_size, t=t, trend_prior=trend_prior).unsqueeze(1)
-        horizon_pos = (horizon_tensor - horizon_tensor.min()) / max((horizon_tensor.max() - horizon_tensor.min()).item(), 1.0)
-        horizon_pos = horizon_pos.unsqueeze(0).expand(batch_size, -1)
+            min_w = min(max(self.multi_res_dynamic_min_weight, 0.0), 1.0)
+            weights = min_w + (1.0 - min_w) * (1.0 - torch.abs(horizon_pos - confidence))
 
-        min_w = min(max(self.multi_res_dynamic_min_weight, 0.0), 1.0)
-        weights = min_w + (1.0 - min_w) * (1.0 - torch.abs(horizon_pos - confidence))
+        if self.multi_res_use_scale_router and scale_route is not None:
+            route = scale_route
+            if route.ndim == 1:
+                route = route.unsqueeze(0)
+            if route.shape[0] != batch_size:
+                route = route[:batch_size]
+            if route.shape[1] != len(horizons):
+                route = nn.functional.interpolate(
+                    route.unsqueeze(1),
+                    size=len(horizons),
+                    mode="linear",
+                    align_corners=True,
+                ).squeeze(1)
+            weights = weights * route.clamp(min=1e-6)
         return weights.clamp(min=1e-6)
 
-    def _calc_multi_res_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None):
+    def _calc_multi_res_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None, scale_route=None):
         if self.pred_len <= 0:
             return torch.zeros((), device=observed_data.device)
         horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
@@ -369,15 +397,28 @@ class CSDI_base(nn.Module):
         max_pred = int(self.pred_len)
         horizons = sorted(set(min(h, max_pred) for h in horizons))
         batch_size = observed_data.shape[0]
-        horizon_weights = self._get_multi_res_horizon_weights(horizons, batch_size, t=t, trend_prior=trend_prior)
+        horizon_weights = self._get_multi_res_horizon_weights(
+            horizons,
+            batch_size,
+            t=t,
+            trend_prior=trend_prior,
+            scale_route=scale_route,
+        )
         weighted_loss_sum = torch.zeros((batch_size,), device=observed_data.device)
         weight_sum = torch.zeros((batch_size,), device=observed_data.device)
+        prev_h = 0
         for h_idx, h in enumerate(horizons):
             if h <= 0:
                 continue
             horizon_mask = torch.zeros_like(target_mask)
-            start = int(self.lookback_len)
+            if self.multi_res_partition_mode == "disjoint":
+                start = int(self.lookback_len + prev_h)
+            else:
+                start = int(self.lookback_len)
             end = int(self.lookback_len + h)
+            prev_h = h
+            if end <= start:
+                continue
             horizon_mask[:, :, start:end] = 1.0
             horizon_mask = horizon_mask * target_mask
             num_eval = horizon_mask.sum(dim=(1, 2))
@@ -618,10 +659,15 @@ class CSDI_Forecasting(CSDI_base):
         gt_mask = batch["gt_mask"].to(self.device).float()
         text_mask = batch["text_mark"].to(self.device).int()
         trend_prior = batch.get("trend_prior")
+        scale_route = batch.get("scale_route")
         if trend_prior is None:
             trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)
         else:
             trend_prior = trend_prior.to(self.device).float()
+        if scale_route is not None:
+            scale_route = scale_route.to(self.device).float()
+            if scale_route.numel() == 0:
+                scale_route = None
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
@@ -650,6 +696,7 @@ class CSDI_Forecasting(CSDI_base):
             texts,
             text_mask, 
             trend_prior,
+            scale_route,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -761,7 +808,22 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior,
+                scale_route,
+            ) = data
+        elif len(data) == 11:
             (
                 observed_data,
                 observed_mask,
@@ -775,20 +837,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
                 trend_prior,
             ) = data
-        elif len(data) == 10:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-            ) = data
-            trend_prior = None
+            scale_route = None
         else:
             (
                 observed_data,
@@ -803,6 +852,7 @@ class CSDI_Forecasting(CSDI_base):
             texts = None
             text_mask = None
             trend_prior = None
+            scale_route = None
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -839,11 +889,38 @@ class CSDI_Forecasting(CSDI_base):
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior)
+        return loss_func(
+            observed_data,
+            cond_mask,
+            observed_mask,
+            side_info,
+            is_train,
+            timesteps=timesteps,
+            timestep_emb=timestep_emb,
+            size_emb=size_emb,
+            context=context,
+            trend_prior=trend_prior,
+            scale_route=scale_route,
+        )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior,
+                scale_route,
+            ) = data
+        elif len(data) == 11:
             (
                 observed_data,
                 observed_mask,
@@ -857,20 +934,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
                 trend_prior,
             ) = data
-        elif len(data) == 10:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-            ) = data
-            trend_prior = None
+            scale_route = None
         else:
             (
                 observed_data,
@@ -885,6 +949,7 @@ class CSDI_Forecasting(CSDI_base):
             texts = None
             text_mask = None
             trend_prior = None
+            scale_route = None
 
         with torch.no_grad():
             cond_mask = gt_mask

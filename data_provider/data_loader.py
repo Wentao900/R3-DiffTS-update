@@ -58,7 +58,9 @@ class Dataset_Custom(Dataset):
                  cot_cache_size=1024, cot_device=None, rag_use_retrieval=True,
                  cot_load_in_8bit=False, cot_load_in_4bit=False, trend_cfg=False,
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
-                 two_stage_gate=True, trend_slope_eps=1e-3):
+                 two_stage_gate=True, trend_slope_eps=1e-3,
+                 use_scale_router=False, scale_route_horizons=None,
+                 scale_window_candidates=None, scale_route_temperature=0.20):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -96,6 +98,8 @@ class Dataset_Custom(Dataset):
         self.rag_stage2_topk = rag_stage2_topk
         self.two_stage_gate = two_stage_gate
         self.trend_slope_eps = trend_slope_eps
+        self.use_scale_router = use_scale_router
+        self.scale_route_temperature = max(float(scale_route_temperature), 1e-3)
         self.guidance_cache = {}
 
         self.root_path = root_path
@@ -116,6 +120,20 @@ class Dataset_Custom(Dataset):
         self.__read_data__()
         self.domain = data_path.split('/')[0]
         self.desc = get_desc(self.domain, self.seq_len, self.pred_len)
+        self.scale_route_horizons = self._resolve_scale_route_horizons(
+            scale_route_horizons,
+            scale_window_candidates,
+        )
+        self.scale_num_bins = len(self.scale_route_horizons)
+        self.scale_window_candidates = self._resolve_scale_window_candidates(
+            scale_window_candidates,
+            self.scale_num_bins,
+        )
+        if self.use_scale_router and self.scale_num_bins == 0:
+            warnings.warn(
+                "Scale router was enabled but no valid bins could be resolved; falling back to fixed text windows."
+            )
+            self.use_scale_router = False
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
         if self.use_rag_cot:
             rag_cfg = RAGCoTConfig(
@@ -213,6 +231,142 @@ class Dataset_Custom(Dataset):
         self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[(df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)]
         self.search_df = df_search[['start_date', 'end_date', 'fact']]
 
+    def _coerce_positive_ints(self, values):
+        if values is None:
+            return []
+        if isinstance(values, str):
+            values = [item.strip() for item in values.split(',')]
+        parsed = []
+        for item in values:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                parsed.append(value)
+        return parsed
+
+    def _auto_scale_horizons(self, num_bins):
+        if num_bins <= 0 or self.pred_len <= 0:
+            return []
+        steps = np.arange(1, self.pred_len + 1)
+        splits = [chunk for chunk in np.array_split(steps, num_bins) if len(chunk) > 0]
+        return [int(chunk[-1]) for chunk in splits]
+
+    def _resolve_scale_route_horizons(self, scale_route_horizons, scale_window_candidates):
+        horizons = sorted(set(self._coerce_positive_ints(scale_route_horizons)))
+        if len(horizons) > 0:
+            return horizons
+        candidate_windows = self._coerce_positive_ints(scale_window_candidates)
+        if len(candidate_windows) > 0:
+            return self._auto_scale_horizons(len(candidate_windows))
+        if not self.use_scale_router:
+            return []
+        return self._auto_scale_horizons(4)
+
+    def _resolve_scale_window_candidates(self, scale_window_candidates, num_bins):
+        if num_bins <= 0:
+            return []
+        explicit = self._coerce_positive_ints(scale_window_candidates)
+        if explicit:
+            clipped = [max(1, min(int(v), self.text_len)) for v in explicit]
+            if len(clipped) == num_bins:
+                return clipped
+            warnings.warn(
+                f"scale_window_candidates expects {num_bins} values, got {len(clipped)}; using evenly spaced defaults instead."
+            )
+        max_window = max(int(self.text_len), 1)
+        return [
+            max(1, min(max_window, int(round(((idx + 1) * max_window) / num_bins))))
+            for idx in range(num_bins)
+        ]
+
+    def _prepare_scale_series(self, numeric_history):
+        arr = np.asarray(numeric_history, dtype=float)
+        if arr.ndim == 0:
+            return arr.reshape(1)
+        if arr.ndim == 1:
+            return arr
+        if arr.shape[1] == 1:
+            return arr[:, 0]
+        return arr.mean(axis=1)
+
+    def _safe_autocorr(self, arr, lag):
+        if lag <= 0 or arr.size <= lag:
+            return 0.0
+        left = arr[:-lag]
+        right = arr[lag:]
+        left_centered = left - left.mean()
+        right_centered = right - right.mean()
+        denom = np.linalg.norm(left_centered) * np.linalg.norm(right_centered)
+        if denom <= 1e-8:
+            return 1.0
+        return float(np.dot(left_centered, right_centered) / denom)
+
+    def _estimate_period_ratio(self, arr):
+        if arr.size < 4:
+            return 0.5
+        trend_line = np.linspace(arr[0], arr[-1], arr.size)
+        detrended = arr - trend_line
+        spectrum = np.abs(np.fft.rfft(detrended))[1:]
+        if spectrum.size == 0 or np.max(spectrum) <= 1e-8:
+            return 0.5
+        dominant_idx = int(np.argmax(spectrum)) + 1
+        dominant_period = float(arr.size) / float(dominant_idx)
+        return float(np.clip(dominant_period / max(float(arr.size), 1.0), 0.0, 1.0))
+
+    def _softmax_np(self, logits):
+        logits = np.asarray(logits, dtype=float)
+        if logits.size == 0:
+            return np.zeros((0,), dtype=np.float32)
+        logits = logits - np.max(logits)
+        probs = np.exp(logits)
+        denom = np.sum(probs)
+        if denom <= 0:
+            return np.full(logits.shape, 1.0 / logits.size, dtype=np.float32)
+        return (probs / denom).astype(np.float32)
+
+    def _compute_scale_route(self, numeric_history):
+        if not self.use_scale_router or self.scale_num_bins <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        if self.scale_num_bins == 1:
+            return np.ones((1,), dtype=np.float32)
+
+        arr = self._prepare_scale_series(numeric_history)
+        if arr.size < 2:
+            return np.full((self.scale_num_bins,), 1.0 / self.scale_num_bins, dtype=np.float32)
+
+        slope = abs(float(arr[-1] - arr[0])) / max(arr.size - 1, 1)
+        std = float(np.std(arr))
+        local_vol = float(np.std(np.diff(arr))) if arr.size > 2 else 0.0
+        trend_strength = slope / (slope + local_vol + 1e-6)
+        lag = max(1, arr.size // 3)
+        persistence = 0.5 * (self._safe_autocorr(arr, lag) + 1.0)
+        periodicity = self._estimate_period_ratio(arr)
+        stability = 1.0 - (local_vol / (local_vol + std + 1e-6))
+
+        longness = np.clip(
+            0.35 * trend_strength +
+            0.30 * persistence +
+            0.20 * periodicity +
+            0.15 * stability,
+            0.0,
+            1.0,
+        )
+        positions = np.linspace(0.0, 1.0, self.scale_num_bins)
+        logits = -((longness - positions) ** 2) / (2.0 * (self.scale_route_temperature ** 2))
+        return self._softmax_np(logits)
+
+    def _select_text_window(self, scale_route):
+        if (not self.use_scale_router) or len(self.scale_window_candidates) == 0:
+            return int(self.text_len)
+        weights = np.asarray(scale_route, dtype=float)
+        if weights.size != len(self.scale_window_candidates):
+            weights = np.full((len(self.scale_window_candidates),), 1.0 / len(self.scale_window_candidates))
+        candidates = np.asarray(self.scale_window_candidates, dtype=float)
+        window = int(round(float(np.dot(weights, candidates))))
+        return max(1, min(int(self.text_len), window))
+
     def collect_text(self, start_date, end_date):
         report = self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
         def add_datemark(row):
@@ -252,7 +406,10 @@ class Dataset_Custom(Dataset):
         seq_x_stamp = self.data_stamp[s_begin:s_end]
         seq_y_stamp = self.data_stamp[r_begin:r_end]
 
-        text_begin = s_end - self.text_len
+        scale_route = self._compute_scale_route(seq_x)
+        dynamic_text_len = self._select_text_window(scale_route)
+
+        text_begin = max(s_end - dynamic_text_len, 0)
         text_end = s_end
 
         seq_x_txt, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
@@ -299,7 +456,9 @@ class Dataset_Custom(Dataset):
             'text_mark': txt_mark,
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
-            'trend_prior': trend_prior
+            'trend_prior': trend_prior,
+            'scale_route': scale_route,
+            'scale_window': np.int64(dynamic_text_len),
         }
 
         return s

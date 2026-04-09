@@ -38,6 +38,8 @@ This adds training signal without changing the model architecture.
   - `multi_res_dynamic_by_epoch`: adapt horizon weights by training epoch.
   - `multi_res_dynamic_by_trend`: adapt horizon weights by trend prior strength/volatility.
   - `multi_res_dynamic_min_weight`: lower bound for each dynamic horizon weight.
+  - `multi_res_partition_mode`: `cumulative` (old behavior) or `disjoint` (non-overlapping bins such as `[1] [2-3] [4-6] [7-12]`).
+  - `multi_res_use_scale_router`: use sample-level scale routing to weight the multi-resolution bins.
 - Example (YAML):
   ```yaml
   train:
@@ -50,7 +52,21 @@ This adds training signal without changing the model architecture.
     multi_res_dynamic_by_epoch: true
     multi_res_dynamic_by_trend: true
     multi_res_dynamic_min_weight: 0.2
+    multi_res_partition_mode: disjoint
+    multi_res_use_scale_router: true
   ```
+
+## Heuristic Scale Router (weekly-report integration)
+Add a lightweight sample-level scale preference `r_i` from the numeric history and use it to
+adapt the text window and optionally the multi-resolution loss.
+- Switch: `--use_scale_router`
+- Routing bins: `train.scale_route_horizons` (falls back to `train.multi_res_horizons`, then auto bins)
+- Text windows: `model.scale_window_candidates` (or auto evenly spaced windows up to `text_len`)
+- Soft assignment temperature: `model.scale_route_temperature`
+- Current use:
+  - dynamic text window selection in the dataset pipeline
+  - optional weighting of disjoint multi-resolution bins
+- The implementation is heuristic and low-risk: no new trainable module is added yet.
 
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
@@ -98,6 +114,9 @@ python -u exe_forecasting.py \
 ## Scripts
 - Full run with trend CFG: `scripts/run_all_datasets_trendcfg.sh`
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
+- Economy ablations for the weekly integration:
+  - runner: `scripts/run_economy_scale_router_ablations.sh`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`
 
 ## Acknowledgements
 Codes are based on:

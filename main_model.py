@@ -88,6 +88,9 @@ class CSDI_base(nn.Module):
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 1.0)
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
+        self.step_guidance = config["diffusion"].get("step_guidance", False)
+        self.step_guidance_power = config["diffusion"].get("step_guidance_power", 1.0)
+        self.step_guidance_floor = config["diffusion"].get("step_guidance_floor", 0.0)
         self.scale_guidance = config["diffusion"].get("scale_guidance", False)
         self.scale_guidance_alpha = config["diffusion"].get("scale_guidance_alpha", [])
         self.consistency_guidance = config["diffusion"].get("consistency_guidance", False)
@@ -490,6 +493,23 @@ class CSDI_base(nn.Module):
             score = torch.where(score >= threshold, score, torch.zeros_like(score))
         return score
 
+    def get_step_guidance_factor(self, step_index, batch_size, device, time_steps=None):
+        if not self.step_guidance:
+            return torch.ones((batch_size,), device=device)
+
+        if self.ddim and time_steps is not None:
+            current_step = float(time_steps[step_index])
+        else:
+            current_step = float(step_index)
+        denom = max(self.num_steps - 1, 1)
+        ratio = 1.0 - current_step / denom
+        ratio = max(0.0, min(1.0, ratio))
+        power = max(float(self.step_guidance_power), 1e-6)
+        ratio = ratio ** power
+        floor = float(np.clip(self.step_guidance_floor, 0.0, 1.0))
+        ratio = floor + (1.0 - floor) * ratio
+        return torch.full((batch_size,), ratio, device=device)
+
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)  
@@ -581,6 +601,12 @@ class CSDI_base(nn.Module):
                         else:
                             predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                 if self.cfg:
+                    step_guide = self.get_step_guidance_factor(
+                        t,
+                        B,
+                        observed_data.device,
+                        time_steps=time_steps if self.ddim else None,
+                    )
                     predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
                     if self.trend_cfg:
                         if self.trend_cfg_random:
@@ -588,13 +614,13 @@ class CSDI_base(nn.Module):
                         if trend_prior is not None:
                             step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
                             trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
-                            trend_weight = trend_weight * guidance_factor
+                            trend_weight = trend_weight * guidance_factor * step_guide
                             predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
                         else:
-                            effective_guide = guide_w * guidance_factor
+                            effective_guide = guide_w * guidance_factor * step_guide
                             predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
                     else:
-                        effective_guide = guide_w * guidance_factor
+                        effective_guide = guide_w * guidance_factor * step_guide
                         predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:

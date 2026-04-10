@@ -98,6 +98,18 @@ bash ./run.sh
   - 开启时，每个样本使用 `guide_w_i = guide_w * <scale_route, alpha>`
   - 若同时开启 `trend_cfg`，该尺度倍数会继续乘到 trend-aware guidance 上
 
+## Step-aware CFG
+可选地在反向扩散采样过程中，对 CFG 强度做按步调度。
+- 开关：`--step_guidance`
+- 调度参数：
+  - `--step_guidance_power`
+  - `--step_guidance_floor`
+- 行为：
+  - 关闭时，仍使用原来的全局 `guide_w`
+  - 开启后，每个反向步使用 `guide_w_t = guide_w_i * s(t)`
+  - `s(t)` 会从设定的 floor 单调增加到 `1.0`，因此后期去噪步骤得到更强约束
+  - 若同时开启 `trend_cfg`，该按步系数会继续乘到 trend-aware guidance 上
+
 ## 证据一致性引导
 可选地对检索到的证据做一致性打分，并在推理时压低不可靠证据对应的 guidance。
 - 检索侧开关：
@@ -128,13 +140,13 @@ python -u exe_forecasting.py \
   --config traffic_36_12.yaml \
   --seq_len 36 --pred_len 12 --text_len 36 --freq m \
   --use_rag_cot --use_two_stage_rag \
-  --trend_cfg --trend_cfg_power 1.0 \
-  --trend_strength_scale 0.35 --trend_volatility_scale 1.0 --trend_time_floor 0.30 \
+  --step_guidance --step_guidance_power 1.0 --step_guidance_floor 0.35 \
   --guide_w -1
 ```
 
 ## Scripts
 - 全量跑 trend CFG：`scripts/run_all_datasets_trendcfg.sh`
+- 全量跑 step-aware CFG：`scripts/run_all_datasets_stepcfg.sh`
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`

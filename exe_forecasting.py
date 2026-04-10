@@ -105,6 +105,9 @@ parser.add_argument('--trend_cfg_random', action='store_true', help='replace tre
 parser.add_argument('--trend_strength_scale', type=float, default=1.0, help='affine mix for trend strength: 1 + scale*(strength-1)')
 parser.add_argument('--trend_volatility_scale', type=float, default=1.0, help='scale for trend volatility in 1/(1+v*vol) penalty')
 parser.add_argument('--trend_time_floor', type=float, default=0.0, help='minimum value added to trend time schedule')
+parser.add_argument('--step_guidance', action='store_true', help='anneal CFG strength across reverse diffusion steps')
+parser.add_argument('--step_guidance_power', type=float, default=1.0, help='power for step-aware CFG schedule')
+parser.add_argument('--step_guidance_floor', type=float, default=0.0, help='minimum value added to step-aware CFG schedule')
 parser.add_argument('--save_trend_prior', action='store_true', help='save per-sample trend priors during evaluation')
 parser.add_argument('--use_scale_router', action='store_true', help='enable heuristic sample-level scale routing')
 parser.add_argument('--scale_route_horizons', type=str, default='', help='comma-separated horizon endpoints for scale routing; empty uses train.multi_res_horizons or auto')
@@ -189,6 +192,9 @@ args.trend_cfg_random = config["diffusion"].get("trend_cfg_random", args.trend_c
 args.trend_strength_scale = config["diffusion"].get("trend_strength_scale", args.trend_strength_scale)
 args.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", args.trend_volatility_scale)
 args.trend_time_floor = config["diffusion"].get("trend_time_floor", args.trend_time_floor)
+args.step_guidance = config["diffusion"].get("step_guidance", args.step_guidance)
+args.step_guidance_power = config["diffusion"].get("step_guidance_power", args.step_guidance_power)
+args.step_guidance_floor = config["diffusion"].get("step_guidance_floor", args.step_guidance_floor)
 args.save_trend_prior = config["model"].get("save_trend_prior", args.save_trend_prior)
 args.use_scale_router = config["model"].get("use_scale_router", args.use_scale_router)
 args.scale_route_temperature = config["model"].get("scale_route_temperature", args.scale_route_temperature)
@@ -270,6 +276,9 @@ config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
 config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale
 config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
+config["diffusion"]["step_guidance"] = args.step_guidance
+config["diffusion"]["step_guidance_power"] = args.step_guidance_power
+config["diffusion"]["step_guidance_floor"] = args.step_guidance_floor
 config["diffusion"]["scale_guidance"] = args.scale_guidance
 config["diffusion"]["scale_guidance_alpha"] = args.scale_guidance_alpha
 config["diffusion"]["consistency_guidance"] = args.consistency_guidance

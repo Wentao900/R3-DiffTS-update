@@ -77,6 +77,18 @@ Optionally convert `scale_route` into a sample-level guidance multiplier during 
   - when enabled, each sample uses `guide_w_i = guide_w * <scale_route, alpha>`
   - if `trend_cfg` is also enabled, the scale factor multiplies the trend-aware guidance weight
 
+## Step-aware CFG
+Optionally anneal CFG strength across the reverse diffusion trajectory.
+- Switch: `--step_guidance`
+- Schedule knobs:
+  - `--step_guidance_power`
+  - `--step_guidance_floor`
+- Behavior:
+  - when disabled, inference uses the original global `guide_w`
+  - when enabled, each reverse step uses `guide_w_t = guide_w_i * s(t)`
+  - `s(t)` increases from the configured floor to `1.0`, so late denoising steps receive stronger guidance
+  - if `trend_cfg` is also enabled, the step-aware factor further scales the trend-aware weight
+
 ## Evidence Consistency Guidance
 Optionally score agreement across retrieved evidence and use that score to down-weight unreliable guidance.
 - Retrieval-side switches:
@@ -130,13 +142,13 @@ python -u exe_forecasting.py \
   --config traffic_36_12.yaml \
   --seq_len 36 --pred_len 12 --text_len 36 --freq m \
   --use_rag_cot --use_two_stage_rag \
-  --trend_cfg --trend_cfg_power 1.0 \
-  --trend_strength_scale 0.35 --trend_volatility_scale 1.0 --trend_time_floor 0.30 \
+  --step_guidance --step_guidance_power 1.0 --step_guidance_floor 0.35 \
   --guide_w -1
 ```
 
 ## Scripts
 - Full run with trend CFG: `scripts/run_all_datasets_trendcfg.sh`
+- Full run with step-aware CFG: `scripts/run_all_datasets_stepcfg.sh`
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`

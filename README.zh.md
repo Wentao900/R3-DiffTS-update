@@ -52,7 +52,6 @@ bash ./run.sh
   - `multi_res_loss_weight`：辅助损失权重（设为 0 即关闭）
   - `multi_res_use_huber`：是否使用 Huber（推荐）
   - `multi_res_huber_delta`：Huber 的 delta
-  - `multi_res_coarse_horizons`：仅供聚合轨迹损失使用的 horizon 列表
   - `multi_res_coarse_loss_weight`：可选的区间聚合轨迹损失权重
   - `multi_res_coarse_use_huber`：聚合轨迹损失是否使用 Huber
   - `multi_res_coarse_huber_delta`：聚合轨迹 Huber 的 delta
@@ -70,7 +69,6 @@ bash ./run.sh
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
-    multi_res_coarse_horizons: [6, 12]
     multi_res_coarse_loss_weight: 0.05
     multi_res_coarse_use_huber: true
     multi_res_coarse_huber_delta: 1.0
@@ -158,7 +156,7 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_guidance_coarse`, `router_guidance_coarse_long`, `router_consistency`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_guidance_coarse`, `router_consistency`
 
 ## 致谢
 代码基于：

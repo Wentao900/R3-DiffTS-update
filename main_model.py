@@ -107,6 +107,7 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        self.multi_res_coarse_horizons = train_cfg.get("multi_res_coarse_horizons", [])
         self.multi_res_coarse_loss_weight = float(train_cfg.get("multi_res_coarse_loss_weight", 0.0))
         self.multi_res_coarse_use_huber = bool(train_cfg.get("multi_res_coarse_use_huber", self.multi_res_use_huber))
         self.multi_res_coarse_huber_delta = float(train_cfg.get("multi_res_coarse_huber_delta", self.multi_res_huber_delta))
@@ -121,6 +122,10 @@ class CSDI_base(nn.Module):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
             self.multi_res_horizons = []
+        if isinstance(self.multi_res_coarse_horizons, int):
+            self.multi_res_coarse_horizons = [self.multi_res_coarse_horizons]
+        elif self.multi_res_coarse_horizons is None:
+            self.multi_res_coarse_horizons = []
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
 
@@ -409,14 +414,23 @@ class CSDI_base(nn.Module):
             weights = weights * route.clamp(min=1e-6)
         return weights.clamp(min=1e-6)
 
-    def _get_active_multi_res_horizons(self):
+    def _normalize_multi_res_horizons(self, horizons):
         if self.pred_len <= 0:
             return []
-        horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
+        horizons = [int(h) for h in horizons if int(h) > 0]
         if len(horizons) == 0:
             return []
         max_pred = int(self.pred_len)
         return sorted(set(min(h, max_pred) for h in horizons))
+
+    def _get_active_multi_res_horizons(self):
+        return self._normalize_multi_res_horizons(self.multi_res_horizons)
+
+    def _get_active_multi_res_coarse_horizons(self):
+        coarse_horizons = self.multi_res_coarse_horizons
+        if len(coarse_horizons) == 0:
+            coarse_horizons = self.multi_res_horizons
+        return self._normalize_multi_res_horizons(coarse_horizons)
 
     def _get_multi_res_spans(self, horizons):
         spans = []
@@ -479,7 +493,7 @@ class CSDI_base(nn.Module):
         return (weighted_loss_sum[valid_samples] / weight_sum[valid_samples]).mean()
 
     def _calc_multi_res_coarse_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None, scale_route=None):
-        horizons = self._get_active_multi_res_horizons()
+        horizons = self._get_active_multi_res_coarse_horizons()
         if len(horizons) == 0:
             return torch.zeros((), device=observed_data.device)
         batch_size = observed_data.shape[0]

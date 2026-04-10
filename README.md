@@ -33,6 +33,7 @@ This adds training signal without changing the model architecture.
   - `multi_res_loss_weight`: weight for the auxiliary loss (set to 0 to disable).
   - `multi_res_use_huber`: use Huber loss (recommended for stability).
   - `multi_res_huber_delta`: delta for Huber loss.
+  - `multi_res_coarse_horizons`: optional horizon list used only by the pooled-bin coarse loss.
   - `multi_res_coarse_loss_weight`: optional pooled-bin trajectory loss weight.
   - `multi_res_coarse_use_huber`: use Huber for the pooled-bin loss.
   - `multi_res_coarse_huber_delta`: delta for the pooled-bin Huber loss.
@@ -50,6 +51,7 @@ This adds training signal without changing the model architecture.
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    multi_res_coarse_horizons: [6, 12]
     multi_res_coarse_loss_weight: 0.05
     multi_res_coarse_use_huber: true
     multi_res_coarse_huber_delta: 1.0
@@ -158,7 +160,7 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_guidance_coarse`, `router_consistency`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_guidance_coarse`, `router_guidance_coarse_long`, `router_consistency`
 
 ## Acknowledgements
 Codes are based on:

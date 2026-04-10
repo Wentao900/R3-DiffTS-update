@@ -168,6 +168,32 @@ CASE_PRESETS = OrderedDict(
             },
         ),
         (
+            "router_guidance_coarse_long",
+            {
+                "description": "router_guidance plus a lighter coarse loss applied only to long horizon bins.",
+                "updates": {
+                    "train": {
+                        "multi_res_partition_mode": "disjoint",
+                        "multi_res_use_scale_router": True,
+                        "scale_route_horizons": [1, 3, 6, 12],
+                        "multi_res_coarse_horizons": [6, 12],
+                        "multi_res_coarse_loss_weight": 0.02,
+                        "multi_res_coarse_use_huber": True,
+                        "multi_res_coarse_huber_delta": 1.0,
+                    },
+                    "model": {
+                        "use_scale_router": True,
+                        "scale_window_candidates": [9, 18, 27, 36],
+                        "scale_route_temperature": 0.20,
+                    },
+                    "diffusion": {
+                        "scale_guidance": True,
+                        "scale_guidance_alpha": [0.9, 1.0, 1.1, 1.2],
+                    },
+                },
+            },
+        ),
+        (
             "router_consistency",
             {
                 "description": "router_guidance plus evidence consistency scoring and guidance gating from retrieved snippets.",
@@ -327,6 +353,7 @@ def summarize_run(run_dir: Path) -> Dict[str, Any]:
         "multi_res_partition_mode": train_cfg.get("multi_res_partition_mode", "cumulative"),
         "multi_res_use_scale_router": bool(train_cfg.get("multi_res_use_scale_router", False)),
         "multi_res_loss_weight": train_cfg.get("multi_res_loss_weight", 0.0),
+        "multi_res_coarse_horizons": train_cfg.get("multi_res_coarse_horizons", []),
         "multi_res_coarse_loss_weight": train_cfg.get("multi_res_coarse_loss_weight", 0.0),
         "scale_route_horizons": train_cfg.get("scale_route_horizons", []),
         "scale_guidance": bool(config.get("diffusion", {}).get("scale_guidance", False)),
@@ -376,6 +403,7 @@ def write_summary(rows: List[Dict[str, Any]], label: str) -> Tuple[Path, Path]:
         "multi_res_partition_mode",
         "multi_res_use_scale_router",
         "multi_res_loss_weight",
+        "multi_res_coarse_horizons",
         "multi_res_coarse_loss_weight",
         "scale_route_horizons",
         "scale_guidance",

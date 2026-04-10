@@ -75,7 +75,23 @@ class DiffusionEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False, with_text=False, context_dim=None, dropout=0., attn_drop=0., pre_norm=False, pred_len=-1, use_tv=False):
+    def __init__(
+        self,
+        side_dim,
+        channels,
+        diffusion_embedding_dim,
+        nheads,
+        is_linear=False,
+        with_text=False,
+        context_dim=None,
+        dropout=0.,
+        attn_drop=0.,
+        pre_norm=False,
+        pred_len=-1,
+        use_tv=False,
+        ttf_gate=False,
+        ttf_alpha_init=1.0,
+    ):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
@@ -98,6 +114,17 @@ class ResidualBlock(nn.Module):
         if with_text:
             self.channel_proj = nn.Linear(context_dim, channels)
             self.cross_modal_layer = get_cross_trans(heads=nheads, layers=1, channels=channels, dropout=dropout, pre_norm=pre_norm)
+            self.ttf_gate = ttf_gate
+            self.ttf_alpha = nn.Parameter(torch.tensor(float(ttf_alpha_init)))
+            if self.ttf_gate:
+                hidden_dim = max(channels // 2, 16)
+                self.text_gate_mlp = nn.Sequential(
+                    nn.Linear(channels * 2, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, 1),
+                )
+        else:
+            self.ttf_gate = False
 
     # fusing information along L
     def forward_time(self, y, base_shape):
@@ -175,8 +202,17 @@ class ResidualBlock(nn.Module):
         
         attn_series_text = None
         if self.with_text and context is not None:
-            context = self.channel_proj(context.permute(0,2,1)).permute(0,2,1) 
-            y, attn_series_text = self.cross_modal_layer(y, context) 
+            context = self.channel_proj(context.permute(0,2,1)).permute(0,2,1)
+            text_input = y
+            text_output, attn_series_text = self.cross_modal_layer(text_input, context)
+            text_delta = text_output - text_input
+            ttf_alpha = torch.clamp(self.ttf_alpha, min=0.0, max=2.0)
+            if self.ttf_gate:
+                gate_input = torch.cat([text_input.mean(dim=-1), context.mean(dim=-1)], dim=-1)
+                text_gate = torch.sigmoid(self.text_gate_mlp(gate_input)).unsqueeze(-1)
+                y = text_input + ttf_alpha * text_gate * text_delta
+            else:
+                y = text_input + ttf_alpha * text_delta
 
         y = self.attn_drop(y)
 
@@ -211,11 +247,18 @@ class diff_CSDI(nn.Module):
         self.lookback_len = config["lookback_len"]
         self.pred_len = config["pred_len"]
         self.with_timestep = config["with_timestep"]
+        self.ttf_gate = config.get("ttf_gate", False)
+        self.ttf_alpha_init = float(config.get("ttf_alpha_init", 1.0))
         dropout = config["dropout"]
         attn_drop = config["attn_drop"]
         self.pre_norm = config["pre_norm"]
         self.time_weight= config["time_weight"]
         self.save_attn = config["save_attn"]
+        num_layers = int(config["layers"])
+        ttf_start_layer = int(config.get("ttf_start_layer", 0))
+        if ttf_start_layer < 0:
+            ttf_start_layer = max(num_layers + ttf_start_layer, 0)
+        self.ttf_start_layer = min(max(ttf_start_layer, 0), num_layers)
 
         self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
@@ -243,15 +286,17 @@ class diff_CSDI(nn.Module):
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
                     is_linear=config["is_linear"],
-                    with_text=config["with_texts"],
+                    with_text=config["with_texts"] and layer_idx >= self.ttf_start_layer,
                     context_dim=config["context_dim"],
                     dropout=dropout,
                     attn_drop=attn_drop,
                     pre_norm=self.pre_norm,
                     pred_len=self.pred_len,
-                    use_tv=config.get("with_timestep", False)
+                    use_tv=config.get("with_timestep", False),
+                    ttf_gate=self.ttf_gate,
+                    ttf_alpha_init=self.ttf_alpha_init,
                 )
-                for _ in range(config["layers"])
+                for layer_idx in range(num_layers)
             ]
         )
 

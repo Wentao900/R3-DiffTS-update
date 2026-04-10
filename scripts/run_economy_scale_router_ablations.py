@@ -247,6 +247,33 @@ CASE_PRESETS = OrderedDict(
                 },
             },
         ),
+        (
+            "router_text_control_long",
+            {
+                "description": "Long-horizon-focused text-control: short bins stay mostly numeric while long bins receive stronger text routing.",
+                "updates": {
+                    "train": {
+                        "multi_res_partition_mode": "disjoint",
+                        "multi_res_use_scale_router": True,
+                        "scale_route_horizons": [1, 3, 6, 12],
+                    },
+                    "model": {
+                        "use_scale_router": True,
+                        "scale_window_candidates": [9, 18, 27, 36],
+                        "scale_route_temperature": 0.20,
+                        "use_text_control_router": True,
+                        "text_control_mix": 0.20,
+                        "text_control_bin_weights": [0.0, 0.15, 0.60, 1.0],
+                    },
+                    "diffusion": {
+                        "scale_guidance": True,
+                        "scale_guidance_alpha": [0.9, 1.0, 1.1, 1.2],
+                        "text_control_guidance": True,
+                        "text_control_guidance_scale": 0.10,
+                    },
+                },
+            },
+        ),
     ]
 )
 

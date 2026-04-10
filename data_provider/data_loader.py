@@ -63,7 +63,8 @@ class Dataset_Custom(Dataset):
                  consistency_conflict_penalty=0.5,
                  use_scale_router=False, scale_route_horizons=None,
                  scale_window_candidates=None, scale_route_temperature=0.20,
-                 use_text_control_router=False, text_control_mix=0.35):
+                 use_text_control_router=False, text_control_mix=0.35,
+                 text_control_bin_weights=None):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -108,6 +109,7 @@ class Dataset_Custom(Dataset):
         self.scale_route_temperature = max(float(scale_route_temperature), 1e-3)
         self.use_text_control_router = bool(use_text_control_router)
         self.text_control_mix = float(np.clip(text_control_mix, 0.0, 1.0))
+        self._text_control_bin_weights_cfg = text_control_bin_weights
         self.guidance_cache = {}
 
         self.root_path = root_path
@@ -136,6 +138,9 @@ class Dataset_Custom(Dataset):
         self.scale_window_candidates = self._resolve_scale_window_candidates(
             scale_window_candidates,
             self.scale_num_bins,
+        )
+        self.text_control_bin_weights = self._resolve_text_control_bin_weights(
+            self._text_control_bin_weights_cfg
         )
         if self.use_scale_router and self.scale_num_bins == 0:
             warnings.warn(
@@ -378,6 +383,26 @@ class Dataset_Custom(Dataset):
         window = int(round(float(np.dot(weights, candidates))))
         return max(1, min(int(self.text_len), window))
 
+    def _resolve_text_control_bin_weights(self, values):
+        if self.scale_num_bins <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        if values is None:
+            values = []
+        weights = []
+        for item in values:
+            try:
+                weights.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        if len(weights) == 0:
+            return np.ones((self.scale_num_bins,), dtype=np.float32)
+        arr = np.asarray(weights, dtype=np.float32)
+        if arr.size != self.scale_num_bins:
+            x_old = np.linspace(0.0, 1.0, arr.size)
+            x_new = np.linspace(0.0, 1.0, self.scale_num_bins)
+            arr = np.interp(x_new, x_old, arr).astype(np.float32)
+        return np.clip(arr, 0.0, 1.0)
+
     def _compute_text_control_route(self, trend_prior):
         if self.scale_num_bins <= 0:
             return np.zeros((0,), dtype=np.float32)
@@ -419,7 +444,8 @@ class Dataset_Custom(Dataset):
             0.0,
             1.0,
         )
-        fused = (1.0 - mix) * base + mix * text_route
+        bin_mix = mix * self.text_control_bin_weights
+        fused = (1.0 - bin_mix) * base + bin_mix * text_route
         denom = float(np.sum(fused))
         if denom <= 0:
             return base
@@ -520,6 +546,7 @@ class Dataset_Custom(Dataset):
             'trend_prior': trend_prior,
             'scale_route': scale_route,
             'base_scale_route': base_scale_route,
+            'text_control_bin_weights': self.text_control_bin_weights.astype(np.float32),
             'scale_window': np.int64(dynamic_text_len),
             'consistency_score': np.float32(consistency_score),
         }

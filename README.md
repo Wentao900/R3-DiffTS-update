@@ -152,9 +152,10 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_text_control`, `router_text_control_mix20`, `router_text_control_soft`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_text_control`, `router_text_control_mix20`, `router_text_control_soft`, `router_text_control_long`
   - text-control config: `config/economy_36_12_text_control.yaml` keeps text out of backbone fusion and uses it only to steer routed loss/guidance
   - softer text-control config: `config/economy_36_12_text_control_soft.yaml` reduces router blend to `0.20` and guidance modulation to `0.10`
+  - long-horizon text-control config: `config/economy_36_12_text_control_long.yaml` keeps short bins mostly numeric and lets text affect longer bins more strongly
 
 ## Acknowledgements
 Codes are based on:

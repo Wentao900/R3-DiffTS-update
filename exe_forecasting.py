@@ -115,6 +115,7 @@ parser.add_argument('--scale_window_candidates', type=str, default='', help='com
 parser.add_argument('--scale_route_temperature', type=float, default=0.20, help='temperature for heuristic scale-routing soft assignment')
 parser.add_argument('--use_text_control_router', action='store_true', help='blend text-derived control signals into sample-level scale routing')
 parser.add_argument('--text_control_mix', type=float, default=0.35, help='maximum blend ratio for text-derived control routing')
+parser.add_argument('--text_control_bin_weights', type=str, default='', help='comma-separated per-bin text-control strengths; empty uses uniform weights')
 parser.add_argument('--scale_guidance', action='store_true', help='modulate sample-level CFG strength with scale routing during inference')
 parser.add_argument('--scale_guidance_alpha', type=str, default='', help='comma-separated guidance multipliers aligned with scale bins, e.g. 0.9,1.0,1.1,1.2')
 parser.add_argument('--consistency_guidance', action='store_true', help='multiply inference guidance by evidence consistency')
@@ -200,6 +201,9 @@ args.use_scale_router = config["model"].get("use_scale_router", args.use_scale_r
 args.scale_route_temperature = config["model"].get("scale_route_temperature", args.scale_route_temperature)
 args.use_text_control_router = config["model"].get("use_text_control_router", args.use_text_control_router)
 args.text_control_mix = config["model"].get("text_control_mix", args.text_control_mix)
+args.text_control_bin_weights = _parse_float_list(
+    config["model"].get("text_control_bin_weights", args.text_control_bin_weights)
+)
 args.scale_window_candidates = _parse_int_list(
     config["model"].get("scale_window_candidates", args.scale_window_candidates)
 )
@@ -276,6 +280,7 @@ config["model"]["scale_window_candidates"] = args.scale_window_candidates
 config["model"]["scale_route_temperature"] = args.scale_route_temperature
 config["model"]["use_text_control_router"] = args.use_text_control_router
 config["model"]["text_control_mix"] = args.text_control_mix
+config["model"]["text_control_bin_weights"] = args.text_control_bin_weights
 config["diffusion"]["trend_cfg"] = args.trend_cfg
 config["diffusion"]["trend_cfg_power"] = args.trend_cfg_power
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random

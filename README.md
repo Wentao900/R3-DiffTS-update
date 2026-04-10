@@ -56,6 +56,17 @@ This adds training signal without changing the model architecture.
     multi_res_use_scale_router: true
   ```
 
+## Frequency-domain auxiliary loss
+Optionally add a light FFT-amplitude loss on the forecast segment.
+- Config keys (under `train`):
+  - `freq_loss_weight`: weight for the FFT auxiliary loss.
+  - `freq_loss_low_bins`: keep only the lowest non-DC frequency bins; `<=0` uses all bins.
+  - `freq_loss_exclude_dc`: drop the DC component before comparing spectra.
+  - `freq_loss_normalize`: normalize amplitudes before comparing spectral shapes.
+- Intended use:
+  - keep this small and paired with the existing pointwise loss
+  - start with low-frequency bins only for monthly or weekly datasets
+
 ## Heuristic Scale Router (weekly-report integration)
 Add a lightweight sample-level scale preference `r_i` from the numeric history and use it to
 adapt the text window and optionally the multi-resolution loss.
@@ -152,7 +163,7 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_guidance_freq`, `router_consistency`
 
 ## Acknowledgements
 Codes are based on:

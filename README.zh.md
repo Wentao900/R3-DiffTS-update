@@ -75,6 +75,17 @@ bash ./run.sh
     multi_res_use_scale_router: true
   ```
 
+## 频域辅助损失
+可选地在预测段上增加一个轻量 FFT 幅度损失。
+- 配置项（位于 `train`）：
+  - `freq_loss_weight`：FFT 辅助损失权重
+  - `freq_loss_low_bins`：仅保留最低频的非 DC bin；`<=0` 表示使用全部 bin
+  - `freq_loss_exclude_dc`：比较频谱时是否去掉 DC 分量
+  - `freq_loss_normalize`：比较前是否对幅度谱做归一化
+- 推荐用法：
+  - 保持较小权重，和现有 pointwise loss 配合使用
+  - 对月频或周频数据优先只看低频 bin
+
 ## 启发式尺度路由（吸收本周周报）
 从数值历史中估计样本级尺度偏好 `r_i`，并用它统一驱动文本窗口和可选的 multi-res 区间权重。
 - 开关：`--use_scale_router`
@@ -150,7 +161,7 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_guidance_freq`, `router_consistency`
 
 ## 致谢
 代码基于：

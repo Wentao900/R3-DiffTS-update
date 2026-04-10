@@ -152,7 +152,8 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_text_control`
+  - text-control config: `config/economy_36_12_text_control.yaml` keeps text out of backbone fusion and uses it only to steer routed loss/guidance
 
 ## Acknowledgements
 Codes are based on:

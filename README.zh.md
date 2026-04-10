@@ -150,7 +150,8 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_text_control`
+  - 文本控制版配置：`config/economy_36_12_text_control.yaml`，文本不进 backbone，只用于控制 routed loss 和 guidance
 
 ## 致谢
 代码基于：

@@ -46,6 +46,8 @@ def data_provider(args, flag):
         extra_kwargs['scale_route_horizons'] = getattr(args, "scale_route_horizons", [])
         extra_kwargs['scale_window_candidates'] = getattr(args, "scale_window_candidates", [])
         extra_kwargs['scale_route_temperature'] = getattr(args, "scale_route_temperature", 0.20)
+        extra_kwargs['use_text_control_router'] = getattr(args, "use_text_control_router", False)
+        extra_kwargs['text_control_mix'] = getattr(args, "text_control_mix", 0.35)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

@@ -62,7 +62,8 @@ class Dataset_Custom(Dataset):
                  rag_consistency=False, consistency_unknown_penalty=1.0,
                  consistency_conflict_penalty=0.5,
                  use_scale_router=False, scale_route_horizons=None,
-                 scale_window_candidates=None, scale_route_temperature=0.20):
+                 scale_window_candidates=None, scale_route_temperature=0.20,
+                 use_text_control_router=False, text_control_mix=0.35):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -105,6 +106,8 @@ class Dataset_Custom(Dataset):
         self.consistency_conflict_penalty = consistency_conflict_penalty
         self.use_scale_router = use_scale_router
         self.scale_route_temperature = max(float(scale_route_temperature), 1e-3)
+        self.use_text_control_router = bool(use_text_control_router)
+        self.text_control_mix = float(np.clip(text_control_mix, 0.0, 1.0))
         self.guidance_cache = {}
 
         self.root_path = root_path
@@ -375,6 +378,53 @@ class Dataset_Custom(Dataset):
         window = int(round(float(np.dot(weights, candidates))))
         return max(1, min(int(self.text_len), window))
 
+    def _compute_text_control_route(self, trend_prior):
+        if self.scale_num_bins <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        if self.scale_num_bins == 1:
+            return np.ones((1,), dtype=np.float32)
+        trend_vec = np.asarray(trend_prior, dtype=np.float32).reshape(-1)
+        if trend_vec.size < 3:
+            return np.full((self.scale_num_bins,), 1.0 / self.scale_num_bins, dtype=np.float32)
+        direction = float(np.clip(abs(trend_vec[0]), 0.0, 1.0))
+        strength = float(np.clip((trend_vec[1] - 0.5) / 1.0, 0.0, 1.0))
+        stability = float(1.0 - np.clip(trend_vec[2], 0.0, 1.0))
+        longness = np.clip(
+            0.45 * strength +
+            0.35 * stability +
+            0.20 * direction,
+            0.0,
+            1.0,
+        )
+        positions = np.linspace(0.0, 1.0, self.scale_num_bins)
+        logits = -((longness - positions) ** 2) / (2.0 * (self.scale_route_temperature ** 2))
+        return self._softmax_np(logits)
+
+    def _blend_text_control_route(self, base_scale_route, trend_prior, text_mark, consistency_score):
+        base = np.asarray(base_scale_route, dtype=np.float32)
+        if (not self.use_text_control_router) or base.size == 0 or int(text_mark) <= 0:
+            return base
+        text_route = self._compute_text_control_route(trend_prior)
+        consistency = float(np.clip(consistency_score, 0.0, 1.0))
+        trend_vec = np.asarray(trend_prior, dtype=np.float32).reshape(-1)
+        if trend_vec.size < 3:
+            return base
+        strength = float(np.clip((trend_vec[1] - 0.5) / 1.0, 0.0, 1.0))
+        stability = float(1.0 - np.clip(trend_vec[2], 0.0, 1.0))
+        mix = np.clip(
+            self.text_control_mix *
+            consistency *
+            (0.5 + 0.5 * strength) *
+            (0.5 + 0.5 * stability),
+            0.0,
+            1.0,
+        )
+        fused = (1.0 - mix) * base + mix * text_route
+        denom = float(np.sum(fused))
+        if denom <= 0:
+            return base
+        return (fused / denom).astype(np.float32)
+
     def collect_text(self, start_date, end_date):
         report = self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
         def add_datemark(row):
@@ -414,8 +464,8 @@ class Dataset_Custom(Dataset):
         seq_x_stamp = self.data_stamp[s_begin:s_end]
         seq_y_stamp = self.data_stamp[r_begin:r_end]
 
-        scale_route = self._compute_scale_route(seq_x)
-        dynamic_text_len = self._select_text_window(scale_route)
+        base_scale_route = self._compute_scale_route(seq_x)
+        dynamic_text_len = self._select_text_window(base_scale_route)
 
         text_begin = max(s_end - dynamic_text_len, 0)
         text_end = s_end
@@ -449,6 +499,7 @@ class Dataset_Custom(Dataset):
 
         trend_fields = build_trend_fields(cot_text, seq_x)
         trend_prior = trend_fields_to_vector(trend_fields)
+        scale_route = self._blend_text_control_route(base_scale_route, trend_prior, txt_mark, consistency_score)
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -468,6 +519,7 @@ class Dataset_Custom(Dataset):
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior,
             'scale_route': scale_route,
+            'base_scale_route': base_scale_route,
             'scale_window': np.int64(dynamic_text_len),
             'consistency_score': np.float32(consistency_score),
         }

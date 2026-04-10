@@ -113,10 +113,14 @@ parser.add_argument('--use_scale_router', action='store_true', help='enable heur
 parser.add_argument('--scale_route_horizons', type=str, default='', help='comma-separated horizon endpoints for scale routing; empty uses train.multi_res_horizons or auto')
 parser.add_argument('--scale_window_candidates', type=str, default='', help='comma-separated candidate text windows; empty uses evenly spaced windows up to text_len')
 parser.add_argument('--scale_route_temperature', type=float, default=0.20, help='temperature for heuristic scale-routing soft assignment')
+parser.add_argument('--use_text_control_router', action='store_true', help='blend text-derived control signals into sample-level scale routing')
+parser.add_argument('--text_control_mix', type=float, default=0.35, help='maximum blend ratio for text-derived control routing')
 parser.add_argument('--scale_guidance', action='store_true', help='modulate sample-level CFG strength with scale routing during inference')
 parser.add_argument('--scale_guidance_alpha', type=str, default='', help='comma-separated guidance multipliers aligned with scale bins, e.g. 0.9,1.0,1.1,1.2')
 parser.add_argument('--consistency_guidance', action='store_true', help='multiply inference guidance by evidence consistency')
 parser.add_argument('--consistency_threshold', type=float, default=0.0, help='zero-out consistency guidance below this threshold')
+parser.add_argument('--text_control_guidance', action='store_true', help='modulate guidance with structured text control signals')
+parser.add_argument('--text_control_guidance_scale', type=float, default=0.15, help='symmetric scale for text-control guidance factor around 1.0')
 parser.add_argument('--multi_res_partition_mode', type=str, default='', help='override multi-res partition mode: cumulative or disjoint')
 parser.add_argument('--multi_res_use_scale_router', action='store_true', help='weight multi-res bins with sample-level scale routing')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
@@ -161,10 +165,6 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
-# Force unified TAA + TTF path: always use texts, timestep embeddings, and timestep branch
-config["model"]["with_texts"] = True
-config["model"]["timestep_emb_cat"] = True
-config["model"]["timestep_branch"] = True
 args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
 args.cot_only = config["model"].get("cot_only", args.cot_only)
 args.use_two_stage_rag = config["model"].get("use_two_stage_rag", args.use_two_stage_rag)
@@ -198,6 +198,8 @@ args.step_guidance_floor = config["diffusion"].get("step_guidance_floor", args.s
 args.save_trend_prior = config["model"].get("save_trend_prior", args.save_trend_prior)
 args.use_scale_router = config["model"].get("use_scale_router", args.use_scale_router)
 args.scale_route_temperature = config["model"].get("scale_route_temperature", args.scale_route_temperature)
+args.use_text_control_router = config["model"].get("use_text_control_router", args.use_text_control_router)
+args.text_control_mix = config["model"].get("text_control_mix", args.text_control_mix)
 args.scale_window_candidates = _parse_int_list(
     config["model"].get("scale_window_candidates", args.scale_window_candidates)
 )
@@ -207,6 +209,8 @@ args.scale_guidance_alpha = _parse_float_list(
 )
 args.consistency_guidance = config["diffusion"].get("consistency_guidance", args.consistency_guidance)
 args.consistency_threshold = config["diffusion"].get("consistency_threshold", args.consistency_threshold)
+args.text_control_guidance = config["diffusion"].get("text_control_guidance", args.text_control_guidance)
+args.text_control_guidance_scale = config["diffusion"].get("text_control_guidance_scale", args.text_control_guidance_scale)
 args.scale_route_horizons = _parse_int_list(
     config["train"].get("scale_route_horizons", args.scale_route_horizons)
 )
@@ -270,6 +274,8 @@ config["model"]["save_trend_prior"] = args.save_trend_prior
 config["model"]["use_scale_router"] = args.use_scale_router
 config["model"]["scale_window_candidates"] = args.scale_window_candidates
 config["model"]["scale_route_temperature"] = args.scale_route_temperature
+config["model"]["use_text_control_router"] = args.use_text_control_router
+config["model"]["text_control_mix"] = args.text_control_mix
 config["diffusion"]["trend_cfg"] = args.trend_cfg
 config["diffusion"]["trend_cfg_power"] = args.trend_cfg_power
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
@@ -283,6 +289,8 @@ config["diffusion"]["scale_guidance"] = args.scale_guidance
 config["diffusion"]["scale_guidance_alpha"] = args.scale_guidance_alpha
 config["diffusion"]["consistency_guidance"] = args.consistency_guidance
 config["diffusion"]["consistency_threshold"] = args.consistency_threshold
+config["diffusion"]["text_control_guidance"] = args.text_control_guidance
+config["diffusion"]["text_control_guidance_scale"] = args.text_control_guidance_scale
 config["train"]["scale_route_horizons"] = args.scale_route_horizons
 config["train"]["multi_res_partition_mode"] = args.multi_res_partition_mode
 config["train"]["multi_res_use_scale_router"] = args.multi_res_use_scale_router

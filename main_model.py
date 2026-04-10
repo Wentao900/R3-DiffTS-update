@@ -95,6 +95,8 @@ class CSDI_base(nn.Module):
         self.scale_guidance_alpha = config["diffusion"].get("scale_guidance_alpha", [])
         self.consistency_guidance = config["diffusion"].get("consistency_guidance", False)
         self.consistency_threshold = float(config["diffusion"].get("consistency_threshold", 0.0))
+        self.text_control_guidance = config["diffusion"].get("text_control_guidance", False)
+        self.text_control_guidance_scale = float(config["diffusion"].get("text_control_guidance_scale", 0.15))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -493,6 +495,30 @@ class CSDI_base(nn.Module):
             score = torch.where(score >= threshold, score, torch.zeros_like(score))
         return score
 
+    def get_text_control_guidance_factor(self, trend_prior, consistency_score, text_mask, batch_size, device):
+        if (not self.text_control_guidance) or trend_prior is None or text_mask is None:
+            return torch.ones((batch_size,), device=device)
+        if trend_prior.shape[0] != batch_size:
+            trend_prior = trend_prior[:batch_size]
+        text_presence = text_mask.reshape(-1).to(device).float()
+        direction = trend_prior[:, 0].abs().clamp(min=0.0, max=1.0)
+        strength = ((trend_prior[:, 1] - 0.5) / 1.0).clamp(min=0.0, max=1.0)
+        stability = (1.0 - trend_prior[:, 2].clamp(min=0.0, max=1.0)).clamp(min=0.0, max=1.0)
+        score = 0.45 * strength + 0.35 * stability + 0.20 * direction
+        if consistency_score is not None:
+            consistency = consistency_score.reshape(-1).to(device)
+            if consistency.numel() == 1 and batch_size > 1:
+                consistency = consistency.repeat(batch_size)
+            elif consistency.numel() != batch_size:
+                consistency = consistency[:batch_size]
+            score = score * consistency.clamp(min=0.0, max=1.0)
+        score = score * text_presence
+        scale = max(self.text_control_guidance_scale, 0.0)
+        if scale <= 0.0:
+            return torch.ones((batch_size,), device=device)
+        factor = (1.0 - scale) + (2.0 * scale) * score
+        return factor.clamp(min=max(0.0, 1.0 - scale), max=1.0 + scale)
+
     def get_step_guidance_factor(self, step_index, batch_size, device, time_steps=None):
         if not self.step_guidance:
             return torch.ones((batch_size,), device=device)
@@ -560,7 +586,14 @@ class CSDI_base(nn.Module):
             cfg_mask = None
         scale_guide = self.get_scale_guidance_factor(scale_route, B, observed_data.device)
         consistency_guide = self.get_consistency_guidance_factor(consistency_score, B, observed_data.device)
-        guidance_factor = scale_guide * consistency_guide
+        text_control_guide = self.get_text_control_guidance_factor(
+            trend_prior,
+            consistency_score,
+            text_mask,
+            B,
+            observed_data.device,
+        )
+        guidance_factor = scale_guide * consistency_guide * text_control_guide
 
         for i in range(n_samples):
             if self.is_unconditional == True:

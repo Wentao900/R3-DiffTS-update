@@ -119,10 +119,6 @@ parser.add_argument('--consistency_guidance', action='store_true', help='multipl
 parser.add_argument('--consistency_threshold', type=float, default=0.0, help='zero-out consistency guidance below this threshold')
 parser.add_argument('--multi_res_partition_mode', type=str, default='', help='override multi-res partition mode: cumulative or disjoint')
 parser.add_argument('--multi_res_use_scale_router', action='store_true', help='weight multi-res bins with sample-level scale routing')
-parser.add_argument('--freq_loss_weight', type=float, default=-1.0, help='optional FFT amplitude loss on the forecast segment')
-parser.add_argument('--freq_loss_low_bins', type=int, default=-1, help='number of low-frequency bins kept for FFT loss; <=0 uses all')
-parser.add_argument('--freq_loss_exclude_dc', action='store_true', help='drop the DC bin when computing FFT loss')
-parser.add_argument('--freq_loss_normalize', action='store_true', help='normalize FFT amplitudes before comparing spectra')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
 parser.add_argument('--freq', type=str, default='m', help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -224,12 +220,6 @@ args.multi_res_use_scale_router = config["train"].get(
     "multi_res_use_scale_router",
     args.multi_res_use_scale_router,
 )
-if args.freq_loss_weight < 0:
-    args.freq_loss_weight = config["train"].get("freq_loss_weight", args.freq_loss_weight)
-if args.freq_loss_low_bins < 0:
-    args.freq_loss_low_bins = config["train"].get("freq_loss_low_bins", args.freq_loss_low_bins)
-args.freq_loss_exclude_dc = config["train"].get("freq_loss_exclude_dc", args.freq_loss_exclude_dc)
-args.freq_loss_normalize = config["train"].get("freq_loss_normalize", args.freq_loss_normalize)
 if args.embed == 'timeF':
     if config["model"]["timestep_branch"] or config["model"]["timestep_emb_cat"]:
         config["model"]["timestep_dim"] = timestep_dim_dict[args.freq] + extra_timestep_dims
@@ -296,12 +286,6 @@ config["diffusion"]["consistency_threshold"] = args.consistency_threshold
 config["train"]["scale_route_horizons"] = args.scale_route_horizons
 config["train"]["multi_res_partition_mode"] = args.multi_res_partition_mode
 config["train"]["multi_res_use_scale_router"] = args.multi_res_use_scale_router
-if args.freq_loss_weight >= 0:
-    config["train"]["freq_loss_weight"] = args.freq_loss_weight
-if args.freq_loss_low_bins >= 0:
-    config["train"]["freq_loss_low_bins"] = args.freq_loss_low_bins
-config["train"]["freq_loss_exclude_dc"] = args.freq_loss_exclude_dc
-config["train"]["freq_loss_normalize"] = args.freq_loss_normalize
 
 if args.c_mask_prob > 0:
     config["diffusion"]["c_mask_prob"] = args.c_mask_prob

@@ -107,10 +107,6 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
-        self.freq_loss_weight = float(train_cfg.get("freq_loss_weight", 0.0))
-        self.freq_loss_low_bins = int(train_cfg.get("freq_loss_low_bins", 0))
-        self.freq_loss_exclude_dc = bool(train_cfg.get("freq_loss_exclude_dc", True))
-        self.freq_loss_normalize = bool(train_cfg.get("freq_loss_normalize", True))
         self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
         self.multi_res_dynamic_by_t = bool(train_cfg.get("multi_res_dynamic_by_t", True))
         self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
@@ -330,9 +326,6 @@ class CSDI_base(nn.Module):
                 scale_route=scale_route,
             )
             loss = loss + self.multi_res_loss_weight * aux_loss
-        if (not self.noise_esti) and self.freq_loss_weight > 0:
-            freq_loss = self._calc_freq_loss(observed_data, predicted, target_mask)
-            loss = loss + self.freq_loss_weight * freq_loss
         return loss
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
@@ -458,49 +451,6 @@ class CSDI_base(nn.Module):
         if not valid_samples.any():
             return torch.zeros((), device=observed_data.device)
         return (weighted_loss_sum[valid_samples] / weight_sum[valid_samples]).mean()
-
-    def _calc_freq_loss(self, observed_data, predicted, target_mask):
-        start = int(self.lookback_len)
-        end = int(min(self.lookback_len + self.pred_len, observed_data.shape[-1]))
-        if end <= start:
-            return torch.zeros((), device=observed_data.device)
-
-        target_slice = target_mask[:, :, start:end]
-        true_slice = observed_data[:, :, start:end] * target_slice
-        pred_slice = predicted[:, :, start:end] * target_slice
-
-        valid_feature = target_slice.sum(dim=2) > 0
-        if not valid_feature.any():
-            return torch.zeros((), device=observed_data.device)
-
-        true_fft = torch.fft.rfft(true_slice, dim=-1)
-        pred_fft = torch.fft.rfft(pred_slice, dim=-1)
-        true_amp = true_fft.abs()
-        pred_amp = pred_fft.abs()
-
-        if self.freq_loss_exclude_dc and true_amp.shape[-1] > 1:
-            true_amp = true_amp[..., 1:]
-            pred_amp = pred_amp[..., 1:]
-
-        if true_amp.shape[-1] == 0:
-            return torch.zeros((), device=observed_data.device)
-
-        if self.freq_loss_low_bins > 0:
-            num_bins = min(int(self.freq_loss_low_bins), int(true_amp.shape[-1]))
-            true_amp = true_amp[..., :num_bins]
-            pred_amp = pred_amp[..., :num_bins]
-
-        if self.freq_loss_normalize:
-            true_amp = true_amp / true_amp.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-            pred_amp = pred_amp / pred_amp.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-
-        residual = (true_amp - pred_amp) * valid_feature.unsqueeze(-1).float()
-        denom = valid_feature.sum(dim=1).clamp(min=1.0) * residual.shape[-1]
-        loss_per_sample = (residual ** 2).sum(dim=(1, 2)) / denom
-        valid_samples = valid_feature.any(dim=1)
-        if not valid_samples.any():
-            return torch.zeros((), device=observed_data.device)
-        return loss_per_sample[valid_samples].mean()
 
     def get_scale_guidance_factor(self, scale_route, batch_size, device):
         if (not self.scale_guidance) or scale_route is None:

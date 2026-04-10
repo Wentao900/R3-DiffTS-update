@@ -195,6 +195,58 @@ CASE_PRESETS = OrderedDict(
                 },
             },
         ),
+        (
+            "router_text_control_mix20",
+            {
+                "description": "Softer text-control routing with a reduced text/router blend ratio.",
+                "updates": {
+                    "train": {
+                        "multi_res_partition_mode": "disjoint",
+                        "multi_res_use_scale_router": True,
+                        "scale_route_horizons": [1, 3, 6, 12],
+                    },
+                    "model": {
+                        "use_scale_router": True,
+                        "scale_window_candidates": [9, 18, 27, 36],
+                        "scale_route_temperature": 0.20,
+                        "use_text_control_router": True,
+                        "text_control_mix": 0.20,
+                    },
+                    "diffusion": {
+                        "scale_guidance": True,
+                        "scale_guidance_alpha": [0.9, 1.0, 1.1, 1.2],
+                        "text_control_guidance": True,
+                        "text_control_guidance_scale": 0.15,
+                    },
+                },
+            },
+        ),
+        (
+            "router_text_control_soft",
+            {
+                "description": "Recommended softer text-control setting: lower router blend and smaller guidance modulation.",
+                "updates": {
+                    "train": {
+                        "multi_res_partition_mode": "disjoint",
+                        "multi_res_use_scale_router": True,
+                        "scale_route_horizons": [1, 3, 6, 12],
+                    },
+                    "model": {
+                        "use_scale_router": True,
+                        "scale_window_candidates": [9, 18, 27, 36],
+                        "scale_route_temperature": 0.20,
+                        "use_text_control_router": True,
+                        "text_control_mix": 0.20,
+                    },
+                    "diffusion": {
+                        "scale_guidance": True,
+                        "scale_guidance_alpha": [0.9, 1.0, 1.1, 1.2],
+                        "text_control_guidance": True,
+                        "text_control_guidance_scale": 0.10,
+                    },
+                },
+            },
+        ),
     ]
 )
 

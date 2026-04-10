@@ -152,8 +152,7 @@ python -u exe_forecasting.py \
 - Trend CFG grid search: `scripts/train_trendcfg_grid.sh`
 - Economy ablations for the weekly integration:
   - runner: `scripts/run_economy_scale_router_ablations.sh`
-  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_ttf_minimal`
-  - minimal TTF config: `config/economy_36_12_ttf_minimal.yaml` enables mean text pooling, gated text residuals, and late-layer text fusion
+  - cases: `no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
 
 ## Acknowledgements
 Codes are based on:

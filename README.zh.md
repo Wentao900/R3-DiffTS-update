@@ -150,8 +150,7 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_ttf_minimal`
-  - 最小改动版 TTF 配置：`config/economy_36_12_ttf_minimal.yaml`，开启 mean pooling、gated TTF 和后层文本融合
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`
 
 ## 致谢
 代码基于：

@@ -71,10 +71,6 @@ class CSDI_base(nn.Module):
         self.timestep_branch = config["model"]["timestep_branch"]
         self.timestep_emb_cat = config["model"]["timestep_emb_cat"]
         self.with_texts = config["model"]["with_texts"]
-        self.text_pool_mode = str(config["model"].get("text_pool_mode", "none")).lower()
-        self.ttf_gate = bool(config["model"].get("ttf_gate", False))
-        self.ttf_alpha_init = float(config["model"].get("ttf_alpha_init", 1.0))
-        self.ttf_start_layer = int(config["model"].get("ttf_start_layer", 0))
         self.noise_esti = config["diffusion"]["noise_esti"]
         self.relative_size_emb_cat = config["model"]["relative_size_emb_cat"]
         self.decomp = config["model"]["decomp"]
@@ -178,9 +174,6 @@ class CSDI_base(nn.Module):
         config_diff["with_timestep"] = True if self.timestep_emb_cat else False
         config_diff["context_dim"] = self.context_dim
         config_diff["with_texts"] = self.with_texts
-        config_diff["ttf_gate"] = self.ttf_gate
-        config_diff["ttf_alpha_init"] = self.ttf_alpha_init
-        config_diff["ttf_start_layer"] = self.ttf_start_layer
         config_diff["time_weight"] = config["diffusion"]["time_weight"]
         config_diff["save_attn"] = config["model"]["save_attn"]
 
@@ -864,26 +857,6 @@ class CSDI_Forecasting(CSDI_base):
                                      return_tensors='pt',
                                      ).to(self.device)
         context = self.text_encoder(**token_input).last_hidden_state
-        attention_mask = token_input.get("attention_mask")
-        if self.text_pool_mode != "none":
-            if self.text_pool_mode == "mean":
-                if attention_mask is None:
-                    context = context.mean(dim=1, keepdim=True)
-                else:
-                    valid = attention_mask.unsqueeze(-1).float()
-                    denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
-                    context = (context * valid).sum(dim=1, keepdim=True) / denom
-            elif self.text_pool_mode == "cls":
-                context = context[:, :1, :]
-            elif self.text_pool_mode == "last":
-                if attention_mask is None:
-                    context = context[:, -1:, :]
-                else:
-                    last_index = attention_mask.long().sum(dim=1).clamp_min(1) - 1
-                    batch_index = torch.arange(context.size(0), device=context.device)
-                    context = context[batch_index, last_index].unsqueeze(1)
-            else:
-                raise ValueError(f"Unsupported text_pool_mode: {self.text_pool_mode}")
         context = context * text_mask.unsqueeze(1).unsqueeze(1)
         context = context.permute(0, 2, 1) 
         if self.save_token:

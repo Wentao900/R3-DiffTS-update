@@ -107,9 +107,6 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
-        self.multi_res_coarse_loss_weight = float(train_cfg.get("multi_res_coarse_loss_weight", 0.0))
-        self.multi_res_coarse_use_huber = bool(train_cfg.get("multi_res_coarse_use_huber", self.multi_res_use_huber))
-        self.multi_res_coarse_huber_delta = float(train_cfg.get("multi_res_coarse_huber_delta", self.multi_res_huber_delta))
         self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
         self.multi_res_dynamic_by_t = bool(train_cfg.get("multi_res_dynamic_by_t", True))
         self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
@@ -319,27 +316,16 @@ class CSDI_base(nn.Module):
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
-        if (not self.noise_esti) and len(self.multi_res_horizons) > 0:
-            if self.multi_res_loss_weight > 0:
-                aux_loss = self._calc_multi_res_loss(
-                    observed_data,
-                    predicted,
-                    target_mask,
-                    t=t,
-                    trend_prior=trend_prior,
-                    scale_route=scale_route,
-                )
-                loss = loss + self.multi_res_loss_weight * aux_loss
-            if self.multi_res_coarse_loss_weight > 0:
-                coarse_loss = self._calc_multi_res_coarse_loss(
-                    observed_data,
-                    predicted,
-                    target_mask,
-                    t=t,
-                    trend_prior=trend_prior,
-                    scale_route=scale_route,
-                )
-                loss = loss + self.multi_res_coarse_loss_weight * coarse_loss
+        if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
+            aux_loss = self._calc_multi_res_loss(
+                observed_data,
+                predicted,
+                target_mask,
+                t=t,
+                trend_prior=trend_prior,
+                scale_route=scale_route,
+            )
+            loss = loss + self.multi_res_loss_weight * aux_loss
         return loss
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
@@ -409,36 +395,14 @@ class CSDI_base(nn.Module):
             weights = weights * route.clamp(min=1e-6)
         return weights.clamp(min=1e-6)
 
-    def _get_active_multi_res_horizons(self):
+    def _calc_multi_res_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None, scale_route=None):
         if self.pred_len <= 0:
-            return []
+            return torch.zeros((), device=observed_data.device)
         horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
         if len(horizons) == 0:
-            return []
-        max_pred = int(self.pred_len)
-        return sorted(set(min(h, max_pred) for h in horizons))
-
-    def _get_multi_res_spans(self, horizons):
-        spans = []
-        prev_h = 0
-        for h in horizons:
-            if h <= 0:
-                continue
-            if self.multi_res_partition_mode == "disjoint":
-                start = int(self.lookback_len + prev_h)
-            else:
-                start = int(self.lookback_len)
-            end = int(self.lookback_len + h)
-            prev_h = h
-            if end <= start:
-                continue
-            spans.append((start, end))
-        return spans
-
-    def _calc_multi_res_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None, scale_route=None):
-        horizons = self._get_active_multi_res_horizons()
-        if len(horizons) == 0:
             return torch.zeros((), device=observed_data.device)
+        max_pred = int(self.pred_len)
+        horizons = sorted(set(min(h, max_pred) for h in horizons))
         batch_size = observed_data.shape[0]
         horizon_weights = self._get_multi_res_horizon_weights(
             horizons,
@@ -447,11 +411,21 @@ class CSDI_base(nn.Module):
             trend_prior=trend_prior,
             scale_route=scale_route,
         )
-        spans = self._get_multi_res_spans(horizons)
         weighted_loss_sum = torch.zeros((batch_size,), device=observed_data.device)
         weight_sum = torch.zeros((batch_size,), device=observed_data.device)
-        for h_idx, (start, end) in enumerate(spans):
+        prev_h = 0
+        for h_idx, h in enumerate(horizons):
+            if h <= 0:
+                continue
             horizon_mask = torch.zeros_like(target_mask)
+            if self.multi_res_partition_mode == "disjoint":
+                start = int(self.lookback_len + prev_h)
+            else:
+                start = int(self.lookback_len)
+            end = int(self.lookback_len + h)
+            prev_h = h
+            if end <= start:
+                continue
             horizon_mask[:, :, start:end] = 1.0
             horizon_mask = horizon_mask * target_mask
             num_eval = horizon_mask.sum(dim=(1, 2))
@@ -471,50 +445,6 @@ class CSDI_base(nn.Module):
             else:
                 loss_h = (residual ** 2).sum(dim=(1, 2)) / num_eval.clamp(min=1.0)
             weight_h = horizon_weights[:, h_idx] * valid.float()
-            weighted_loss_sum = weighted_loss_sum + weight_h * loss_h
-            weight_sum = weight_sum + weight_h
-        valid_samples = weight_sum > 0
-        if not valid_samples.any():
-            return torch.zeros((), device=observed_data.device)
-        return (weighted_loss_sum[valid_samples] / weight_sum[valid_samples]).mean()
-
-    def _calc_multi_res_coarse_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None, scale_route=None):
-        horizons = self._get_active_multi_res_horizons()
-        if len(horizons) == 0:
-            return torch.zeros((), device=observed_data.device)
-        batch_size = observed_data.shape[0]
-        horizon_weights = self._get_multi_res_horizon_weights(
-            horizons,
-            batch_size,
-            t=t,
-            trend_prior=trend_prior,
-            scale_route=scale_route,
-        )
-        spans = self._get_multi_res_spans(horizons)
-        weighted_loss_sum = torch.zeros((batch_size,), device=observed_data.device)
-        weight_sum = torch.zeros((batch_size,), device=observed_data.device)
-        for h_idx, (start, end) in enumerate(spans):
-            horizon_mask = target_mask[:, :, start:end]
-            counts = horizon_mask.sum(dim=2)
-            valid_feature = counts > 0
-            sample_valid = valid_feature.any(dim=1)
-            if not sample_valid.any():
-                continue
-            pooled_true = (observed_data[:, :, start:end] * horizon_mask).sum(dim=2) / counts.clamp(min=1.0)
-            pooled_pred = (predicted[:, :, start:end] * horizon_mask).sum(dim=2) / counts.clamp(min=1.0)
-            coarse_residual = (pooled_true - pooled_pred) * valid_feature.float()
-            if self.multi_res_coarse_use_huber:
-                delta = self.multi_res_coarse_huber_delta
-                abs_res = coarse_residual.abs()
-                coarse_loss = torch.where(
-                    abs_res <= delta,
-                    0.5 * coarse_residual ** 2,
-                    delta * abs_res - 0.5 * (delta ** 2),
-                )
-                loss_h = coarse_loss.sum(dim=1) / valid_feature.sum(dim=1).clamp(min=1.0)
-            else:
-                loss_h = (coarse_residual ** 2).sum(dim=1) / valid_feature.sum(dim=1).clamp(min=1.0)
-            weight_h = horizon_weights[:, h_idx] * sample_valid.float()
             weighted_loss_sum = weighted_loss_sum + weight_h * loss_h
             weight_sum = weight_sum + weight_h
         valid_samples = weight_sum > 0

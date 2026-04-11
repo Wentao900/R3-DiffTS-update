@@ -101,6 +101,16 @@ class CSDI_base(nn.Module):
         self.forecast_prior_mode = str(config["diffusion"].get("forecast_prior_mode", "linear")).lower()
         self.forecast_prior_lag = int(config["diffusion"].get("forecast_prior_lag", 6))
         self.forecast_prior_slope_clip = float(config["diffusion"].get("forecast_prior_slope_clip", 1.0))
+        self.adaptive_residual_prior = bool(config["diffusion"].get("adaptive_residual_prior", False))
+        self.residual_prior_candidates = self._coerce_residual_prior_candidates(
+            config["diffusion"].get("residual_prior_candidates", ["none", "last", "linear", "seasonal"])
+        )
+        self.residual_prior_backtest_len = int(config["diffusion"].get("residual_prior_backtest_len", -1))
+        self.residual_prior_lag = int(config["diffusion"].get("residual_prior_lag", 6))
+        self.residual_prior_seasonal_lag = int(config["diffusion"].get("residual_prior_seasonal_lag", -1))
+        self.residual_prior_slope_clip = float(config["diffusion"].get("residual_prior_slope_clip", 1.0))
+        self.residual_prior_max_weight = float(config["diffusion"].get("residual_prior_max_weight", 1.0))
+        self.residual_prior_min_gain = float(config["diffusion"].get("residual_prior_min_gain", 0.0))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -285,14 +295,21 @@ class CSDI_base(nn.Module):
             means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
             stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
             observed_data = (observed_data - means) / stdev
+        adaptive_prior, adaptive_weight = self.build_adaptive_residual_prior(observed_data)
+        target_data = self.apply_adaptive_residual_target(
+            observed_data,
+            adaptive_prior,
+            adaptive_weight,
+            cond_mask,
+        )
 
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
         else:
             t = torch.randint(0, self.num_steps, [B]).to(self.device) 
         current_alpha = self.alpha_torch[t]  
-        noise = torch.randn_like(observed_data)
-        noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
+        noise = torch.randn_like(target_data)
+        noisy_data = (current_alpha ** 0.5) * target_data + (1.0 - current_alpha) ** 0.5 * noise
 
         total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask) 
 
@@ -319,12 +336,12 @@ class CSDI_base(nn.Module):
         if self.noise_esti:
             residual = (noise - predicted) * target_mask 
         else:
-            residual = (observed_data - predicted) * target_mask 
+            residual = (target_data - predicted) * target_mask
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(
-                observed_data,
+                target_data,
                 predicted,
                 target_mask,
                 t=t,
@@ -540,6 +557,125 @@ class CSDI_base(nn.Module):
         ratio = floor + (1.0 - floor) * ratio
         return torch.full((batch_size,), ratio, device=device)
 
+    def _coerce_residual_prior_candidates(self, candidates):
+        if isinstance(candidates, str):
+            candidates = [item.strip() for item in candidates.split(",")]
+        elif candidates is None:
+            candidates = []
+        valid = []
+        for item in candidates:
+            mode = str(item).strip().lower()
+            if mode in {"none", "last", "linear", "seasonal"} and mode not in valid:
+                valid.append(mode)
+        if "none" not in valid:
+            valid.insert(0, "none")
+        return valid if valid else ["none", "last", "linear", "seasonal"]
+
+    def _resolve_residual_backtest_len(self, hist_len):
+        if hist_len <= 2:
+            return 0
+        if self.residual_prior_backtest_len > 0:
+            backtest_len = int(self.residual_prior_backtest_len)
+        else:
+            backtest_len = min(max(int(self.pred_len), 1), max(hist_len // 3, 1))
+        return max(1, min(backtest_len, hist_len - 1))
+
+    def _make_residual_prior_forecast(self, history, horizon, mode):
+        B, K, hist_len = history.shape
+        if horizon <= 0:
+            return history.new_zeros((B, K, 0))
+        if hist_len <= 0 or mode == "none":
+            return history.new_zeros((B, K, horizon))
+
+        last_value = history[:, :, -1:]
+        if mode == "last" or hist_len == 1:
+            return last_value.expand(-1, -1, horizon)
+
+        if mode == "linear":
+            lag = max(1, min(int(self.residual_prior_lag), hist_len - 1))
+            slope = (history[:, :, -1:] - history[:, :, -1 - lag:-lag]) / float(lag)
+            clip_scale = float(self.residual_prior_slope_clip)
+            if clip_scale > 0.0 and hist_len > 1:
+                history_diff = history[:, :, 1:] - history[:, :, :-1]
+                diff_std = history_diff.std(dim=-1, keepdim=True, unbiased=False)
+                max_slope = clip_scale * diff_std.clamp(min=1e-6)
+                slope = slope.clamp(min=-max_slope, max=max_slope)
+            steps = torch.arange(1, horizon + 1, device=history.device, dtype=history.dtype).view(1, 1, -1)
+            return last_value + slope * steps
+
+        if mode == "seasonal":
+            lag = int(self.residual_prior_seasonal_lag)
+            if lag <= 0:
+                lag = max(int(self.pred_len), 1)
+            lag = max(1, min(lag, hist_len))
+            source = history[:, :, -lag:]
+            repeats = int(np.ceil(float(horizon) / float(lag)))
+            return source.repeat(1, 1, repeats)[:, :, :horizon]
+
+        return history.new_zeros((B, K, horizon))
+
+    def build_adaptive_residual_prior(self, observed_data):
+        if (not self.adaptive_residual_prior) or self.noise_esti or self.pred_len <= 0:
+            return None, None
+        hist_end = min(int(self.lookback_len), observed_data.shape[-1])
+        pred_end = min(hist_end + int(self.pred_len), observed_data.shape[-1])
+        if hist_end <= 2 or pred_end <= hist_end:
+            return None, None
+
+        history = observed_data[:, :, :hist_end]
+        future_len = pred_end - hist_end
+        backtest_len = self._resolve_residual_backtest_len(hist_end)
+        train_hist_end = hist_end - backtest_len
+        if backtest_len <= 0 or train_hist_end <= 0:
+            return None, None
+
+        train_history = history[:, :, :train_hist_end]
+        validation = history[:, :, train_hist_end:hist_end]
+        candidates = self.residual_prior_candidates
+        backtest_forecasts = torch.stack(
+            [self._make_residual_prior_forecast(train_history, backtest_len, mode) for mode in candidates],
+            dim=0,
+        )
+        future_forecasts = torch.stack(
+            [self._make_residual_prior_forecast(history, future_len, mode) for mode in candidates],
+            dim=0,
+        )
+        errors = ((backtest_forecasts - validation.unsqueeze(0)) ** 2).mean(dim=(2, 3))
+        best_idx = errors.argmin(dim=0)
+        best_error = errors.gather(0, best_idx.view(1, -1)).squeeze(0)
+        none_idx = candidates.index("none") if "none" in candidates else 0
+        baseline_error = errors[none_idx].clamp(min=1e-6)
+        gain = ((baseline_error - best_error) / baseline_error).clamp(min=0.0, max=1.0)
+        min_gain = float(np.clip(self.residual_prior_min_gain, 0.0, 1.0))
+        if min_gain > 0.0:
+            gain = torch.where(gain >= min_gain, (gain - min_gain) / max(1.0 - min_gain, 1e-6), torch.zeros_like(gain))
+        max_weight = float(np.clip(self.residual_prior_max_weight, 0.0, 1.0))
+        prior_weight = (gain * max_weight).view(-1, 1, 1)
+        prior_weight = torch.where(
+            (best_idx == none_idx).view(-1, 1, 1),
+            torch.zeros_like(prior_weight),
+            prior_weight,
+        )
+
+        B, K, _ = observed_data.shape
+        gather_idx = best_idx.view(1, B, 1, 1).expand(1, B, K, future_len)
+        future_prior = future_forecasts.gather(0, gather_idx).squeeze(0)
+        prior = torch.zeros_like(observed_data)
+        prior[:, :, hist_end:pred_end] = future_prior
+        return prior, prior_weight
+
+    def apply_adaptive_residual_target(self, observed_data, residual_prior, residual_weight, cond_mask):
+        if residual_prior is None or residual_weight is None:
+            return observed_data
+        target_mask = (1.0 - cond_mask).clamp(min=0.0, max=1.0)
+        return observed_data - residual_prior * residual_weight * target_mask
+
+    def apply_adaptive_residual_output(self, sample, residual_prior, residual_weight, cond_mask):
+        if residual_prior is None or residual_weight is None:
+            return sample
+        target_mask = (1.0 - cond_mask).clamp(min=0.0, max=1.0)
+        return sample + residual_prior * residual_weight * target_mask
+
     def build_forecast_prior(self, observed_data):
         blend = float(np.clip(self.forecast_prior_blend, 0.0, 1.0))
         if blend <= 0.0 or self.forecast_prior_mode == "none" or self.pred_len <= 0:
@@ -637,6 +773,7 @@ class CSDI_base(nn.Module):
             observed_data.device,
         )
         guidance_factor = scale_guide * consistency_guide * text_control_guide
+        adaptive_prior, adaptive_weight = self.build_adaptive_residual_prior(observed_data)
         forecast_prior = self.build_forecast_prior(observed_data)
 
         for i in range(n_samples):
@@ -741,6 +878,7 @@ class CSDI_base(nn.Module):
                             ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
                         )
 
+            current_sample = self.apply_adaptive_residual_output(current_sample, adaptive_prior, adaptive_weight, cond_mask)
             current_sample = self.apply_forecast_prior(current_sample, forecast_prior, cond_mask)
             imputed_samples[:, i] = current_sample.detach()
             if self.timestep_branch and timesteps is not None:

@@ -63,6 +63,14 @@ def _parse_float_list(value):
             continue
     return parsed
 
+
+def _parse_str_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
 parser.add_argument("--datatype", type=str, default="multimodal")
@@ -106,6 +114,14 @@ parser.add_argument('--forecast_prior_mode', type=str, default='linear', choices
 parser.add_argument('--forecast_prior_mode_list', type=str, default='', help='comma-separated forecast prior modes to sweep after one training run; values: none,last,linear')
 parser.add_argument('--forecast_prior_lag', type=int, default=6, help='history lag for linear forecast prior slope estimation')
 parser.add_argument('--forecast_prior_slope_clip', type=float, default=1.0, help='clip linear prior slope by this multiple of recent diff std; non-positive disables clipping')
+parser.add_argument('--adaptive_residual_prior', action='store_true', help='train/evaluate diffusion in an adaptive numeric-prior residual space')
+parser.add_argument('--residual_prior_candidates', type=str, default='none,last,linear,seasonal', help='comma-separated adaptive residual prior candidates')
+parser.add_argument('--residual_prior_backtest_len', type=int, default=-1, help='history tail length for adaptive residual prior backtest; negative uses auto')
+parser.add_argument('--residual_prior_lag', type=int, default=6, help='history lag for adaptive residual linear prior slope')
+parser.add_argument('--residual_prior_seasonal_lag', type=int, default=-1, help='seasonal lag for adaptive residual prior; negative uses pred_len')
+parser.add_argument('--residual_prior_slope_clip', type=float, default=1.0, help='clip adaptive residual linear slope by this multiple of recent diff std')
+parser.add_argument('--residual_prior_max_weight', type=float, default=1.0, help='maximum sample-level adaptive residual prior weight')
+parser.add_argument('--residual_prior_min_gain', type=float, default=0.0, help='minimum backtest gain over no-prior baseline before applying residual prior')
 parser.add_argument('--trend_cfg', action='store_true', help='enable trend-aware CFG modulation from CoT')
 parser.add_argument('--trend_cfg_power', type=float, default=1.0, help='power for trend CFG time schedule')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace trend prior with random draws')
@@ -203,6 +219,16 @@ args.forecast_prior_blend = config["diffusion"].get("forecast_prior_blend", args
 args.forecast_prior_mode = config["diffusion"].get("forecast_prior_mode", args.forecast_prior_mode)
 args.forecast_prior_lag = config["diffusion"].get("forecast_prior_lag", args.forecast_prior_lag)
 args.forecast_prior_slope_clip = config["diffusion"].get("forecast_prior_slope_clip", args.forecast_prior_slope_clip)
+args.adaptive_residual_prior = config["diffusion"].get("adaptive_residual_prior", args.adaptive_residual_prior)
+args.residual_prior_candidates = _parse_str_list(
+    config["diffusion"].get("residual_prior_candidates", args.residual_prior_candidates)
+)
+args.residual_prior_backtest_len = config["diffusion"].get("residual_prior_backtest_len", args.residual_prior_backtest_len)
+args.residual_prior_lag = config["diffusion"].get("residual_prior_lag", args.residual_prior_lag)
+args.residual_prior_seasonal_lag = config["diffusion"].get("residual_prior_seasonal_lag", args.residual_prior_seasonal_lag)
+args.residual_prior_slope_clip = config["diffusion"].get("residual_prior_slope_clip", args.residual_prior_slope_clip)
+args.residual_prior_max_weight = config["diffusion"].get("residual_prior_max_weight", args.residual_prior_max_weight)
+args.residual_prior_min_gain = config["diffusion"].get("residual_prior_min_gain", args.residual_prior_min_gain)
 args.step_guidance = config["diffusion"].get("step_guidance", args.step_guidance)
 args.step_guidance_power = config["diffusion"].get("step_guidance_power", args.step_guidance_power)
 args.step_guidance_floor = config["diffusion"].get("step_guidance_floor", args.step_guidance_floor)
@@ -297,6 +323,14 @@ config["diffusion"]["forecast_prior_blend"] = args.forecast_prior_blend
 config["diffusion"]["forecast_prior_mode"] = args.forecast_prior_mode
 config["diffusion"]["forecast_prior_lag"] = args.forecast_prior_lag
 config["diffusion"]["forecast_prior_slope_clip"] = args.forecast_prior_slope_clip
+config["diffusion"]["adaptive_residual_prior"] = args.adaptive_residual_prior
+config["diffusion"]["residual_prior_candidates"] = args.residual_prior_candidates
+config["diffusion"]["residual_prior_backtest_len"] = args.residual_prior_backtest_len
+config["diffusion"]["residual_prior_lag"] = args.residual_prior_lag
+config["diffusion"]["residual_prior_seasonal_lag"] = args.residual_prior_seasonal_lag
+config["diffusion"]["residual_prior_slope_clip"] = args.residual_prior_slope_clip
+config["diffusion"]["residual_prior_max_weight"] = args.residual_prior_max_weight
+config["diffusion"]["residual_prior_min_gain"] = args.residual_prior_min_gain
 config["diffusion"]["step_guidance"] = args.step_guidance
 config["diffusion"]["step_guidance_power"] = args.step_guidance_power
 config["diffusion"]["step_guidance_floor"] = args.step_guidance_floor

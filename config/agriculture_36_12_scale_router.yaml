@@ -38,14 +38,6 @@ diffusion:
   pre_norm: False
   scale_guidance: true
   scale_guidance_alpha: [0.9, 1.0, 1.1, 1.2]
-  adaptive_residual_prior: true
-  residual_prior_candidates: [none, last, linear, seasonal]
-  residual_prior_backtest_len: -1
-  residual_prior_lag: 6
-  residual_prior_seasonal_lag: -1
-  residual_prior_slope_clip: 1.0
-  residual_prior_max_weight: 1.0
-  residual_prior_min_gain: 0.0
 
 model:
   cot_model: ./gpt2-medium

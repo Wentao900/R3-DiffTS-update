@@ -97,6 +97,10 @@ class CSDI_base(nn.Module):
         self.consistency_threshold = float(config["diffusion"].get("consistency_threshold", 0.0))
         self.text_control_guidance = config["diffusion"].get("text_control_guidance", False)
         self.text_control_guidance_scale = float(config["diffusion"].get("text_control_guidance_scale", 0.15))
+        self.forecast_prior_blend = float(config["diffusion"].get("forecast_prior_blend", 0.0))
+        self.forecast_prior_mode = str(config["diffusion"].get("forecast_prior_mode", "linear")).lower()
+        self.forecast_prior_lag = int(config["diffusion"].get("forecast_prior_lag", 6))
+        self.forecast_prior_slope_clip = float(config["diffusion"].get("forecast_prior_slope_clip", 1.0))
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
         self.llm = config["model"]["llm"]
@@ -536,6 +540,45 @@ class CSDI_base(nn.Module):
         ratio = floor + (1.0 - floor) * ratio
         return torch.full((batch_size,), ratio, device=device)
 
+    def build_forecast_prior(self, observed_data):
+        blend = float(np.clip(self.forecast_prior_blend, 0.0, 1.0))
+        if blend <= 0.0 or self.forecast_prior_mode == "none" or self.pred_len <= 0:
+            return None
+        hist_end = min(int(self.lookback_len), observed_data.shape[-1])
+        pred_end = min(hist_end + int(self.pred_len), observed_data.shape[-1])
+        if hist_end <= 0 or pred_end <= hist_end:
+            return None
+
+        history = observed_data[:, :, :hist_end]
+        last_value = history[:, :, -1:]
+        future_len = pred_end - hist_end
+        if self.forecast_prior_mode == "last" or hist_end == 1:
+            future_prior = last_value.expand(-1, -1, future_len)
+        else:
+            lag = max(1, min(int(self.forecast_prior_lag), hist_end - 1))
+            slope = (history[:, :, -1:] - history[:, :, -1 - lag:-lag]) / float(lag)
+            clip_scale = float(self.forecast_prior_slope_clip)
+            if clip_scale > 0.0 and history.shape[-1] > 1:
+                history_diff = history[:, :, 1:] - history[:, :, :-1]
+                diff_std = history_diff.std(dim=-1, keepdim=True, unbiased=False)
+                max_slope = clip_scale * diff_std.clamp(min=1e-6)
+                slope = slope.clamp(min=-max_slope, max=max_slope)
+            steps = torch.arange(1, future_len + 1, device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
+            future_prior = last_value + slope * steps
+
+        prior = torch.zeros_like(observed_data)
+        prior[:, :, :hist_end] = observed_data[:, :, :hist_end]
+        prior[:, :, hist_end:pred_end] = future_prior
+        return prior
+
+    def apply_forecast_prior(self, sample, forecast_prior, cond_mask):
+        blend = float(np.clip(self.forecast_prior_blend, 0.0, 1.0))
+        if blend <= 0.0 or forecast_prior is None:
+            return sample
+        target_mask = (1.0 - cond_mask).clamp(min=0.0, max=1.0)
+        blended = (1.0 - blend) * sample + blend * forecast_prior
+        return sample * (1.0 - target_mask) + blended * target_mask
+
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)  
@@ -594,6 +637,7 @@ class CSDI_base(nn.Module):
             observed_data.device,
         )
         guidance_factor = scale_guide * consistency_guide * text_control_guide
+        forecast_prior = self.build_forecast_prior(observed_data)
 
         for i in range(n_samples):
             if self.is_unconditional == True:
@@ -697,6 +741,7 @@ class CSDI_base(nn.Module):
                             ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
                         )
 
+            current_sample = self.apply_forecast_prior(current_sample, forecast_prior, cond_mask)
             imputed_samples[:, i] = current_sample.detach()
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)

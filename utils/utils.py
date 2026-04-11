@@ -234,6 +234,8 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
 
             results = {
                 "guide_w": guide_w,
+                "forecast_prior_blend": float(getattr(model, "forecast_prior_blend", 0.0)),
+                "forecast_prior_mode": getattr(model, "forecast_prior_mode", "none"),
                 "MSE": nmse_total / evalpoints_total,
                 "MAE": nmae_total / evalpoints_total,
             }

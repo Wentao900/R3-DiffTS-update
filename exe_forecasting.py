@@ -100,6 +100,12 @@ parser.add_argument('--cot_load_in_8bit', action='store_true', help='load CoT mo
 parser.add_argument('--cot_load_in_4bit', action='store_true', help='load CoT model in 4-bit (requires bitsandbytes)')
 parser.add_argument('--guide_w', type=float, default=-1, help='override guidance weight when cfg is enabled; negative to use default sweep')
 parser.add_argument('--guide_w_list', type=str, default='', help='comma-separated guidance weights to sweep after one training run; overrides --guide_w when non-empty')
+parser.add_argument('--forecast_prior_blend', type=float, default=0.0, help='blend generated samples with a numeric forecast prior during inference')
+parser.add_argument('--forecast_prior_blend_list', type=str, default='', help='comma-separated forecast prior blend values to sweep after one training run')
+parser.add_argument('--forecast_prior_mode', type=str, default='linear', choices=['none', 'last', 'linear'], help='numeric forecast prior used when forecast_prior_blend is positive')
+parser.add_argument('--forecast_prior_mode_list', type=str, default='', help='comma-separated forecast prior modes to sweep after one training run; values: none,last,linear')
+parser.add_argument('--forecast_prior_lag', type=int, default=6, help='history lag for linear forecast prior slope estimation')
+parser.add_argument('--forecast_prior_slope_clip', type=float, default=1.0, help='clip linear prior slope by this multiple of recent diff std; non-positive disables clipping')
 parser.add_argument('--trend_cfg', action='store_true', help='enable trend-aware CFG modulation from CoT')
 parser.add_argument('--trend_cfg_power', type=float, default=1.0, help='power for trend CFG time schedule')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace trend prior with random draws')
@@ -193,6 +199,10 @@ args.trend_cfg_random = config["diffusion"].get("trend_cfg_random", args.trend_c
 args.trend_strength_scale = config["diffusion"].get("trend_strength_scale", args.trend_strength_scale)
 args.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", args.trend_volatility_scale)
 args.trend_time_floor = config["diffusion"].get("trend_time_floor", args.trend_time_floor)
+args.forecast_prior_blend = config["diffusion"].get("forecast_prior_blend", args.forecast_prior_blend)
+args.forecast_prior_mode = config["diffusion"].get("forecast_prior_mode", args.forecast_prior_mode)
+args.forecast_prior_lag = config["diffusion"].get("forecast_prior_lag", args.forecast_prior_lag)
+args.forecast_prior_slope_clip = config["diffusion"].get("forecast_prior_slope_clip", args.forecast_prior_slope_clip)
 args.step_guidance = config["diffusion"].get("step_guidance", args.step_guidance)
 args.step_guidance_power = config["diffusion"].get("step_guidance_power", args.step_guidance_power)
 args.step_guidance_floor = config["diffusion"].get("step_guidance_floor", args.step_guidance_floor)
@@ -283,6 +293,10 @@ config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
 config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale
 config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
+config["diffusion"]["forecast_prior_blend"] = args.forecast_prior_blend
+config["diffusion"]["forecast_prior_mode"] = args.forecast_prior_mode
+config["diffusion"]["forecast_prior_lag"] = args.forecast_prior_lag
+config["diffusion"]["forecast_prior_slope_clip"] = args.forecast_prior_slope_clip
 config["diffusion"]["step_guidance"] = args.step_guidance
 config["diffusion"]["step_guidance_power"] = args.step_guidance_power
 config["diffusion"]["step_guidance_floor"] = args.step_guidance_floor
@@ -347,20 +361,36 @@ if config["diffusion"]["cfg"]:
         if len(custom_guide_list) > 0
         else ([args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0])
     )
-    for guide_w in guide_list:
-        mse = evaluate(
-            model,
-            test_loader,
-            nsample=args.nsample,
-            scaler=scaler,
-            mean_scaler=mean_scaler,
-            foldername=foldername,
-            window_lens=[args.seq_len, args.pred_len],
-            guide_w=guide_w,
-            save_attn=args.save_attn,
-            save_token=args.save_token,
-            save_trend_prior=args.save_trend_prior
-        )
+    custom_prior_blend_list = _parse_float_list(args.forecast_prior_blend_list)
+    prior_blend_list = custom_prior_blend_list if len(custom_prior_blend_list) > 0 else [args.forecast_prior_blend]
+    prior_mode_list = [
+        item.strip().lower()
+        for item in str(args.forecast_prior_mode_list).split(",")
+        if item.strip()
+    ]
+    if len(prior_mode_list) == 0:
+        prior_mode_list = [args.forecast_prior_mode]
+    prior_mode_list = [item for item in prior_mode_list if item in {"none", "last", "linear"}]
+    if len(prior_mode_list) == 0:
+        prior_mode_list = [args.forecast_prior_mode]
+    for prior_mode in prior_mode_list:
+        model.forecast_prior_mode = prior_mode
+        for prior_blend in prior_blend_list:
+            model.forecast_prior_blend = float(prior_blend)
+            for guide_w in guide_list:
+                mse = evaluate(
+                    model,
+                    test_loader,
+                    nsample=args.nsample,
+                    scaler=scaler,
+                    mean_scaler=mean_scaler,
+                    foldername=foldername,
+                    window_lens=[args.seq_len, args.pred_len],
+                    guide_w=guide_w,
+                    save_attn=args.save_attn,
+                    save_token=args.save_token,
+                    save_trend_prior=args.save_trend_prior
+                )
 else:
     evaluate(
             model,

@@ -99,6 +99,7 @@ parser.add_argument('--cot_device', type=str, default=None, help='device for CoT
 parser.add_argument('--cot_load_in_8bit', action='store_true', help='load CoT model in 8-bit (requires bitsandbytes)')
 parser.add_argument('--cot_load_in_4bit', action='store_true', help='load CoT model in 4-bit (requires bitsandbytes)')
 parser.add_argument('--guide_w', type=float, default=-1, help='override guidance weight when cfg is enabled; negative to use default sweep')
+parser.add_argument('--guide_w_list', type=str, default='', help='comma-separated guidance weights to sweep after one training run; overrides --guide_w when non-empty')
 parser.add_argument('--trend_cfg', action='store_true', help='enable trend-aware CFG modulation from CoT')
 parser.add_argument('--trend_cfg_power', type=float, default=1.0, help='power for trend CFG time schedule')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace trend prior with random draws')
@@ -340,7 +341,12 @@ else:
 model.target_dim = target_dim
 if config["diffusion"]["cfg"]:
     best_mse = 10e10
-    guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
+    custom_guide_list = _parse_float_list(args.guide_w_list)
+    guide_list = (
+        custom_guide_list
+        if len(custom_guide_list) > 0
+        else ([args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0])
+    )
     for guide_w in guide_list:
         mse = evaluate(
             model,

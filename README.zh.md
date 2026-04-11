@@ -150,10 +150,9 @@ python -u exe_forecasting.py \
 - trend CFG 网格搜索：`scripts/train_trendcfg_grid.sh`
 - Economy 消融：
   - 入口脚本：`scripts/run_economy_scale_router_ablations.sh`
-  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_text_control`, `router_text_control_mix20`, `router_text_control_soft`, `router_text_control_long`
+  - 默认 case：`no_multires`, `cum_base`, `disjoint_only`, `router_window_only`, `router_loss_only`, `router_full`, `router_guidance`, `router_consistency`, `router_text_control`, `router_text_control_mix20`, `router_text_control_soft`
   - 文本控制版配置：`config/economy_36_12_text_control.yaml`，文本不进 backbone，只用于控制 routed loss 和 guidance
   - 更温和的文本控制配置：`config/economy_36_12_text_control_soft.yaml`，将 `text_control_mix` 降到 `0.20`、`text_control_guidance_scale` 降到 `0.10`
-  - 长 horizon 优先的文本控制配置：`config/economy_36_12_text_control_long.yaml`，短 bin 基本保持 numeric，长 bin 才更强地混入 text-control
 
 ## 致谢
 代码基于：

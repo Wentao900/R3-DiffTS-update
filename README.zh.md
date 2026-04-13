@@ -30,7 +30,8 @@ bash ./run.sh
 - Stage-2：将趋势假设转为自然语言 query 检索 E1，合并 E1 与 E0（去重、保留 top-k）。
 - 稳定性：若原始文本为空或检索失败，自动回退到单阶段。
 - 输出模板固定：
-  `[RAW TEXT] / [NUMERICAL SUMMARY] / [TREND HYPOTHESIS] / [RETRIEVED EVIDENCE - REFINED]`
+  `[NUMERICAL SUMMARY] / [TREND HYPOTHESIS] / [RETRIEVED EVIDENCE - REFINED] / [RAW TEXT]`
+- 长文本处理：为适配 BERT 编码上限，会对各段落按优先级做预算裁剪（优先保留 NUM/TREND/EVIDENCE，RAW 放最后且最先被裁）。
 - 可调参数：`--rag_stage1_topk`, `--rag_stage2_topk`, `--two_stage_gate`, `--trend_slope_eps`
 - 数值统计（`slope/std/mean`）会追加到 `key_factors`，提升 Stage-2 检索效果。
 

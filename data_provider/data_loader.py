@@ -386,10 +386,10 @@ class Dataset_Custom(Dataset):
                 filtered_report.append(segment)
                 seen.add(segment)
         all_txt = ' '.join(filtered_report)
-        # basic cleanup and truncation for robustness
+        # basic cleanup and optional truncation for robustness
         tokens = all_txt.split()
-        if len(tokens) > self.max_text_tokens:
-            tokens = tokens[:self.max_text_tokens]
+        if self.max_text_tokens is not None and int(self.max_text_tokens) > 0 and len(tokens) > int(self.max_text_tokens):
+            tokens = tokens[: int(self.max_text_tokens)]
         all_txt = ' '.join(tokens)
         return all_txt, text_mark
     
@@ -412,7 +412,11 @@ class Dataset_Custom(Dataset):
         text_begin = max(s_end - dynamic_text_len, 0)
         text_end = s_end
 
-        seq_x_txt, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
+        # Use end_date[text_end - 1] to avoid leaking the first prediction step window.
+        seq_x_txt, txt_mark = self.collect_text(
+            self.num_dates.start_date[text_begin],
+            self.num_dates.end_date[text_end - 1],
+        )
         text_dropped = False
         if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
             seq_x_txt, txt_mark = 'NA', 0

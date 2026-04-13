@@ -771,6 +771,7 @@ class CSDI_Forecasting(CSDI_base):
         token_input = self.tokenizer(text,
                                      padding='max_length',
                                      truncation=True,
+                                     max_length=512,
                                      return_tensors='pt',
                                      ).to(self.device)
         context = self.text_encoder(**token_input).last_hidden_state

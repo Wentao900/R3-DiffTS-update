@@ -69,6 +69,67 @@ class RAGCoTPipeline:
         self.retriever = self._fit_retriever(self.search_df)
         self.generator = self._init_generator(self.config)
         self.cache: OrderedDict[str, Dict[str, str]] = OrderedDict()
+        # Text budget (approx. whitespace tokens) to reduce harmful truncation by BERT.
+        # Priority: NUMERICAL SUMMARY > TREND HYPOTHESIS/CoT > RETRIEVED EVIDENCE > RAW TEXT.
+        # Note: BERT still truncates at its own tokenizer max length; this makes truncation predictable.
+        self._text_budget_total_words = 480
+        self._text_budget_num_words = 80
+        self._text_budget_trend_words = 120
+        self._text_budget_evidence_words = 240
+        self._text_budget_raw_words = 240
+
+    def _truncate_words(self, text: str, max_words: int) -> str:
+        if not text or max_words <= 0:
+            return ""
+        words = " ".join(str(text).split()).split(" ")
+        if len(words) <= max_words:
+            return " ".join(words).strip()
+        return " ".join(words[:max_words]).strip()
+
+    def _apply_section_budgets(
+        self,
+        raw_text: str,
+        numeric_summary: str,
+        trend_text: str,
+        evidence_items: Sequence[str],
+    ) -> Tuple[str, str, str, List[str]]:
+        numeric_summary = self._truncate_words(numeric_summary, self._text_budget_num_words)
+        trend_text = self._truncate_words(trend_text, self._text_budget_trend_words)
+        evidence_joined = " ".join([self._truncate_evidence(item) for item in (evidence_items or [])]).strip()
+        evidence_joined = self._truncate_words(evidence_joined, self._text_budget_evidence_words)
+        raw_text = self._truncate_words(raw_text, self._text_budget_raw_words)
+
+        # Enforce total budget by trimming low-priority sections first.
+        def count_words(t: str) -> int:
+            return 0 if not t else len(str(t).split())
+
+        total = count_words(numeric_summary) + count_words(trend_text) + count_words(evidence_joined) + count_words(raw_text)
+        if total > self._text_budget_total_words:
+            overflow = total - self._text_budget_total_words
+            # Trim RAW first
+            raw_keep = max(0, count_words(raw_text) - overflow)
+            raw_text = self._truncate_words(raw_text, raw_keep)
+            total = count_words(numeric_summary) + count_words(trend_text) + count_words(evidence_joined) + count_words(raw_text)
+        if total > self._text_budget_total_words:
+            overflow = total - self._text_budget_total_words
+            # Then trim evidence
+            ev_keep = max(0, count_words(evidence_joined) - overflow)
+            evidence_joined = self._truncate_words(evidence_joined, ev_keep)
+            total = count_words(numeric_summary) + count_words(trend_text) + count_words(evidence_joined) + count_words(raw_text)
+        if total > self._text_budget_total_words:
+            overflow = total - self._text_budget_total_words
+            # Then trim trend
+            tr_keep = max(0, count_words(trend_text) - overflow)
+            trend_text = self._truncate_words(trend_text, tr_keep)
+            total = count_words(numeric_summary) + count_words(trend_text) + count_words(evidence_joined) + count_words(raw_text)
+        if total > self._text_budget_total_words:
+            overflow = total - self._text_budget_total_words
+            # Finally trim numeric summary (should rarely happen)
+            num_keep = max(0, count_words(numeric_summary) - overflow)
+            numeric_summary = self._truncate_words(numeric_summary, num_keep)
+
+        evidence_items_out = [evidence_joined] if evidence_joined else []
+        return raw_text, numeric_summary, trend_text, evidence_items_out
 
     def _resolve_stage2_topk(self, stage2_topk: int) -> int:
         if stage2_topk and stage2_topk > 0:
@@ -393,15 +454,38 @@ class RAGCoTPipeline:
             return cleaned
         return cleaned[: max_chars - 3].rstrip() + "..."
 
-    def _compose_text(self, base_text: str, retrieved: List[str], cot_text: str) -> str:
-        blocks = []
-        if base_text and base_text != "NA":
-            blocks.append(base_text)
-        if retrieved:
-            blocks.append("Retrieved evidence: " + " ".join(retrieved))
-        if cot_text and self.config.include_cot_in_text:
-            blocks.append("Intermediate trend reasoning: " + cot_text)
-        return "\n".join(blocks) if blocks else ""
+    def _compose_one_shot_text(
+        self,
+        base_text: str,
+        numeric_summary: str,
+        retrieved: List[str],
+        cot_text: str,
+    ) -> str:
+        raw_text_in = base_text if (base_text and base_text != "NA") else "NA"
+        trend_text_in = cot_text if (cot_text and self.config.include_cot_in_text) else ""
+        raw_text, numeric_summary, trend_text, retrieved_budgeted = self._apply_section_budgets(
+            raw_text=("" if raw_text_in == "NA" else raw_text_in),
+            numeric_summary=numeric_summary,
+            trend_text=trend_text_in,
+            evidence_items=retrieved or [],
+        )
+        raw_text = raw_text if raw_text else "NA"
+        lines = [
+            "[NUMERICAL SUMMARY]",
+            numeric_summary,
+            "",
+            "[TREND HYPOTHESIS]" if self.config.structured_output else "[TREND]",
+            trend_text if trend_text else "NA",
+            "",
+            "[RETRIEVED EVIDENCE]",
+        ]
+        if retrieved_budgeted:
+            for idx, item in enumerate(retrieved_budgeted, start=1):
+                lines.append(f"{idx}) {item}")
+        else:
+            lines.append("1) NA")
+        lines.extend(["", "[RAW TEXT]", raw_text])
+        return "\n".join(lines)
 
     def _compose_two_stage_text(
         self,
@@ -410,11 +494,15 @@ class RAGCoTPipeline:
         trend_hypothesis: str,
         retrieved: List[str],
     ) -> str:
-        raw_text = base_text if not self._is_empty_text(base_text) else "NA"
+        raw_text_in = base_text if not self._is_empty_text(base_text) else "NA"
+        raw_text, numeric_summary, trend_hypothesis, retrieved_budgeted = self._apply_section_budgets(
+            raw_text=("" if raw_text_in == "NA" else raw_text_in),
+            numeric_summary=numeric_summary,
+            trend_text=trend_hypothesis,
+            evidence_items=retrieved or [],
+        )
+        raw_text = raw_text if raw_text else "NA"
         lines = [
-            "[RAW TEXT]",
-            raw_text,
-            "",
             "[NUMERICAL SUMMARY]",
             numeric_summary,
             "",
@@ -423,11 +511,19 @@ class RAGCoTPipeline:
             "",
             "[RETRIEVED EVIDENCE - REFINED]",
         ]
-        if retrieved:
-            for idx, item in enumerate(retrieved, start=1):
-                lines.append(f"{idx}) {self._truncate_evidence(item)}")
+        if retrieved_budgeted:
+            # Keep the fixed template, but the evidence content is already budgeted/prioritized.
+            for idx, item in enumerate(retrieved_budgeted, start=1):
+                lines.append(f"{idx}) {item}")
         else:
             lines.append("1) NA")
+        lines.extend(
+            [
+                "",
+                "[RAW TEXT]",
+                raw_text,
+            ]
+        )
         return "\n".join(lines)
 
     def _build_one_shot_guidance(
@@ -440,7 +536,7 @@ class RAGCoTPipeline:
         retrieved = self._retrieve(query)
         prompt = self._format_prompt(numeric_summary, retrieved)
         cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
-        composed_text = self._compose_text(base_text, retrieved, cot_text)
+        composed_text = self._compose_one_shot_text(base_text, numeric_summary, retrieved, cot_text)
         return {
             "cot_text": cot_text,
             "retrieved_text": " ".join(retrieved),

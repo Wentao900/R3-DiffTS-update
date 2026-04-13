@@ -76,7 +76,9 @@ adapt the text window and optionally the multi-resolution loss.
   then merge E1 with E0 (deduplicate, keep top-k).
 - Stability: gate/fallback to one-shot if raw text is empty or retrieval fails.
 - Output template is fixed:
-  `[RAW TEXT] / [NUMERICAL SUMMARY] / [TREND HYPOTHESIS] / [RETRIEVED EVIDENCE - REFINED]`.
+  `[NUMERICAL SUMMARY] / [TREND HYPOTHESIS] / [RETRIEVED EVIDENCE - REFINED] / [RAW TEXT]`.
+- Long-text handling: to fit the BERT encoder limit, each section is budget-trimmed by priority
+  (keep NUM/TREND/EVIDENCE first; RAW is placed last and trimmed first).
 - Tunables: `--rag_stage1_topk`, `--rag_stage2_topk`, `--two_stage_gate`, `--trend_slope_eps`.
 - Numeric stats (`slope/std/mean`) are appended to `key_factors` to improve Stage-2 retrieval.
 

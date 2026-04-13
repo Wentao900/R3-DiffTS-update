@@ -10,6 +10,9 @@ __pycache__/
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 
+# Misc local metadata
+.msc
+
 # Model/cache folders
 Qwen2.5-7B-Instruct/
 gpt2-medium/

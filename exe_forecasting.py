@@ -125,10 +125,6 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
-# Force unified TAA + TTF path: always use texts, timestep embeddings, and timestep branch
-config["model"]["with_texts"] = True
-config["model"]["timestep_emb_cat"] = True
-config["model"]["timestep_branch"] = True
 args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
 args.cot_only = config["model"].get("cot_only", args.cot_only)
 args.use_two_stage_rag = config["model"].get("use_two_stage_rag", args.use_two_stage_rag)

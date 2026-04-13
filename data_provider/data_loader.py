@@ -148,6 +148,33 @@ class Dataset_Custom(Dataset):
         else:
             self.rag_cot = None
         
+    def _truncate_final_text(self, text: str) -> str:
+        """
+        Truncate the FINAL composed text to max_text_tokens.
+        This prevents downstream tokenizer-side truncation from silently dropping
+        the most relevant (recent) evidence/CoT appended by RAG.
+        Strategy:
+        - If text begins with self.desc: keep the desc prefix, then keep the tail
+          of the remaining tokens to fit the budget.
+        - Otherwise: keep the tail tokens.
+        """
+        if not text or text == "NA":
+            return text
+        if not self.max_text_tokens or int(self.max_text_tokens) <= 0:
+            return text
+        max_tok = int(self.max_text_tokens)
+        tokens = str(text).split()
+        if len(tokens) <= max_tok:
+            return text
+        desc_tokens = str(self.desc).split() if getattr(self, "desc", None) else []
+        if desc_tokens and text.strip().startswith(str(self.desc).strip()):
+            if len(desc_tokens) >= max_tok:
+                return " ".join(desc_tokens[-max_tok:])
+            remaining_budget = max_tok - len(desc_tokens)
+            rest_tokens = tokens[len(desc_tokens) :]
+            kept = desc_tokens + rest_tokens[-remaining_budget:]
+            return " ".join(kept)
+        return " ".join(tokens[-max_tok:])
 
     def __read_data__(self):
         df_num = pd.read_csv(os.path.join(self.root_path, 'numerical', self.data_path))
@@ -211,7 +238,16 @@ class Dataset_Custom(Dataset):
         self.data_stamp = data_stamp
         self.num_dates = df_num[['start_date', 'end_date']][border1:border2].reset_index(drop=True)
         self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[(df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)]
-        self.search_df = df_search[['start_date', 'end_date', 'fact']]
+        # RAG leakage guard:
+        # retrieval corpus must not include "future" evidence beyond the current split boundary.
+        # Otherwise valid/test will accidentally retrieve facts from later periods (data leakage).
+        df_search_cut = df_search[['start_date', 'end_date', 'fact']].copy()
+        df_search_cut = df_search_cut.loc[df_search_cut.end_date <= final_end_date]
+        if not df_search_cut.empty:
+            max_end = df_search_cut.end_date.max()
+            if pd.notna(max_end):
+                assert max_end <= final_end_date, "search corpus contains future evidence beyond split boundary"
+        self.search_df = df_search_cut.reset_index(drop=True)
 
     def collect_text(self, start_date, end_date):
         report = self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
@@ -235,7 +271,9 @@ class Dataset_Custom(Dataset):
         # basic cleanup and truncation for robustness
         tokens = all_txt.split()
         if len(tokens) > self.max_text_tokens:
-            tokens = tokens[:self.max_text_tokens]
+            # Keep the most recent tokens (tail) so the text budget prioritizes
+            # segments closest to the forecast window end.
+            tokens = tokens[-self.max_text_tokens:]
         all_txt = ' '.join(tokens)
         return all_txt, text_mark
     
@@ -273,6 +311,7 @@ class Dataset_Custom(Dataset):
                 seq_x_txt = guidance["composed_text"]
                 cot_text = guidance["cot_text"]
                 rag_retrieved = guidance["retrieved_text"]
+                seq_x_txt = self._truncate_final_text(seq_x_txt)
                 txt_mark = 1 if len(seq_x_txt.strip()) > 0 else 0
                 self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved)
             else:

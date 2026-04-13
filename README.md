@@ -33,6 +33,16 @@ This adds training signal without changing the model architecture.
   - `multi_res_loss_weight`: weight for the auxiliary loss (set to 0 to disable).
   - `multi_res_use_huber`: use Huber loss (recommended for stability).
   - `multi_res_huber_delta`: delta for Huber loss.
+- Optional dynamic horizons:
+  - If `multi_res_dynamic: true` and `multi_res_horizons: []`, horizons are derived from `pred_len`
+    (default powers-of-2 + `pred_len`).
+  - `multi_res_dynamic_mode`: `powers2` / `linspace`
+  - `multi_res_dynamic_max`: cap the number of horizons.
+- Optional true multi-scale supervision (pooling/downsampling on the forecast window):
+  - `multi_res_scale_loss_weight`: weight for scale-pooling auxiliary loss (>0 enables).
+  - `multi_res_scales`: pooling block sizes like `[1, 2, 4, 8]` (applied on forecast segment).
+  - `multi_res_scale_dynamic`: auto-generate powers-of-2 scales when `multi_res_scales` is empty.
+  - `multi_res_scale_pool`: `mean` (default) or `sum`.
 - Example (YAML):
   ```yaml
   train:
@@ -40,6 +50,15 @@ This adds training signal without changing the model architecture.
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    # Optional: dynamic horizons
+    # multi_res_dynamic: true
+    # multi_res_dynamic_mode: powers2
+    # multi_res_dynamic_max: 8
+    # Optional: scale pooling loss
+    # multi_res_scale_loss_weight: 0.05
+    # multi_res_scale_dynamic: true
+    # multi_res_scales: []
+    # multi_res_scale_pool: mean
   ```
 
 ## Two-stage RAG (minimal change enhancement)

@@ -52,6 +52,15 @@ bash ./run.sh
   - `multi_res_loss_weight`：辅助损失权重（设为 0 即关闭）
   - `multi_res_use_huber`：是否使用 Huber（推荐）
   - `multi_res_huber_delta`：Huber 的 delta
+- 动态视距（可选）：
+  - `multi_res_dynamic: true` 且 `multi_res_horizons: []` 时，自动按 `pred_len` 生成视距（默认 powers-of-2 + `pred_len`）。
+  - `multi_res_dynamic_mode`: `powers2` / `linspace`
+  - `multi_res_dynamic_max`: 最多保留的视距数
+- 真·多尺度监督（可选，downsample/pooling）：
+  - `multi_res_scale_loss_weight`：多尺度辅助损失权重（>0 开启）
+  - `multi_res_scales`：pooling block size 列表（如 `[1,2,4,8]`），在预测窗口上做分块均值后对齐监督
+  - `multi_res_scale_dynamic: true` 且 `multi_res_scales: []` 时，自动生成 powers-of-2 scales
+  - `multi_res_scale_pool`: `mean`（默认）或 `sum`
 - 示例（YAML）：
   ```yaml
   train:
@@ -59,6 +68,15 @@ bash ./run.sh
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    # 可选：动态视距
+    # multi_res_dynamic: true
+    # multi_res_dynamic_mode: powers2
+    # multi_res_dynamic_max: 8
+    # 可选：多尺度监督（pooling）
+    # multi_res_scale_loss_weight: 0.05
+    # multi_res_scale_dynamic: true
+    # multi_res_scales: []
+    # multi_res_scale_pool: mean
   ```
 
 ## Guide weight 扫描

@@ -100,10 +100,27 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        # Dynamic multi-resolution supervision:
+        # if enabled and multi_res_horizons is empty, automatically derive a compact
+        # set of horizons from pred_len (e.g., 1,2,4,...,pred_len).
+        self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
+        self.multi_res_dynamic_mode = str(train_cfg.get("multi_res_dynamic_mode", "powers2"))
+        self.multi_res_dynamic_max = int(train_cfg.get("multi_res_dynamic_max", 8))
+        # Optional scale-based multi-resolution loss (pooling/downsampling).
+        # This is closer to "multi-resolution supervision" than horizon slices.
+        self.multi_res_scales = train_cfg.get("multi_res_scales", [])
+        self.multi_res_scale_loss_weight = float(train_cfg.get("multi_res_scale_loss_weight", 0.0))
+        self.multi_res_scale_pool = str(train_cfg.get("multi_res_scale_pool", "mean"))
+        self.multi_res_scale_dynamic = bool(train_cfg.get("multi_res_scale_dynamic", False))
+        self.multi_res_scale_dynamic_max = int(train_cfg.get("multi_res_scale_dynamic_max", 6))
         if isinstance(self.multi_res_horizons, int):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
             self.multi_res_horizons = []
+        if isinstance(self.multi_res_scales, int):
+            self.multi_res_scales = [self.multi_res_scales]
+        elif self.multi_res_scales is None:
+            self.multi_res_scales = []
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -303,12 +320,15 @@ class CSDI_base(nn.Module):
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask)
             loss = loss + self.multi_res_loss_weight * aux_loss
+        if (not self.noise_esti) and self.multi_res_scale_loss_weight > 0:
+            scale_loss = self._calc_multi_scale_loss(observed_data, predicted, target_mask)
+            loss = loss + self.multi_res_scale_loss_weight * scale_loss
         return loss
 
     def _calc_multi_res_loss(self, observed_data, predicted, target_mask):
         if self.pred_len <= 0:
             return torch.zeros((), device=observed_data.device)
-        horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
+        horizons = self._resolve_multi_res_horizons()
         if len(horizons) == 0:
             return torch.zeros((), device=observed_data.device)
         max_pred = int(self.pred_len)
@@ -339,6 +359,138 @@ class CSDI_base(nn.Module):
             else:
                 loss_h = (residual ** 2).sum() / num_eval
             loss_sum += loss_h
+            count += 1
+        if count == 0:
+            return torch.zeros((), device=observed_data.device)
+        return loss_sum / count
+
+    def _resolve_multi_res_horizons(self):
+        horizons = []
+        try:
+            horizons = [int(h) for h in (self.multi_res_horizons or []) if int(h) > 0]
+        except Exception:
+            horizons = []
+        if len(horizons) > 0:
+            return sorted(set(horizons))
+        if not self.multi_res_dynamic:
+            return []
+        pred_len = int(self.pred_len)
+        if pred_len <= 0:
+            return []
+        mode = (self.multi_res_dynamic_mode or "powers2").lower().strip()
+        derived = []
+        if mode in ("powers2", "pow2", "powers_of_2"):
+            h = 1
+            while h < pred_len:
+                derived.append(h)
+                h *= 2
+            derived.append(pred_len)
+        elif mode in ("linspace", "linear"):
+            # roughly log/linear hybrid: spread a few horizons plus pred_len
+            n = max(1, int(self.multi_res_dynamic_max))
+            if n == 1:
+                derived = [pred_len]
+            else:
+                pts = np.linspace(1, pred_len, num=n).round().astype(int).tolist()
+                derived = pts
+        else:
+            # fallback to powers2
+            h = 1
+            while h < pred_len:
+                derived.append(h)
+                h *= 2
+            derived.append(pred_len)
+        derived = sorted(set([int(x) for x in derived if int(x) > 0]))
+        if self.multi_res_dynamic_max > 0 and len(derived) > self.multi_res_dynamic_max:
+            # keep smallest plus pred_len
+            keep = derived[: max(1, self.multi_res_dynamic_max - 1)]
+            if pred_len not in keep:
+                keep.append(pred_len)
+            derived = sorted(set(keep))
+        return derived
+
+    def _resolve_multi_res_scales(self):
+        scales = []
+        try:
+            scales = [int(s) for s in (self.multi_res_scales or []) if int(s) > 0]
+        except Exception:
+            scales = []
+        pred_len = int(self.pred_len)
+        if pred_len <= 0:
+            return []
+        if len(scales) == 0 and self.multi_res_scale_dynamic:
+            # powers-of-2 scales that fit into pred_len, include 1 by default.
+            s = 1
+            derived = []
+            while s <= pred_len:
+                derived.append(s)
+                s *= 2
+            scales = derived
+        scales = sorted(set([int(s) for s in scales if int(s) > 0]))
+        # drop scales that are too large to form at least 1 pooled step
+        scales = [s for s in scales if (pred_len // s) >= 1]
+        if self.multi_res_scale_dynamic_max > 0 and len(scales) > self.multi_res_scale_dynamic_max:
+            scales = scales[: self.multi_res_scale_dynamic_max]
+        return scales
+
+    def _pool_1d_blocks(self, x, block, pool="mean"):
+        # x: [B, K, T]
+        B, K, T = x.shape
+        n = T // block
+        if n <= 0:
+            return None
+        x = x[:, :, : n * block].reshape(B, K, n, block)
+        pool = (pool or "mean").lower().strip()
+        if pool in ("mean", "avg", "average"):
+            return x.mean(dim=-1)
+        if pool in ("sum",):
+            return x.sum(dim=-1)
+        # fallback
+        return x.mean(dim=-1)
+
+    def _calc_multi_scale_loss(self, observed_data, predicted, target_mask):
+        # Scale supervision is applied only on the forecast window [lookback_len : lookback_len+pred_len]
+        pred_len = int(self.pred_len)
+        if pred_len <= 0:
+            return torch.zeros((), device=observed_data.device)
+        start = int(self.lookback_len)
+        end = int(self.lookback_len + pred_len)
+        obs = observed_data[:, :, start:end]
+        pred = predicted[:, :, start:end]
+        m = target_mask[:, :, start:end]
+
+        scales = self._resolve_multi_res_scales()
+        if len(scales) == 0:
+            return torch.zeros((), device=observed_data.device)
+
+        loss_sum = 0.0
+        count = 0
+        for s in scales:
+            if s <= 0:
+                continue
+            obs_s = self._pool_1d_blocks(obs, s, pool=self.multi_res_scale_pool)
+            pred_s = self._pool_1d_blocks(pred, s, pool=self.multi_res_scale_pool)
+            mask_s = self._pool_1d_blocks(m, s, pool="mean")
+            if obs_s is None or pred_s is None or mask_s is None:
+                continue
+            # treat a pooled step as valid if any constituent step is valid (approx via mean>0)
+            mask_s = (mask_s > 0).float()
+            num_eval = mask_s.sum()
+            if num_eval <= 0:
+                continue
+            residual = (obs_s - pred_s) * mask_s
+            if self.multi_res_use_huber:
+                delta = self.multi_res_huber_delta
+                abs_res = residual.abs()
+                huber = torch.where(
+                    abs_res <= delta,
+                    0.5 * residual ** 2,
+                    delta * abs_res - 0.5 * (delta ** 2),
+                )
+                loss_s = huber.sum() / num_eval
+            else:
+                loss_s = (residual ** 2).sum() / num_eval
+            loss_sum += loss_s
             count += 1
         if count == 0:
             return torch.zeros((), device=observed_data.device)

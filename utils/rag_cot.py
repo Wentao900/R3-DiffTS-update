@@ -147,7 +147,12 @@ class RAGCoTPipeline:
             return int(parts[1]) if len(parts) > 1 else 0
         return -1
 
-    def _retrieve(self, query_text: str, top_k: Optional[int] = None) -> List[str]:
+    def _retrieve(
+        self,
+        query_text: str,
+        top_k: Optional[int] = None,
+        max_end_date=None,
+    ) -> List[str]:
         k = self.config.top_k if top_k is None else int(top_k)
         if not self.retriever or not self.config.use_retrieval or k <= 0:
             return []
@@ -155,12 +160,32 @@ class RAGCoTPipeline:
         sims = cosine_similarity(query_vec, self.retriever["matrix"]).ravel()
         if sims.size == 0:
             return []
+        # Leakage guard: for a given sample/window, only allow evidence that ends
+        # no later than the sample's end_date. This prevents "future" retrieval
+        # within the same split.
+        if max_end_date is not None and "end_date" in self.search_df.columns and not self.search_df.empty:
+            try:
+                max_end_ts = pd.to_datetime(max_end_date)
+            except Exception:
+                max_end_ts = None
+            if max_end_ts is not None and pd.notna(max_end_ts):
+                end_dates = self.search_df["end_date"]
+                try:
+                    allowed_mask = (end_dates <= max_end_ts).to_numpy()
+                except Exception:
+                    allowed_mask = None
+                if allowed_mask is not None and allowed_mask.shape[0] == sims.shape[0]:
+                    sims = np.where(allowed_mask, sims, -1.0)
+
         top_idx = sims.argsort()[::-1][:k]
-        return [
-            self.search_df.iloc[i].fact
-            for i in top_idx
-            if sims[i] > 0 and len(self.search_df.iloc[i].fact.strip()) > 0
-        ]
+        out: List[str] = []
+        for i in top_idx:
+            if sims[i] <= 0:
+                continue
+            fact = str(self.search_df.iloc[i].fact)
+            if fact.strip():
+                out.append(fact)
+        return out
 
     def _summarize_numeric(self, numeric_history: Sequence[float]) -> str:
         arr = np.asarray(numeric_history, dtype=float).flatten()
@@ -434,10 +459,11 @@ class RAGCoTPipeline:
         self,
         numeric_history: Sequence[float],
         base_text: str,
+        max_end_date=None,
     ) -> Dict[str, str]:
         numeric_summary = self._summarize_numeric(numeric_history)
         query = self._build_query(numeric_summary, base_text)
-        retrieved = self._retrieve(query)
+        retrieved = self._retrieve(query, max_end_date=max_end_date)
         prompt = self._format_prompt(numeric_summary, retrieved)
         cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
         composed_text = self._compose_text(base_text, retrieved, cot_text)
@@ -459,7 +485,7 @@ class RAGCoTPipeline:
             return self.cache[cache_key]
 
         if not self.use_two_stage_rag:
-            packaged = self._build_one_shot_guidance(numeric_history, base_text)
+            packaged = self._build_one_shot_guidance(numeric_history, base_text, max_end_date=end_date)
             self.cache[cache_key] = packaged
             if len(self.cache) > self.config.cache_size:
                 self.cache.popitem(last=False)
@@ -470,15 +496,15 @@ class RAGCoTPipeline:
         query = self._build_query(numeric_summary, base_text)
 
         if self.two_stage_gate and self._is_empty_text(base_text) and abs(numeric_stats["slope"]) < self.trend_slope_eps:
-            packaged = self._build_one_shot_guidance(numeric_history, base_text)
+            packaged = self._build_one_shot_guidance(numeric_history, base_text, max_end_date=end_date)
             self.cache[cache_key] = packaged
             if len(self.cache) > self.config.cache_size:
                 self.cache.popitem(last=False)
             return packaged
 
-        retrieved_stage1 = self._retrieve(query, top_k=self.rag_stage1_topk)
+        retrieved_stage1 = self._retrieve(query, top_k=self.rag_stage1_topk, max_end_date=end_date)
         if not retrieved_stage1:
-            packaged = self._build_one_shot_guidance(numeric_history, base_text)
+            packaged = self._build_one_shot_guidance(numeric_history, base_text, max_end_date=end_date)
             self.cache[cache_key] = packaged
             if len(self.cache) > self.config.cache_size:
                 self.cache.popitem(last=False)
@@ -494,7 +520,7 @@ class RAGCoTPipeline:
         trend_hypothesis = self._augment_trend_hypothesis(trend_hypothesis, numeric_stats)
         trend_query_text = self._trend_hypothesis_to_query_text(trend_hypothesis)
         stage2_query = self._build_stage2_query(query, trend_query_text)
-        retrieved_stage2 = self._retrieve(stage2_query, top_k=self.rag_stage2_topk)
+        retrieved_stage2 = self._retrieve(stage2_query, top_k=self.rag_stage2_topk, max_end_date=end_date)
         if retrieved_stage2:
             final_retrieved = self._merge_retrieved(
                 retrieved_stage2,

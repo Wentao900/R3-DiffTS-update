@@ -442,7 +442,7 @@ class RAGCoTPipeline:
         retrieved: List[str],
         numeric_history: Sequence[float],
     ) -> str:
-        if self.generator is None:
+        if self._cot_model is None or self._cot_tokenizer is None or self._cot_device is None:
             return self._fallback_trend_hypothesis(numeric_history)
         raw = self._generate_cot(prompt, numeric_summary, retrieved)
         if raw.startswith("1) Summarize numeric window"):

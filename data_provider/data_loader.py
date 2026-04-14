@@ -322,6 +322,51 @@ class Dataset_Custom(Dataset):
             return self._truncate_by_tokenizer_keep_tail(" ".join(kept))
         return self._truncate_by_tokenizer_keep_tail(" ".join(tokens[-max_tok:]))
 
+    def _pack_recent_segments(self, segments, max_tokens: int, prefix: str = "") -> str:
+        """
+        Keep whole text segments from most recent to oldest under a token budget.
+        This is safer than token-level tail clipping on noisy datasets because it
+        preserves complete dated report snippets instead of truncated fragments.
+        """
+        if not segments:
+            return prefix if prefix else "NA"
+
+        budget = int(max_tokens) if max_tokens is not None else 0
+        if budget <= 0:
+            merged = ([prefix] if prefix else []) + list(segments)
+            return self._truncate_by_tokenizer_keep_tail(" ".join(merged).strip())
+
+        prefix_tokens = prefix.split() if prefix else []
+        if len(prefix_tokens) >= budget:
+            return self._truncate_by_tokenizer_keep_tail(" ".join(prefix_tokens[-budget:]))
+
+        kept = []
+        used = len(prefix_tokens)
+        for segment in reversed(list(segments)):
+            seg = str(segment).strip()
+            if not seg:
+                continue
+            seg_tokens = seg.split()
+            seg_len = len(seg_tokens)
+            if kept and (used + seg_len > budget):
+                continue
+            if (not kept) and prefix_tokens and (used + seg_len > budget):
+                kept = [seg]
+                break
+            if (not kept) and (not prefix_tokens) and seg_len > budget:
+                return self._truncate_by_tokenizer_keep_tail(seg)
+            if used + seg_len > budget:
+                break
+            kept.append(seg)
+            used += seg_len
+
+        kept.reverse()
+        merged = []
+        if prefix:
+            merged.append(prefix)
+        merged.extend(kept)
+        return self._truncate_by_tokenizer_keep_tail(" ".join(merged).strip())
+
     def __read_data__(self):
         df_num = pd.read_csv(os.path.join(self.root_path, 'numerical', self.data_path))
         df_report = pd.read_csv(os.path.join(self.root_path, 'textual', self.data_prefix + '_report.csv'))
@@ -401,7 +446,6 @@ class Dataset_Custom(Dataset):
             return row['start_date'].strftime("%Y-%m-%d") + " to " + row['end_date'].strftime("%Y-%m-%d") + ": " + row['fact']
         if not report.empty:
             report = report.apply(add_datemark, axis=1).to_list()
-            report.insert(0, self.desc)
             text_mark = 1
         else:
             report = ['NA']
@@ -413,15 +457,15 @@ class Dataset_Custom(Dataset):
             if segment not in seen:
                 filtered_report.append(segment)
                 seen.add(segment)
-        all_txt = ' '.join(filtered_report)
-        # basic cleanup and truncation for robustness
-        tokens = all_txt.split()
-        if len(tokens) > self.max_text_tokens:
-            # Keep the most recent tokens (tail) so the text budget prioritizes
-            # segments closest to the forecast window end.
-            tokens = tokens[-self.max_text_tokens:]
-        all_txt = ' '.join(tokens)
-        all_txt = self._truncate_by_tokenizer_keep_tail(all_txt)
+
+        if text_mark == 0:
+            all_txt = 'NA'
+        else:
+            all_txt = self._pack_recent_segments(
+                filtered_report,
+                self.max_text_tokens,
+                prefix=self.desc,
+            )
         return all_txt, text_mark
     
     def __getitem__(self, index):

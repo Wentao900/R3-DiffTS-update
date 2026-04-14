@@ -5,8 +5,9 @@ from torch.utils.data import Dataset
 import warnings
 from utils.timefeatures import time_features
 from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
-from utils.trend_prior import build_trend_fields, trend_fields_to_vector
-from utils.prepare4llm import get_desc
+from utils.trend_prior import build_trend_fields, infer_trend_fields, trend_fields_to_vector
+from utils.prepare4llm import LOCAL_BERT_PATH, get_desc
+from transformers import AutoTokenizer
 
 try:
     from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -58,7 +59,9 @@ class Dataset_Custom(Dataset):
                  cot_cache_size=1024, cot_device=None, rag_use_retrieval=True,
                  cot_load_in_8bit=False, cot_load_in_4bit=False, trend_cfg=False,
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
-                 two_stage_gate=True, trend_slope_eps=1e-3):
+                 two_stage_gate=True, trend_slope_eps=1e-3,
+                 rag_cot_in_collate=True,
+                 llm=None):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -97,6 +100,10 @@ class Dataset_Custom(Dataset):
         self.two_stage_gate = two_stage_gate
         self.trend_slope_eps = trend_slope_eps
         self.guidance_cache = {}
+        self.rag_cot_in_collate = bool(rag_cot_in_collate)
+        self.llm = llm
+        self._text_tokenizer = None
+        self._text_token_budget = None
 
         self.root_path = root_path
         self.data_path = data_path
@@ -117,6 +124,7 @@ class Dataset_Custom(Dataset):
         self.domain = data_path.split('/')[0]
         self.desc = get_desc(self.domain, self.seq_len, self.pred_len)
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+        self._init_text_tokenizer()
         if self.use_rag_cot:
             rag_cfg = RAGCoTConfig(
                 top_k=self.rag_topk,
@@ -147,7 +155,144 @@ class Dataset_Custom(Dataset):
             )
         else:
             self.rag_cot = None
+
+    def _estimate_text_reliability(self, numeric_history, txt_mark: int, cot_text: str) -> float:
+        """
+        Heuristic reliability score r in [0, 1] for text / retrieved evidence / CoT.
+        Goal: down-weight guidance when text is missing or inconsistent with numeric history.
+        - If no text: r = 0
+        - Otherwise start from 1, then penalize for direction mismatch, weak strength, high volatility,
+          and missing/empty CoT when trend_cfg is enabled.
+        """
+        if int(txt_mark) <= 0:
+            return 0.0
+        r = 1.0
+        try:
+            num_fields = infer_trend_fields(numeric_history)
+        except Exception:
+            num_fields = {"direction": "flat", "strength": "moderate", "volatility": "medium"}
+        try:
+            cot_fields = build_trend_fields(cot_text or "", numeric_history)
+        except Exception:
+            cot_fields = num_fields
+
+        nd = str(num_fields.get("direction", "flat")).lower().strip()
+        cd = str(cot_fields.get("direction", "flat")).lower().strip()
+        if (nd in ("up", "down")) and (cd in ("up", "down")) and (nd != cd):
+            r *= 0.3
+        elif (nd == "flat") != (cd == "flat"):
+            r *= 0.6
+
+        strength = str(cot_fields.get("strength", "moderate")).lower().strip()
+        if strength == "weak":
+            r *= 0.85
+        elif strength == "strong":
+            r *= 1.0
+
+        vol = str(cot_fields.get("volatility", "medium")).lower().strip()
+        if vol == "high":
+            r *= 0.75
+        elif vol == "low":
+            r *= 1.0
+
+        # If trend_cfg is enabled, we rely more on structured CoT/trend text.
+        # Missing CoT suggests higher uncertainty.
+        if bool(getattr(self, "trend_cfg", False)):
+            if not (cot_text and str(cot_text).strip()):
+                r *= 0.7
+
+        if r < 0.0:
+            return 0.0
+        if r > 1.0:
+            return 1.0
+        return float(r)
         
+    def _init_text_tokenizer(self):
+        """
+        Initialize a lightweight tokenizer for tokenizer-aware truncation.
+        If loading fails (e.g., model files not present locally), we fall back to
+        whitespace truncation only.
+        """
+        llm = str(self.llm).lower().strip() if self.llm is not None else ""
+        name_or_path = None
+        default_max_len = 512
+        if llm == "bert":
+            name_or_path = str(LOCAL_BERT_PATH)
+            default_max_len = 512
+        elif llm == "gpt2":
+            name_or_path = "openai-community/gpt2"
+            default_max_len = 1024
+        elif llm == "llama":
+            name_or_path = "huggyllama/llama-7b"
+            default_max_len = 2048
+        else:
+            # Unknown / unset; keep None and use whitespace truncation only.
+            name_or_path = None
+
+        if not name_or_path:
+            return
+        try:
+            tok = AutoTokenizer.from_pretrained(name_or_path, local_files_only=True)
+        except Exception:
+            return
+
+        # Derive a safe token budget (excluding special tokens).
+        raw_max = getattr(tok, "model_max_length", None)
+        try:
+            raw_max_i = int(raw_max) if raw_max is not None else None
+        except Exception:
+            raw_max_i = None
+        if raw_max_i is None or raw_max_i <= 0 or raw_max_i > 10000:
+            max_len = int(default_max_len)
+        else:
+            max_len = int(min(raw_max_i, default_max_len))
+        # reserve space for typical [CLS]/[SEP] or EOS, be conservative
+        budget = max(16, max_len - 2)
+
+        self._text_tokenizer = tok
+        self._text_token_budget = int(budget)
+
+    def _truncate_by_tokenizer_keep_tail(self, text: str) -> str:
+        """
+        Tokenizer-aware truncation that keeps the tail tokens.
+        Attempts to preserve the desc prefix (if present) while keeping the most
+        recent tokens from the rest.
+        """
+        if self._text_tokenizer is None or self._text_token_budget is None:
+            return text
+        if not text or text == "NA":
+            return text
+        tok = self._text_tokenizer
+        budget = int(self._text_token_budget)
+        try:
+            ids = tok.encode(text, add_special_tokens=False)
+        except Exception:
+            return text
+        if len(ids) <= budget:
+            return text
+
+        desc = str(getattr(self, "desc", "") or "").strip()
+        if desc and text.strip().startswith(desc):
+            # Preserve desc if possible.
+            try:
+                desc_ids = tok.encode(desc, add_special_tokens=False)
+            except Exception:
+                desc_ids = []
+            if len(desc_ids) >= budget:
+                kept_ids = desc_ids[-budget:]
+                return tok.decode(kept_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            rest = text[len(desc) :].strip()
+            try:
+                rest_ids = tok.encode(rest, add_special_tokens=False)
+            except Exception:
+                rest_ids = ids[len(desc_ids) :] if len(desc_ids) < len(ids) else []
+            tail_budget = budget - len(desc_ids)
+            kept_ids = desc_ids + rest_ids[-tail_budget:]
+            return tok.decode(kept_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+        kept_ids = ids[-budget:]
+        return tok.decode(kept_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
     def _truncate_final_text(self, text: str) -> str:
         """
         Truncate the FINAL composed text to max_text_tokens.
@@ -165,16 +310,17 @@ class Dataset_Custom(Dataset):
         max_tok = int(self.max_text_tokens)
         tokens = str(text).split()
         if len(tokens) <= max_tok:
-            return text
+            # still apply tokenizer-aware clamp if enabled
+            return self._truncate_by_tokenizer_keep_tail(text)
         desc_tokens = str(self.desc).split() if getattr(self, "desc", None) else []
         if desc_tokens and text.strip().startswith(str(self.desc).strip()):
             if len(desc_tokens) >= max_tok:
-                return " ".join(desc_tokens[-max_tok:])
+                return self._truncate_by_tokenizer_keep_tail(" ".join(desc_tokens[-max_tok:]))
             remaining_budget = max_tok - len(desc_tokens)
             rest_tokens = tokens[len(desc_tokens) :]
             kept = desc_tokens + rest_tokens[-remaining_budget:]
-            return " ".join(kept)
-        return " ".join(tokens[-max_tok:])
+            return self._truncate_by_tokenizer_keep_tail(" ".join(kept))
+        return self._truncate_by_tokenizer_keep_tail(" ".join(tokens[-max_tok:]))
 
     def __read_data__(self):
         df_num = pd.read_csv(os.path.join(self.root_path, 'numerical', self.data_path))
@@ -275,6 +421,7 @@ class Dataset_Custom(Dataset):
             # segments closest to the forecast window end.
             tokens = tokens[-self.max_text_tokens:]
         all_txt = ' '.join(tokens)
+        all_txt = self._truncate_by_tokenizer_keep_tail(all_txt)
         return all_txt, text_mark
     
     def __getitem__(self, index):
@@ -299,7 +446,7 @@ class Dataset_Custom(Dataset):
             seq_x_txt, txt_mark = 'NA', 0
             text_dropped = True
         rag_retrieved, cot_text = '', ''
-        if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
+        if self.use_rag_cot and self.rag_cot is not None and not text_dropped and (not self.rag_cot_in_collate):
             cached = self.guidance_cache.get(index, None)
             if cached is None:
                 guidance = self.rag_cot.build_guidance_text(
@@ -319,6 +466,9 @@ class Dataset_Custom(Dataset):
         if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
             txt_mark = 0
 
+        text_reliability = self._estimate_text_reliability(seq_x, txt_mark, cot_text)
+
+        # Trend prior will be computed in collate if rag_cot_in_collate is enabled.
         trend_fields = build_trend_fields(cot_text, seq_x)
         trend_prior = trend_fields_to_vector(trend_fields)
 
@@ -336,10 +486,20 @@ class Dataset_Custom(Dataset):
             'timesteps': timesteps,
             'texts': seq_x_txt,
             'text_mark': txt_mark,
+            'text_reliability': np.float32(text_reliability),
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior
         }
+        if self.use_rag_cot and self.rag_cot is not None and not text_dropped and self.rag_cot_in_collate:
+            s["rag_base_text"] = seq_x_txt
+            # keep dates as strings to be safely collated even if collate_fn is not used
+            s["rag_start_date"] = str(self.num_dates.start_date[text_begin])
+            s["rag_end_date"] = str(self.num_dates.end_date[text_end - 1])
+            s["rag_numeric_history"] = seq_x
+            s["rag_need_guidance"] = 1
+        else:
+            s["rag_need_guidance"] = 0
 
         return s
 

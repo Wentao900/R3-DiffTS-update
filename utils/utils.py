@@ -138,6 +138,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
         all_tokens = []
         all_trend_priors = []
         all_text_marks = []
+        all_text_reliability = []
         with tqdm(test_loader, mininterval=1.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample, guide_w)
@@ -146,6 +147,8 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     all_trend_priors.append(test_batch["trend_prior"].detach().cpu().numpy())
                     if "text_mark" in test_batch:
                         all_text_marks.append(test_batch["text_mark"].detach().cpu().numpy())
+                    if "text_reliability" in test_batch:
+                        all_text_reliability.append(test_batch["text_reliability"].detach().cpu().numpy())
 
                 if save_attn:
                     if save_token:
@@ -229,6 +232,36 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 if all_text_marks:
                     text_mark_arr = np.concatenate(all_text_marks, axis=0)
                     np.save(foldername + "trend_text_marks.npy", text_mark_arr)
+                if all_text_reliability:
+                    text_rel_arr = np.concatenate(all_text_reliability, axis=0).reshape(-1)
+                    np.save(foldername + "trend_text_reliability.npy", text_rel_arr)
+                    # Save a small JSON summary for quick inspection.
+                    try:
+                        marks = text_mark_arr.reshape(-1) if all_text_marks else None
+                        rel = text_rel_arr
+                        qs = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+                        summ = {
+                            "count": int(rel.shape[0]),
+                            "mean": float(np.mean(rel)) if rel.size else 0.0,
+                            "std": float(np.std(rel)) if rel.size else 0.0,
+                            "min": float(np.min(rel)) if rel.size else 0.0,
+                            "max": float(np.max(rel)) if rel.size else 0.0,
+                            "quantiles": {str(q): float(np.quantile(rel, q)) for q in qs} if rel.size else {},
+                        }
+                        if marks is not None and marks.size == rel.size:
+                            has = marks > 0
+                            summ["text_present"] = {
+                                "count": int(has.sum()),
+                                "mean": float(np.mean(rel[has])) if has.any() else 0.0,
+                            }
+                            summ["text_absent"] = {
+                                "count": int((~has).sum()),
+                                "mean": float(np.mean(rel[~has])) if (~has).any() else 0.0,
+                            }
+                        with open(foldername + "trend_text_reliability_summary.json", "w") as f:
+                            json.dump(summ, f, indent=2)
+                    except Exception:
+                        pass
 
             results = {
                 "guide_w": guide_w,

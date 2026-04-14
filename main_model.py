@@ -4,6 +4,22 @@ import torch.nn as nn
 from diff_models import diff_CSDI
 from utils.prepare4llm import get_llm
 
+
+def _parse_ratio_value(x) -> float:
+    """
+    Parse ratio config values.
+    Accepts float/int or strings like "0.25" or "1/12".
+    """
+    if x is None:
+        raise ValueError("ratio is None")
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if "/" in s:
+        a, b = s.split("/", 1)
+        return float(a.strip()) / float(b.strip())
+    return float(s)
+
 class moving_avg(nn.Module):
     """
     Moving average block to highlight the trend of time series
@@ -106,6 +122,9 @@ class CSDI_base(nn.Module):
         self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
         self.multi_res_dynamic_mode = str(train_cfg.get("multi_res_dynamic_mode", "powers2"))
         self.multi_res_dynamic_max = int(train_cfg.get("multi_res_dynamic_max", 8))
+        # Ratio-based dynamic horizons: derive horizons via round(r * pred_len).
+        # Example: [0.0625, 0.125, 0.25, 0.5, 1.0] => [pred_len/16, /8, /4, /2, pred_len]
+        self.multi_res_horizon_ratios = train_cfg.get("multi_res_horizon_ratios", None)
         # Optional scale-based multi-resolution loss (pooling/downsampling).
         # This is closer to "multi-resolution supervision" than horizon slices.
         self.multi_res_scales = train_cfg.get("multi_res_scales", [])
@@ -113,6 +132,10 @@ class CSDI_base(nn.Module):
         self.multi_res_scale_pool = str(train_cfg.get("multi_res_scale_pool", "mean"))
         self.multi_res_scale_dynamic = bool(train_cfg.get("multi_res_scale_dynamic", False))
         self.multi_res_scale_dynamic_max = int(train_cfg.get("multi_res_scale_dynamic_max", 6))
+        # Ratio-based dynamic scales: derive pooling block sizes via round(r * pred_len).
+        self.multi_res_scale_ratios = train_cfg.get("multi_res_scale_ratios", None)
+        # Minimum number of pooled steps required for a scale (default 1 keeps old behavior).
+        self.multi_res_scale_min_pooled_steps = int(train_cfg.get("multi_res_scale_min_pooled_steps", 1))
         if isinstance(self.multi_res_horizons, int):
             self.multi_res_horizons = [self.multi_res_horizons]
         elif self.multi_res_horizons is None:
@@ -121,6 +144,10 @@ class CSDI_base(nn.Module):
             self.multi_res_scales = [self.multi_res_scales]
         elif self.multi_res_scales is None:
             self.multi_res_scales = []
+        if isinstance(self.multi_res_horizon_ratios, (int, float)):
+            self.multi_res_horizon_ratios = [float(self.multi_res_horizon_ratios)]
+        if isinstance(self.multi_res_scale_ratios, (int, float)):
+            self.multi_res_scale_ratios = [float(self.multi_res_scale_ratios)]
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -317,7 +344,7 @@ class CSDI_base(nn.Module):
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
-        if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
+        if (not self.noise_esti) and self.multi_res_loss_weight > 0 and (len(self.multi_res_horizons) > 0 or self.multi_res_dynamic):
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask)
             loss = loss + self.multi_res_loss_weight * aux_loss
         if (not self.noise_esti) and self.multi_res_scale_loss_weight > 0:
@@ -379,7 +406,26 @@ class CSDI_base(nn.Module):
             return []
         mode = (self.multi_res_dynamic_mode or "powers2").lower().strip()
         derived = []
-        if mode in ("powers2", "pow2", "powers_of_2"):
+        if mode in ("ratios", "ratio") or (self.multi_res_horizon_ratios is not None and len(self.multi_res_horizon_ratios) > 0):
+            ratios = self.multi_res_horizon_ratios
+            # default ratios if mode asks for it but user didn't provide
+            if ratios is None or len(ratios) == 0:
+                ratios = [1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0]
+            tmp = []
+            for r in ratios:
+                try:
+                    rf = _parse_ratio_value(r)
+                except Exception:
+                    continue
+                if rf <= 0:
+                    continue
+                h = int(np.round(rf * pred_len))
+                h = max(1, min(pred_len, h))
+                tmp.append(h)
+            # always include pred_len for full-horizon supervision
+            tmp.append(pred_len)
+            derived = tmp
+        elif mode in ("powers2", "pow2", "powers_of_2"):
             h = 1
             while h < pred_len:
                 derived.append(h)
@@ -419,16 +465,31 @@ class CSDI_base(nn.Module):
         if pred_len <= 0:
             return []
         if len(scales) == 0 and self.multi_res_scale_dynamic:
-            # powers-of-2 scales that fit into pred_len, include 1 by default.
-            s = 1
             derived = []
-            while s <= pred_len:
-                derived.append(s)
-                s *= 2
+            ratios = self.multi_res_scale_ratios
+            if ratios is not None and len(ratios) > 0:
+                for r in ratios:
+                    try:
+                        rf = _parse_ratio_value(r)
+                    except Exception:
+                        continue
+                    if rf <= 0:
+                        continue
+                    s = int(np.round(rf * pred_len))
+                    s = max(1, min(pred_len, s))
+                    derived.append(s)
+                derived.append(1)
+            else:
+                # powers-of-2 scales that fit into pred_len, include 1 by default.
+                s = 1
+                while s <= pred_len:
+                    derived.append(s)
+                    s *= 2
             scales = derived
         scales = sorted(set([int(s) for s in scales if int(s) > 0]))
-        # drop scales that are too large to form at least 1 pooled step
-        scales = [s for s in scales if (pred_len // s) >= 1]
+        # drop scales that are too large to form enough pooled steps
+        min_steps = max(1, int(self.multi_res_scale_min_pooled_steps))
+        scales = [s for s in scales if (pred_len // s) >= min_steps]
         if self.multi_res_scale_dynamic_max > 0 and len(scales) > self.multi_res_scale_dynamic_max:
             scales = scales[: self.multi_res_scale_dynamic_max]
         return scales
@@ -514,7 +575,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, text_reliability=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -590,12 +651,24 @@ class CSDI_base(nn.Module):
                             trend_prior = self.sample_random_trend_prior(B, observed_data.device)
                         if trend_prior is not None:
                             step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
-                            trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
+                            trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask, text_reliability)
                             predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
                         else:
-                            predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                            step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
+                            gw = guide_w * step_ratio
+                            if text_mask is not None:
+                                gw = gw * text_mask
+                            if text_reliability is not None:
+                                gw = gw * text_reliability
+                            predicted = predicted_uncond + gw[:, None, None] * (predicted_cond - predicted_uncond)
                     else:
-                        predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                        step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
+                        gw = guide_w * step_ratio
+                        if text_mask is not None:
+                            gw = gw * text_mask
+                        if text_reliability is not None:
+                            gw = gw * text_reliability
+                        predicted = predicted_uncond + gw[:, None, None] * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -709,6 +782,11 @@ class CSDI_Forecasting(CSDI_base):
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
         text_mask = batch["text_mark"].to(self.device).int()
+        text_reliability = batch.get("text_reliability")
+        if text_reliability is None:
+            text_reliability = torch.ones((observed_data.shape[0],), device=self.device)
+        else:
+            text_reliability = text_reliability.to(self.device).float().view(-1)
         trend_prior = batch.get("trend_prior")
         if trend_prior is None:
             trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)
@@ -742,6 +820,7 @@ class CSDI_Forecasting(CSDI_base):
             texts,
             text_mask, 
             trend_prior,
+            text_reliability,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -793,7 +872,7 @@ class CSDI_Forecasting(CSDI_base):
             ratio = floor + (1.0 - floor) * ratio
         return ratio
 
-    def get_trend_guidance_weight(self, trend_prior, step_ratio, guide_w, text_mask=None):
+    def get_trend_guidance_weight(self, trend_prior, step_ratio, guide_w, text_mask=None, text_reliability=None):
         strength = trend_prior[:, 1].clamp(min=0.0)
         strength = 1.0 + self.trend_strength_scale * (strength - 1.0)
         strength = strength.clamp(min=0.0)
@@ -802,6 +881,8 @@ class CSDI_Forecasting(CSDI_base):
         weight = guide_w * step_ratio * strength * vol_penalty
         if text_mask is not None:
             weight = weight * text_mask
+        if text_reliability is not None:
+            weight = weight * text_reliability
         return weight
 
     def sample_random_trend_prior(self, batch_size, device):
@@ -813,11 +894,43 @@ class CSDI_Forecasting(CSDI_base):
         return torch.stack([direction, strength, volatility], dim=1)
     
     def get_text_info(self, text, text_mask):
-        token_input = self.tokenizer(text,
-                                     padding='max_length',
-                                     truncation=True,
-                                     return_tensors='pt',
-                                     ).to(self.device)
+        # IMPORTANT: keep the *tail* of text (most recent evidence / RAG / CoT).
+        # Also clamp max_length to avoid tokenizer.model_max_length being an
+        # unusably large sentinel for some tokenizers.
+        default_max_len = 512
+        try:
+            llm_name = str(getattr(self, "llm", "")).lower()
+        except Exception:
+            llm_name = ""
+        if llm_name == "gpt2":
+            default_max_len = 1024
+        elif llm_name == "llama":
+            default_max_len = 2048
+        elif llm_name == "bert":
+            default_max_len = 512
+        raw_max = getattr(self.tokenizer, "model_max_length", None)
+        try:
+            raw_max_i = int(raw_max) if raw_max is not None else None
+        except Exception:
+            raw_max_i = None
+        if raw_max_i is None or raw_max_i <= 0 or raw_max_i > 10000:
+            max_len = int(default_max_len)
+        else:
+            max_len = int(min(raw_max_i, default_max_len))
+
+        prev_trunc_side = getattr(self.tokenizer, "truncation_side", None)
+        try:
+            self.tokenizer.truncation_side = "left"
+            token_input = self.tokenizer(
+                text,
+                padding="max_length",
+                truncation=True,
+                max_length=max_len,
+                return_tensors="pt",
+            ).to(self.device)
+        finally:
+            if prev_trunc_side is not None:
+                self.tokenizer.truncation_side = prev_trunc_side
         context = self.text_encoder(**token_input).last_hidden_state
         context = context * text_mask.unsqueeze(1).unsqueeze(1)
         context = context.permute(0, 2, 1) 
@@ -853,7 +966,7 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -866,8 +979,9 @@ class CSDI_Forecasting(CSDI_base):
                 texts,
                 text_mask,
                 trend_prior,
+                text_reliability,
             ) = data
-        elif len(data) == 10:
+        elif len(data) == 11:
             (
                 observed_data,
                 observed_mask,
@@ -881,6 +995,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
             ) = data
             trend_prior = None
+            text_reliability = None
         else:
             (
                 observed_data,
@@ -895,6 +1010,7 @@ class CSDI_Forecasting(CSDI_base):
             texts = None
             text_mask = None
             trend_prior = None
+            text_reliability = None
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -935,7 +1051,7 @@ class CSDI_Forecasting(CSDI_base):
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -948,8 +1064,9 @@ class CSDI_Forecasting(CSDI_base):
                 texts,
                 text_mask,
                 trend_prior,
+                text_reliability,
             ) = data
-        elif len(data) == 10:
+        elif len(data) == 11:
             (
                 observed_data,
                 observed_mask,
@@ -963,6 +1080,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
             ) = data
             trend_prior = None
+            text_reliability = None
         else:
             (
                 observed_data,
@@ -977,6 +1095,7 @@ class CSDI_Forecasting(CSDI_base):
             texts = None
             text_mask = None
             trend_prior = None
+            text_reliability = None
 
         with torch.no_grad():
             cond_mask = gt_mask
@@ -1003,9 +1122,9 @@ class CSDI_Forecasting(CSDI_base):
                 context = None
             text_mask_f = text_mask.float() if text_mask is not None else None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, text_reliability=text_reliability)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f, text_reliability=text_reliability)
 
         if self.save_attn:
             if self.save_token:

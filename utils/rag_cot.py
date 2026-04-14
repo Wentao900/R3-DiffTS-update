@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 @dataclass
@@ -19,6 +19,7 @@ class RAGCoTConfig:
     use_retrieval: bool = True
     top_k: int = 3
     max_new_tokens: int = 96
+    max_prompt_tokens: int = 2048
     temperature: float = 0.7
     cot_model: Optional[str] = None
     cache_size: int = 1024
@@ -67,7 +68,7 @@ class RAGCoTPipeline:
         self.rag_stage1_topk = self._resolve_stage1_topk(self.config.rag_stage1_topk, self.rag_stage2_topk)
         self.search_df = self._prep_search_df(search_df)
         self.retriever = self._fit_retriever(self.search_df)
-        self.generator = self._init_generator(self.config)
+        self._cot_model, self._cot_tokenizer, self._cot_device = self._init_generator(self.config)
         self.cache: OrderedDict[str, Dict[str, str]] = OrderedDict()
 
     def _resolve_stage2_topk(self, stage2_topk: int) -> int:
@@ -101,7 +102,7 @@ class RAGCoTPipeline:
 
     def _init_generator(self, config: RAGCoTConfig):
         if config.cot_model is None:
-            return None
+            return None, None, None
         device_index = self._resolve_device_index(config.device)
         trust_remote = config.trust_remote_code or (config.cot_model and "qwen" in config.cot_model.lower())
         try:
@@ -110,6 +111,9 @@ class RAGCoTPipeline:
                 local_files_only=config.local_files_only,
                 trust_remote_code=trust_remote,
             )
+            # Decoder-only LMs should use left padding for correct batched generation.
+            # This also silences the Transformers warning about right-padding.
+            tokenizer.padding_side = "left"
             model_kwargs = {
                 "local_files_only": config.local_files_only,
                 "trust_remote_code": trust_remote,
@@ -122,12 +126,22 @@ class RAGCoTPipeline:
                 config.cot_model,
                 **model_kwargs,
             )
-            return pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                device=device_index,
-            )
+            if device_index >= 0:
+                model = model.to(f"cuda:{device_index}")
+                model.eval()
+                device = torch.device(f"cuda:{device_index}")
+            else:
+                model.eval()
+                device = torch.device("cpu")
+            # Ensure pad token exists for generation
+            if tokenizer.pad_token_id is None:
+                if tokenizer.eos_token_id is not None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                else:
+                    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                    tokenizer.pad_token = "[PAD]"
+                    model.resize_token_embeddings(len(tokenizer))
+            return model, tokenizer, device
         except Exception as exc:  # noqa: BLE001
             warnings.warn(
                 f"Falling back to template CoT because model '{config.cot_model}' "
@@ -137,7 +151,7 @@ class RAGCoTPipeline:
                 f"[RAGCoT] CoT model load failed for '{config.cot_model}': {exc}",
                 file=sys.stderr,
             )
-            return None
+            return None, None, None
 
     def _resolve_device_index(self, device: Optional[str]) -> int:
         if device is None:
@@ -321,17 +335,93 @@ class RAGCoTPipeline:
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
     def _generate_cot(self, prompt: str, numeric_summary: str, retrieved: List[str]) -> str:
-        if self.generator is None:
+        if self._cot_model is None or self._cot_tokenizer is None or self._cot_device is None:
             return self._fallback_cot(numeric_summary, retrieved)
+
+    def _generate_cot_batch(self, prompts: Sequence[str]) -> List[str]:
+        if self._cot_model is None or self._cot_tokenizer is None or self._cot_device is None:
+            return ["" for _ in prompts]
+        if not prompts:
+            return []
         try:
-            output = self.generator(
-                prompt,
-                max_new_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-                num_return_sequences=1,
-                do_sample=True,
+            tok = self._cot_tokenizer(
+                list(prompts),
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=int(self.config.max_prompt_tokens),
             )
-            text = output[0]["generated_text"]
+            tok = {k: v.to(self._cot_device) for k, v in tok.items()}
+            use_cuda = self._cot_device.type == "cuda"
+            with torch.inference_mode():
+                if use_cuda:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        out = self._cot_model.generate(
+                            **tok,
+                            max_new_tokens=int(self.config.max_new_tokens),
+                            do_sample=True,
+                            temperature=float(self.config.temperature),
+                            num_return_sequences=1,
+                            pad_token_id=self._cot_tokenizer.pad_token_id,
+                            eos_token_id=self._cot_tokenizer.eos_token_id,
+                            use_cache=True,
+                        )
+                else:
+                    out = self._cot_model.generate(
+                        **tok,
+                        max_new_tokens=int(self.config.max_new_tokens),
+                        do_sample=True,
+                        temperature=float(self.config.temperature),
+                        num_return_sequences=1,
+                        pad_token_id=self._cot_tokenizer.pad_token_id,
+                        eos_token_id=self._cot_tokenizer.eos_token_id,
+                        use_cache=True,
+                    )
+            texts = self._cot_tokenizer.batch_decode(out, skip_special_tokens=True)
+            results: List[str] = []
+            for prompt, text in zip(prompts, texts):
+                cleaned = text[len(prompt) :].strip() if text.startswith(prompt) else text.strip()
+                results.append(cleaned)
+            return results
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Falling back to template CoT because batch generation failed ({exc}).")
+            return ["" for _ in prompts]
+        try:
+            tok = self._cot_tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding=False,
+                truncation=True,
+                max_length=int(self.config.max_prompt_tokens),
+            )
+            tok = {k: v.to(self._cot_device) for k, v in tok.items()}
+            # Inference-only speedups (safe): inference_mode + fp16 autocast on CUDA.
+            use_cuda = self._cot_device.type == "cuda"
+            with torch.inference_mode():
+                if use_cuda:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        out = self._cot_model.generate(
+                            **tok,
+                            max_new_tokens=int(self.config.max_new_tokens),
+                            do_sample=True,
+                            temperature=float(self.config.temperature),
+                            num_return_sequences=1,
+                            pad_token_id=self._cot_tokenizer.pad_token_id,
+                            eos_token_id=self._cot_tokenizer.eos_token_id,
+                            use_cache=True,
+                        )
+                else:
+                    out = self._cot_model.generate(
+                        **tok,
+                        max_new_tokens=int(self.config.max_new_tokens),
+                        do_sample=True,
+                        temperature=float(self.config.temperature),
+                        num_return_sequences=1,
+                        pad_token_id=self._cot_tokenizer.pad_token_id,
+                        eos_token_id=self._cot_tokenizer.eos_token_id,
+                        use_cache=True,
+                    )
+            text = self._cot_tokenizer.decode(out[0], skip_special_tokens=True)
             return text[len(prompt) :].strip() if text.startswith(prompt) else text.strip()
         except Exception as exc:  # noqa: BLE001
             warnings.warn(f"Falling back to template CoT because generation failed ({exc}).")
@@ -545,3 +635,121 @@ class RAGCoTPipeline:
         if len(self.cache) > self.config.cache_size:
             self.cache.popitem(last=False)
         return packaged
+
+    def build_guidance_text_batch(
+        self,
+        numeric_histories: Sequence[Sequence[float]],
+        start_dates: Sequence,
+        end_dates: Sequence,
+        base_texts: Sequence[str],
+    ) -> List[Dict[str, str]]:
+        n = len(base_texts)
+        if not (len(numeric_histories) == len(start_dates) == len(end_dates) == n):
+            raise ValueError("Batch inputs must have the same length.")
+        out: List[Optional[Dict[str, str]]] = [None] * n
+
+        # 1) Cache hits
+        miss_idx: List[int] = []
+        for i in range(n):
+            cache_key = f"{start_dates[i]}-{end_dates[i]}"
+            if cache_key in self.cache:
+                out[i] = self.cache[cache_key]
+            else:
+                miss_idx.append(i)
+        if not miss_idx:
+            return [x if x is not None else {"cot_text": "", "retrieved_text": "", "composed_text": ""} for x in out]
+
+        # 2) Build prompts for misses (one-shot vs two-stage)
+        if not self.use_two_stage_rag:
+            prompts = []
+            meta = []
+            for i in miss_idx:
+                numeric_summary = self._summarize_numeric(numeric_histories[i])
+                query = self._build_query(numeric_summary, base_texts[i])
+                retrieved = self._retrieve(query, max_end_date=end_dates[i])
+                prompt = self._format_prompt(numeric_summary, retrieved)
+                prompts.append(prompt)
+                meta.append((i, numeric_summary, retrieved))
+            cots = self._generate_cot_batch(prompts) if self._cot_model is not None else ["" for _ in prompts]
+            for (i, numeric_summary, retrieved), cot_text in zip(meta, cots):
+                if not cot_text:
+                    cot_text = self._fallback_cot(numeric_summary, retrieved)
+                packaged = {
+                    "cot_text": cot_text,
+                    "retrieved_text": " ".join(retrieved),
+                    "composed_text": self._compose_text(base_texts[i], retrieved, cot_text),
+                }
+                cache_key = f"{start_dates[i]}-{end_dates[i]}"
+                self.cache[cache_key] = packaged
+                if len(self.cache) > self.config.cache_size:
+                    self.cache.popitem(last=False)
+                out[i] = packaged
+            return [x if x is not None else {"cot_text": "", "retrieved_text": "", "composed_text": ""} for x in out]
+
+        # Two-stage path: generate trend hypotheses in batch
+        stage1_meta = []
+        trend_prompts = []
+        for i in miss_idx:
+            numeric_summary = self._summarize_numeric(numeric_histories[i])
+            numeric_stats = self._compute_numeric_stats(numeric_histories[i])
+            query = self._build_query(numeric_summary, base_texts[i])
+            if self.two_stage_gate and self._is_empty_text(base_texts[i]) and abs(numeric_stats["slope"]) < self.trend_slope_eps:
+                stage1_meta.append((i, numeric_summary, numeric_stats, query, [], True))
+                trend_prompts.append("")
+                continue
+            retrieved_stage1 = self._retrieve(query, top_k=self.rag_stage1_topk, max_end_date=end_dates[i])
+            if not retrieved_stage1:
+                stage1_meta.append((i, numeric_summary, numeric_stats, query, [], True))
+                trend_prompts.append("")
+                continue
+            trend_prompt = self._format_trend_prompt(numeric_summary, retrieved_stage1)
+            stage1_meta.append((i, numeric_summary, numeric_stats, query, retrieved_stage1, False))
+            trend_prompts.append(trend_prompt)
+
+        # Generate hypotheses only for those with valid prompts
+        gen_map = {}
+        gen_prompts = [(idx, p) for idx, p in zip([m[0] for m in stage1_meta], trend_prompts) if p]
+        if gen_prompts and self._cot_model is not None:
+            prompts_only = [p for _, p in gen_prompts]
+            hypos = self._generate_cot_batch(prompts_only)
+            for (i, prompt), hypo in zip(gen_prompts, hypos):
+                gen_map[i] = hypo
+
+        for (i, numeric_summary, numeric_stats, query, retrieved_stage1, fallback_one_shot) in stage1_meta:
+            if fallback_one_shot or not retrieved_stage1:
+                packaged = self._build_one_shot_guidance(numeric_histories[i], base_texts[i], max_end_date=end_dates[i])
+            else:
+                raw_hypo = gen_map.get(i, "")
+                if (not raw_hypo) or raw_hypo.startswith("1) Summarize numeric window"):
+                    trend_hypothesis = self._fallback_trend_hypothesis(numeric_histories[i])
+                else:
+                    cleaned = self._extract_json_block(raw_hypo)
+                    trend_hypothesis = cleaned if cleaned else self._fallback_trend_hypothesis(numeric_histories[i])
+                trend_hypothesis = self._augment_trend_hypothesis(trend_hypothesis, numeric_stats)
+                trend_query_text = self._trend_hypothesis_to_query_text(trend_hypothesis)
+                stage2_query = self._build_stage2_query(query, trend_query_text)
+                retrieved_stage2 = self._retrieve(stage2_query, top_k=self.rag_stage2_topk, max_end_date=end_dates[i])
+                final_retrieved = (
+                    self._merge_retrieved(retrieved_stage2, retrieved_stage1, self.rag_stage2_topk)
+                    if retrieved_stage2
+                    else retrieved_stage1
+                )
+                composed_text = self._compose_two_stage_text(
+                    base_texts[i],
+                    numeric_summary,
+                    trend_hypothesis,
+                    final_retrieved,
+                )
+                packaged = {
+                    "cot_text": trend_hypothesis,
+                    "retrieved_text": " ".join(final_retrieved),
+                    "composed_text": composed_text,
+                }
+
+            cache_key = f"{start_dates[i]}-{end_dates[i]}"
+            self.cache[cache_key] = packaged
+            if len(self.cache) > self.config.cache_size:
+                self.cache.popitem(last=False)
+            out[i] = packaged
+
+        return [x if x is not None else {"cot_text": "", "retrieved_text": "", "composed_text": ""} for x in out]

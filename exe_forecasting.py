@@ -97,6 +97,7 @@ with open(path, "r") as f:
 config["model"]["with_texts"] = True
 config["model"]["timestep_emb_cat"] = True
 config["model"]["timestep_branch"] = True
+args.llm = config["model"].get("llm", None)
 args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
 args.cot_only = config["model"].get("cot_only", args.cot_only)
 args.use_two_stage_rag = config["model"].get("use_two_stage_rag", args.use_two_stage_rag)

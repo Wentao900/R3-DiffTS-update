@@ -1,0 +1,82 @@
+# Health_US denoise ablation: retrieval-only (no CoT generation)
+# - text_len=36 (less stale noise)
+# - keep retrieval but do not append intermediate reasoning text
+# - keep trend_cfg on (trend_prior will fall back to numeric stats when CoT empty)
+#
+# Suggested run:
+#   python exe_forecasting.py --config health_96_12_denoise_no_cot.yaml \
+#     --data_path Health_US/Health_US.csv --seq_len 96 --pred_len 12 --text_len 36 --freq w
+
+train:
+  epochs: 150
+  batch_size: 64
+  lr: 0.0025
+  itr_per_epoch: 1.0e+8
+  multi_res_horizons: []
+  multi_res_loss_weight: 0.02
+  multi_res_use_huber: true
+  multi_res_huber_delta: 1.0
+  multi_res_dynamic: true
+  multi_res_dynamic_mode: ratios
+  multi_res_horizon_ratios: ["1/12", "2/12", "3/12", "6/12", "1"]
+  multi_res_scale_loss_weight: 0.0
+  multi_res_scale_dynamic: true
+  multi_res_scale_dynamic_max: 6
+  multi_res_scales: []
+  multi_res_scale_pool: mean
+  multi_res_scale_ratios: [0.0625, 0.125, 0.25, 0.5, 1.0]
+  multi_res_scale_min_pooled_steps: 2
+
+diffusion:
+  layers: 6
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.7
+  num_steps: 400
+  schedule: "quad"
+  is_linear: False
+  noise_esti: False
+  cfg: True
+  c_mask_prob: 0.3
+  ddim: True
+  sample_steps: 100
+  sample_method: "quad"
+  pre_norm: False
+  time_weight: 0.1
+  trend_cfg: true
+  trend_cfg_power: 1.0
+  trend_cfg_random: false
+  trend_strength_scale: 1.0
+  trend_volatility_scale: 1.0
+  trend_time_floor: 0.0
+
+model:
+  cot_model: null
+  cot_temperature: 0.0
+  cot_max_new_tokens: 0
+  cot_cache_size: 1024
+  cot_only: false
+
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  guide_w_default: 0.8
+  target_strategy: "test"
+  num_sample_features: 64
+
+  use_rag_cot: true
+  use_two_stage_rag: false
+  rag_topk: 1
+  two_stage_gate: true
+  trend_slope_eps: 0.001
+
+  timestep_branch: true
+  timestep_emb_cat: true
+  with_texts: true
+  relative_size_emb_cat: false
+  decomp: false
+  llm: "bert"
+  llm_layers: 0
+

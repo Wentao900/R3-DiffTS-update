@@ -874,8 +874,8 @@ class CSDI_base(nn.Module):
                         if self.cfg:
                             res_input = res_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
                             moving_mean_input = moving_mean_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
-                        predicted_seasonal = self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
-                        predicted_trend = self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
+                        predicted_seasonal, _ = self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb) # (2*B, K, L)
+                        predicted_trend = self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb) # (2*B, K, L)
                         predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
                     else:
                         cond_obs = (cond_mask * observed_data).unsqueeze(1) # (B, 1, K, L)
@@ -883,10 +883,15 @@ class CSDI_base(nn.Module):
                         diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B, 2, K, L)
                         if self.cfg:
                             diff_input = diff_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
-                        if self.save_attn:
-                            predicted, attn = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
-                        else:
-                            predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
+                        predicted = self._run_diffusion_model(
+                            diff_input,
+                            side_info,
+                            torch.tensor([t]).to(self.device),
+                            cfg_mask,
+                            timestep_emb=timestep_emb,
+                            size_emb=size_emb,
+                            context=context,
+                        )
                 if self.cfg:
                     predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
                     if self.trend_cfg:

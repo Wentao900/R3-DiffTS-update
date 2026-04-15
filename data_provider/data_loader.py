@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
@@ -62,7 +63,12 @@ class Dataset_Custom(Dataset):
                  aug_noise_std=0.0, aug_time_warp_prob=0.0,
                  aug_segment_scale_std=0.1, adaptive_noise_scale=0.0,
                  text_quality_gate=True, text_quality_min_scale=0.0,
-                 text_quality_coverage_mix=0.5):
+                 text_quality_coverage_mix=0.5,
+                 text_quality_weights=None,
+                 text_trust_ret=0.75,
+                 text_trust_cot=0.5,
+                 text_quality_drop_threshold=0.3,
+                 text_quality_mid_threshold=0.6):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -108,6 +114,16 @@ class Dataset_Custom(Dataset):
         self.text_quality_gate = bool(text_quality_gate)
         self.text_quality_min_scale = float(text_quality_min_scale)
         self.text_quality_coverage_mix = float(text_quality_coverage_mix)
+        source_weights = text_quality_weights if text_quality_weights is not None else [0.5, 0.3, 0.2]
+        if len(source_weights) != 3:
+            source_weights = [0.5, 0.3, 0.2]
+        source_weights = np.asarray(source_weights, dtype=np.float32)
+        source_weights = source_weights / max(float(np.sum(source_weights)), 1e-6)
+        self.text_quality_weights = source_weights
+        self.text_trust_ret = float(np.clip(text_trust_ret, 0.0, 1.0))
+        self.text_trust_cot = float(np.clip(text_trust_cot, 0.0, self.text_trust_ret))
+        self.text_quality_drop_threshold = float(np.clip(text_quality_drop_threshold, 0.0, 1.0))
+        self.text_quality_mid_threshold = float(np.clip(text_quality_mid_threshold, self.text_quality_drop_threshold, 1.0))
 
         self.root_path = root_path
         self.data_path = data_path
@@ -243,16 +259,211 @@ class Dataset_Custom(Dataset):
             "acf_head": [float(x) for x in avg_acf[: min(max_lag + 1, 16)]],
         }
 
-    def _compute_text_quality(self, text, text_mark):
-        if not self.text_quality_gate or int(text_mark) <= 0:
-            return float(text_mark)
+    def _normalize_text(self, text):
+        if not isinstance(text, str):
+            return ""
+        text = text.strip()
+        if text.upper() == "NA":
+            return ""
+        return text
 
-        token_count = len(text.split()) if isinstance(text, str) else 0
-        token_density = min(token_count / float(max(self.max_text_tokens, 1)), 1.0)
+    def _tokenize_quality_text(self, text):
+        normalized = self._normalize_text(text).lower()
+        if not normalized:
+            return []
+        return re.findall(r"[a-zA-Z]+(?:'[a-z]+)?|\d+(?:\.\d+)?", normalized)
+
+    def _score_text_availability(self, text):
+        token_count = len(self._tokenize_quality_text(text))
+        if token_count <= 0:
+            return 0.0
+        return float(np.clip(token_count / 12.0, 0.0, 1.0))
+
+    def _score_text_informativeness(self, text):
+        tokens = self._tokenize_quality_text(text)
+        if len(tokens) == 0:
+            return 0.0
+        stopwords = {
+            "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "at", "by",
+            "with", "from", "is", "are", "was", "were", "be", "been", "this", "that",
+            "these", "those", "as", "it", "its", "their", "his", "her", "they", "we",
+            "you", "our", "into", "over", "after", "before", "during", "about",
+        }
+        content_tokens = [token for token in tokens if token not in stopwords]
+        unique_ratio = len(set(tokens)) / max(len(tokens), 1)
+        content_ratio = len(content_tokens) / max(len(tokens), 1)
+        keyword_set = {
+            "increase", "decrease", "rise", "fall", "growth", "decline", "stable",
+            "volatility", "volatile", "demand", "supply", "price", "market", "output",
+            "yield", "production", "inflation", "trade", "policy", "export", "import",
+            "up", "down", "higher", "lower", "sharp", "slight", "strong", "weak",
+        }
+        keyword_hits = sum(1 for token in tokens if token in keyword_set or token.isdigit())
+        keyword_ratio = min(keyword_hits / max(len(tokens), 1) * 3.0, 1.0)
+        score = 0.4 * content_ratio + 0.3 * unique_ratio + 0.3 * keyword_ratio
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _infer_numeric_trend_fields(self, seq_x):
+        arr = np.asarray(seq_x, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr.mean(axis=1)
+        arr = arr.reshape(-1)
+        if arr.size < 2:
+            return {"direction": "flat", "strength": "moderate", "volatility": "medium"}
+        slope = float((arr[-1] - arr[0]) / max(arr.size - 1, 1))
+        std = float(np.std(arr))
+        mean_abs = float(np.mean(np.abs(arr))) + 1e-6
+        if slope > 1e-6:
+            direction = "up"
+        elif slope < -1e-6:
+            direction = "down"
+        else:
+            direction = "flat"
+        norm_slope = abs(slope) / (std + 1e-6)
+        if norm_slope < 0.1:
+            strength = "weak"
+        elif norm_slope < 0.5:
+            strength = "moderate"
+        else:
+            strength = "strong"
+        vol_ratio = std / mean_abs
+        if vol_ratio < 0.1:
+            volatility = "low"
+        elif vol_ratio < 0.3:
+            volatility = "medium"
+        else:
+            volatility = "high"
+        return {"direction": direction, "strength": strength, "volatility": volatility}
+
+    def _infer_text_trend_fields(self, text):
+        normalized = self._normalize_text(text).lower()
+        if not normalized:
+            return None
+        direction = "flat"
+        if any(keyword in normalized for keyword in ("increase", "rise", "rising", "upward", "higher", "bull")):
+            direction = "up"
+        elif any(keyword in normalized for keyword in ("decrease", "decline", "fall", "falling", "downward", "lower", "bear")):
+            direction = "down"
+        strength = "moderate"
+        if any(keyword in normalized for keyword in ("slight", "mild", "small", "weak")):
+            strength = "weak"
+        elif any(keyword in normalized for keyword in ("sharp", "strong", "steep", "large")):
+            strength = "strong"
+        volatility = "medium"
+        if any(keyword in normalized for keyword in ("stable", "steady", "smooth", "quiet", "low volatility")):
+            volatility = "low"
+        elif any(keyword in normalized for keyword in ("volatile", "volatility", "turbulent", "noisy", "uncertain")):
+            volatility = "high"
+        return {"direction": direction, "strength": strength, "volatility": volatility}
+
+    def _score_text_alignment(self, text, seq_x):
+        numeric_fields = self._infer_numeric_trend_fields(seq_x)
+        text_fields = self._infer_text_trend_fields(text)
+        if text_fields is None:
+            return 0.0
+        trend_match = 1.0 if text_fields["direction"] == numeric_fields["direction"] else 0.0
+        if text_fields["direction"] == "flat" or numeric_fields["direction"] == "flat":
+            trend_match = 0.5 if text_fields["direction"] != numeric_fields["direction"] else 1.0
+        vol_match = 1.0 if text_fields["volatility"] == numeric_fields["volatility"] else 0.0
+        if "medium" in (text_fields["volatility"], numeric_fields["volatility"]):
+            vol_match = max(vol_match, 0.5)
+        strength_match = 1.0 if text_fields["strength"] == numeric_fields["strength"] else 0.0
+        if "moderate" in (text_fields["strength"], numeric_fields["strength"]):
+            strength_match = max(strength_match, 0.5)
+        score = 0.5 * trend_match + 0.3 * vol_match + 0.2 * strength_match
+        if trend_match <= 0.0:
+            score = min(score, 0.2)
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _get_source_trust(self, source_name):
+        if source_name == "raw":
+            return 1.0
+        if source_name == "ret":
+            return self.text_trust_ret
+        if source_name == "cot":
+            return self.text_trust_cot
+        return 0.5
+
+    def _compute_text_quality(self, text, source_name, seq_x):
+        if not self.text_quality_gate:
+            return 1.0 if self._normalize_text(text) else 0.0
+        availability = self._score_text_availability(text)
+        if availability <= 0.0:
+            return 0.0
+        informativeness = self._score_text_informativeness(text)
+        alignment = self._score_text_alignment(text, seq_x)
+        trust = self._get_source_trust(source_name)
         mix = min(max(self.text_quality_coverage_mix, 0.0), 1.0)
-        quality = (1.0 - mix) * token_density + mix * self.domain_text_coverage
-        quality = max(quality, self.text_quality_min_scale)
+        coverage = self.domain_text_coverage if source_name == "raw" else 1.0
+        quality = availability * informativeness * alignment * trust
+        quality = (1.0 - mix) * quality + mix * quality * coverage
+        quality = max(quality, self.text_quality_min_scale if quality > 0 else 0.0)
         return float(np.clip(quality, 0.0, 1.0))
+
+    def _build_text_quality_package(self, raw_text, ret_text, cot_text, seq_x):
+        q_raw = self._compute_text_quality(raw_text, "raw", seq_x)
+        q_ret = self._compute_text_quality(ret_text, "ret", seq_x)
+        q_cot = self._compute_text_quality(cot_text, "cot", seq_x)
+        q_all = float(
+            self.text_quality_weights[0] * q_raw
+            + self.text_quality_weights[1] * q_ret
+            + self.text_quality_weights[2] * q_cot
+        )
+        g_raw = q_raw
+        g_ret = min(q_ret, g_raw)
+        g_cot = min(q_cot, g_ret)
+        if q_all >= self.text_quality_mid_threshold:
+            level = 2
+        elif q_all >= self.text_quality_drop_threshold:
+            level = 1
+        else:
+            level = 0
+        if level < 2:
+            g_cot = 0.0
+        if level < 1:
+            g_ret = 0.0
+            g_cot = 0.0
+        return {
+            "quality_raw": float(np.clip(q_raw, 0.0, 1.0)),
+            "quality_ret": float(np.clip(q_ret, 0.0, 1.0)),
+            "quality_cot": float(np.clip(q_cot, 0.0, 1.0)),
+            "quality_total": float(np.clip(q_all, 0.0, 1.0)),
+            "gate_raw": float(np.clip(g_raw, 0.0, 1.0)),
+            "gate_ret": float(np.clip(g_ret, 0.0, 1.0)),
+            "gate_cot": float(np.clip(g_cot, 0.0, 1.0)),
+            "level": int(level),
+        }
+
+    def _merge_trend_prior(self, raw_text, ret_text, cot_text, quality_pkg, seq_x):
+        source_fields = []
+        source_weights = []
+        for source_name, text_value, gate_key in (
+            ("raw", raw_text, "gate_raw"),
+            ("ret", ret_text, "gate_ret"),
+            ("cot", cot_text, "gate_cot"),
+        ):
+            if quality_pkg[gate_key] <= 0:
+                continue
+            fields = self._infer_text_trend_fields(text_value)
+            if fields is None:
+                continue
+            source_fields.append(fields)
+            source_weights.append(float(quality_pkg[gate_key]))
+        if len(source_fields) == 0:
+            return trend_fields_to_vector(self._infer_numeric_trend_fields(seq_x))
+        direction_map = {"down": -1.0, "flat": 0.0, "up": 1.0}
+        strength_map = {"weak": 0.5, "moderate": 1.0, "strong": 1.5}
+        volatility_map = {"low": 0.0, "medium": 0.5, "high": 1.0}
+        total_weight = max(sum(source_weights), 1e-6)
+        direction_value = 0.0
+        strength_value = 0.0
+        volatility_value = 0.0
+        for fields, weight in zip(source_fields, source_weights):
+            norm_weight = weight / total_weight
+            direction_value += norm_weight * direction_map[fields["direction"]]
+            strength_value += norm_weight * strength_map[fields["strength"]]
+            volatility_value += norm_weight * volatility_map[fields["volatility"]]
+        return np.array([direction_value, strength_value, volatility_value], dtype=np.float32)
 
     def _apply_lookback_augmentation(self, seq_x):
         augmented = np.array(seq_x, copy=True)
@@ -391,11 +602,12 @@ class Dataset_Custom(Dataset):
         text_begin = s_end - self.text_len
         text_end = s_end
 
-        seq_x_txt, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
+        raw_text, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
         text_dropped = False
         if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
-            seq_x_txt, txt_mark = 'NA', 0
+            raw_text, txt_mark = 'NA', 0
             text_dropped = True
+        composed_text = raw_text
         rag_retrieved, cot_text = '', ''
         if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
             cached = self.guidance_cache.get(index, None)
@@ -404,21 +616,22 @@ class Dataset_Custom(Dataset):
                     numeric_history=seq_x,
                     start_date=self.num_dates.start_date[text_begin],
                     end_date=self.num_dates.end_date[text_end - 1],
-                    base_text=seq_x_txt,
+                    base_text=raw_text,
                 )
-                seq_x_txt = guidance["composed_text"]
+                composed_text = guidance["composed_text"]
                 cot_text = guidance["cot_text"]
                 rag_retrieved = guidance["retrieved_text"]
-                txt_mark = 1 if len(seq_x_txt.strip()) > 0 else 0
-                self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved)
+                txt_mark = 1 if any(len(self._normalize_text(text_value)) > 0 for text_value in (raw_text, rag_retrieved, cot_text)) else 0
+                self.guidance_cache[index] = (composed_text, txt_mark, cot_text, rag_retrieved)
             else:
-                seq_x_txt, txt_mark, cot_text, rag_retrieved = cached
-        if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
+                composed_text, txt_mark, cot_text, rag_retrieved = cached
+        if txt_mark <= 0 and len(self._normalize_text(raw_text)) == 0:
             txt_mark = 0
-        text_quality = self._compute_text_quality(seq_x_txt, txt_mark)
+        quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
+        if quality_pkg["quality_total"] <= 0:
+            txt_mark = 0
 
-        trend_fields = build_trend_fields(cot_text, seq_x)
-        trend_prior = trend_fields_to_vector(trend_fields)
+        trend_prior = self._merge_trend_prior(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -432,9 +645,20 @@ class Dataset_Custom(Dataset):
             'timepoints': np.arange(self.seq_len + self.pred_len).astype(np.float32), 
             'feature_id': np.arange(seq_x.shape[1]).astype(np.float32),
             'timesteps': timesteps,
-            'texts': seq_x_txt,
+            'texts': composed_text,
+            'text_raw': raw_text,
+            'text_ret': rag_retrieved,
+            'text_cot': cot_text,
             'text_mark': txt_mark,
-            'text_quality': np.asarray(text_quality, dtype=np.float32),
+            'text_quality': np.asarray(quality_pkg['quality_total'], dtype=np.float32),
+            'text_quality_raw': np.asarray(quality_pkg['quality_raw'], dtype=np.float32),
+            'text_quality_ret': np.asarray(quality_pkg['quality_ret'], dtype=np.float32),
+            'text_quality_cot': np.asarray(quality_pkg['quality_cot'], dtype=np.float32),
+            'text_quality_total': np.asarray(quality_pkg['quality_total'], dtype=np.float32),
+            'text_gate_raw': np.asarray(quality_pkg['gate_raw'], dtype=np.float32),
+            'text_gate_ret': np.asarray(quality_pkg['gate_ret'], dtype=np.float32),
+            'text_gate_cot': np.asarray(quality_pkg['gate_cot'], dtype=np.float32),
+            'text_level': np.asarray(quality_pkg['level'], dtype=np.int64),
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior

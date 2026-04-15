@@ -379,6 +379,11 @@ args.adaptive_noise_scale = float(config.get("train", {}).get("adaptive_noise_sc
 args.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
 args.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
 args.text_quality_coverage_mix = float(config["model"].get("text_quality_coverage_mix", 0.5))
+args.text_quality_weights = config["model"].get("text_quality_weights", [0.5, 0.3, 0.2])
+args.text_trust_ret = float(config["model"].get("text_trust_ret", 0.75))
+args.text_trust_cot = float(config["model"].get("text_trust_cot", 0.5))
+args.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
+args.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
 
 args.batch_size = config["train"]["batch_size"]
 

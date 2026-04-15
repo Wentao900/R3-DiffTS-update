@@ -98,6 +98,13 @@ class CSDI_base(nn.Module):
         self.save_token = config["model"]["save_token"]
         self.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
         self.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
+        quality_weights = config["model"].get("text_quality_weights", [0.5, 0.3, 0.2])
+        if not isinstance(quality_weights, (list, tuple)) or len(quality_weights) != 3:
+            quality_weights = [0.5, 0.3, 0.2]
+        quality_weights = np.asarray(quality_weights, dtype=np.float32)
+        self.text_quality_weights = quality_weights / max(float(np.sum(quality_weights)), 1e-6)
+        self.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
+        self.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
 
         train_cfg = config.get("train", {})
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -672,6 +679,8 @@ class CSDI_base(nn.Module):
 
     def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None):
         B, K, L = observed_data.shape
+        guide_w_tensor = self._to_samplewise_weight(guide_w, B, observed_data.device)
+        effective_guide_w = guide_w_tensor * text_mask if text_mask is not None else guide_w_tensor
         if self.ddim:
             if self.sample_method == 'linear':
                 a = self.num_steps // self.sample_steps
@@ -746,12 +755,12 @@ class CSDI_base(nn.Module):
                             trend_prior = self.sample_random_trend_prior(B, observed_data.device)
                         if trend_prior is not None:
                             step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
-                            trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w, text_mask)
+                            trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w_tensor, text_mask)
                             predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
                         else:
-                            predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                            predicted = predicted_uncond + effective_guide_w[:, None, None] * (predicted_cond - predicted_uncond)
                     else:
-                        predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                        predicted = predicted_uncond + effective_guide_w[:, None, None] * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -865,12 +874,29 @@ class CSDI_Forecasting(CSDI_base):
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
         text_mask = batch["text_mark"].to(self.device).float().reshape(-1)
-        text_quality = batch.get("text_quality")
-        if text_quality is not None:
-            text_quality = text_quality.to(self.device).float().reshape(-1)
+        text_quality_total = batch.get("text_quality_total", batch.get("text_quality"))
+        if text_quality_total is not None:
+            text_quality_total = text_quality_total.to(self.device).float().reshape(-1)
             if self.text_quality_gate:
-                gated_quality = text_quality.clamp(min=self.text_quality_min_scale, max=1.0)
+                gated_quality = text_quality_total.clamp(min=self.text_quality_min_scale, max=1.0)
                 text_mask = (text_mask > 0).float() * gated_quality
+        else:
+            text_quality_total = text_mask
+        text_gate_raw = batch.get("text_gate_raw")
+        text_gate_ret = batch.get("text_gate_ret")
+        text_gate_cot = batch.get("text_gate_cot")
+        if text_gate_raw is not None:
+            text_gate_raw = text_gate_raw.to(self.device).float().reshape(-1)
+        else:
+            text_gate_raw = text_mask
+        if text_gate_ret is not None:
+            text_gate_ret = text_gate_ret.to(self.device).float().reshape(-1)
+        else:
+            text_gate_ret = torch.zeros_like(text_mask)
+        if text_gate_cot is not None:
+            text_gate_cot = text_gate_cot.to(self.device).float().reshape(-1)
+        else:
+            text_gate_cot = torch.zeros_like(text_mask)
         trend_prior = batch.get("trend_prior")
         if trend_prior is None:
             trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)
@@ -881,7 +907,18 @@ class CSDI_Forecasting(CSDI_base):
             timesteps = timesteps.permute(0, 2, 1)
         else:
             timesteps = None
-        texts = batch["texts"] if self.with_texts else None
+        if self.with_texts:
+            texts = {
+                "raw": batch.get("text_raw", batch.get("texts")),
+                "ret": batch.get("text_ret", batch.get("retrieved_text")),
+                "cot": batch.get("text_cot", batch.get("cot_text")),
+                "gate_raw": text_gate_raw,
+                "gate_ret": text_gate_ret,
+                "gate_cot": text_gate_cot,
+                "quality_total": text_quality_total,
+            }
+        else:
+            texts = None
 
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
@@ -955,13 +992,22 @@ class CSDI_Forecasting(CSDI_base):
             ratio = floor + (1.0 - floor) * ratio
         return ratio
 
+    def _to_samplewise_weight(self, value, batch_size, device):
+        if torch.is_tensor(value):
+            value = value.to(device).float().reshape(-1)
+            if value.numel() == 1:
+                value = value.repeat(batch_size)
+            return value
+        return torch.full((batch_size,), float(value), device=device)
+
     def get_trend_guidance_weight(self, trend_prior, step_ratio, guide_w, text_mask=None):
+        base_weight = self._to_samplewise_weight(guide_w, trend_prior.shape[0], trend_prior.device)
         strength = trend_prior[:, 1].clamp(min=0.0)
         strength = 1.0 + self.trend_strength_scale * (strength - 1.0)
         strength = strength.clamp(min=0.0)
         volatility = trend_prior[:, 2].clamp(min=0.0) * self.trend_volatility_scale
         vol_penalty = 1.0 / (1.0 + volatility)
-        weight = guide_w * step_ratio * strength * vol_penalty
+        weight = base_weight * step_ratio * strength * vol_penalty
         if text_mask is not None:
             weight = weight * text_mask
         return weight
@@ -974,7 +1020,46 @@ class CSDI_Forecasting(CSDI_base):
         volatility = volatility_choices[torch.randint(0, 3, (batch_size,), device=device)]
         return torch.stack([direction, strength, volatility], dim=1)
     
+    def _encode_text_source(self, text):
+        token_input = self.tokenizer(
+            text,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt',
+        ).to(self.device)
+        context = self.text_encoder(**token_input).last_hidden_state
+        return context, token_input
+
     def get_text_info(self, text, text_mask):
+        if isinstance(text, dict):
+            text_raw = text.get("raw")
+            text_ret = text.get("ret")
+            text_cot = text.get("cot")
+            gate_raw = text.get("gate_raw")
+            gate_ret = text.get("gate_ret")
+            gate_cot = text.get("gate_cot")
+            contexts = []
+            tokens_out = {}
+            for source_name, source_text, source_gate in (
+                ("raw", text_raw, gate_raw),
+                ("ret", text_ret, gate_ret),
+                ("cot", text_cot, gate_cot),
+            ):
+                if source_text is None or source_gate is None:
+                    continue
+                context_src, token_input = self._encode_text_source(source_text)
+                context_src = context_src * source_gate.unsqueeze(1).unsqueeze(1)
+                contexts.append(context_src)
+                if self.save_token:
+                    tokens_out[source_name] = self.tokenizer.batch_decode(token_input['input_ids'])
+            if len(contexts) == 0:
+                return (None, tokens_out) if self.save_token else None
+            context = torch.stack(contexts, dim=0).sum(dim=0)
+            context = context.permute(0, 2, 1)
+            if self.save_token:
+                return context, tokens_out
+            return context
+
         token_input = self.tokenizer(text,
                                      padding='max_length',
                                      truncation=True,

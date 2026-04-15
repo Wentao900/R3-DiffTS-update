@@ -76,6 +76,11 @@ model:
   text_quality_gate: true
   text_quality_min_scale: 0.0
   text_quality_coverage_mix: 0.7
+  text_quality_weights: [0.5, 0.3, 0.2]
+  text_trust_ret: 0.75
+  text_trust_cot: 0.5
+  text_quality_drop_threshold: 0.3
+  text_quality_mid_threshold: 0.6
 
 dataset:
   aug_noise_std: 0.01

@@ -631,7 +631,8 @@ class Dataset_Custom(Dataset):
         if quality_pkg["quality_total"] <= 0:
             txt_mark = 0
 
-        trend_prior = self._merge_trend_prior(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
+        trend_prior_num = trend_fields_to_vector(self._infer_numeric_trend_fields(seq_x))
+        trend_prior_text = self._merge_trend_prior(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -661,7 +662,9 @@ class Dataset_Custom(Dataset):
             'text_level': np.asarray(quality_pkg['level'], dtype=np.int64),
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
-            'trend_prior': trend_prior
+            'trend_prior': trend_prior_text,
+            'trend_prior_text': trend_prior_text,
+            'trend_prior_num': trend_prior_num,
         }
 
         return s

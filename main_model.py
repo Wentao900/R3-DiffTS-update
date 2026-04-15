@@ -105,6 +105,8 @@ class CSDI_base(nn.Module):
         self.text_quality_weights = quality_weights / max(float(np.sum(quality_weights)), 1e-6)
         self.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
         self.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
+        self.text_ret_increment_scale = float(config["model"].get("text_ret_increment_scale", 0.75))
+        self.text_cot_increment_scale = float(config["model"].get("text_cot_increment_scale", 0.5))
 
         train_cfg = config.get("train", {})
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -126,8 +128,13 @@ class CSDI_base(nn.Module):
         self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
         self.text_consistency_weight = float(train_cfg.get("text_consistency_weight", 0.0))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
+        self.text_incremental_risk_gamma = float(train_cfg.get("text_incremental_risk_gamma", 2.0))
+        self.text_incremental_loss_weight = float(train_cfg.get("text_incremental_loss_weight", 0.05))
+        self.text_tail_loss_weight = float(train_cfg.get("text_tail_loss_weight", 0.05))
+        self.text_tail_topk_ratio = float(train_cfg.get("text_tail_topk_ratio", 0.2))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
+        self._last_incremental_text_info = None
         self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
         self.multi_res_horizon_to_index = {
             int(horizon): idx for idx, horizon in enumerate(self.multi_res_horizons)
@@ -387,18 +394,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, trend_prior_num=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, trend_prior_num=trend_prior_num
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, trend_prior_num=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -416,6 +423,9 @@ class CSDI_base(nn.Module):
         noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
 
         total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask) 
+        if isinstance(context, dict) and context.get("mode") == "incremental_text":
+            context = dict(context)
+            context["region_mask"] = observed_mask - cond_mask
 
         if self.cfg:
             cfg_mask = torch.bernoulli(torch.ones((B, )) - self.c_mask_prob).to(self.device) 
@@ -431,6 +441,7 @@ class CSDI_base(nn.Module):
             size_emb=size_emb,
             context=context,
         )
+        incremental_info = self._last_incremental_text_info
 
         if self.timestep_branch and timesteps is not None:
             predicted_from_timestep = self.timestep_pred(timesteps)
@@ -445,8 +456,15 @@ class CSDI_base(nn.Module):
         main_loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         auxiliary_loss = torch.zeros((), device=observed_data.device)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
-            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
+            multi_res_prior = trend_prior_num if trend_prior_num is not None else trend_prior
+            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=multi_res_prior)
             auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
+        if incremental_info is not None and self.text_incremental_loss_weight > 0:
+            inc_loss = self._calc_incremental_text_loss(incremental_info)
+            auxiliary_loss = auxiliary_loss + self.text_incremental_loss_weight * inc_loss
+        if (not self.noise_esti) and self.text_tail_loss_weight > 0:
+            tail_loss = self._calc_tail_loss(residual, target_mask)
+            auxiliary_loss = auxiliary_loss + self.text_tail_loss_weight * tail_loss
         if (
             (not self.noise_esti)
             and self.training
@@ -467,6 +485,8 @@ class CSDI_base(nn.Module):
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
+            if incremental_info is not None:
+                predicted_no_text = incremental_info["pred0"]
             consistency_loss = self._calc_text_consistency_loss(
                 predicted,
                 predicted_no_text,
@@ -480,6 +500,19 @@ class CSDI_base(nn.Module):
         return main_loss + auxiliary_loss
 
     def _run_diffusion_model(self, total_input, side_info, t, cfg_mask, timestep_emb=None, size_emb=None, context=None):
+        if isinstance(context, dict) and context.get("mode") == "incremental_text":
+            predicted, info = self._run_incremental_text_model(
+                total_input,
+                side_info,
+                t,
+                cfg_mask,
+                context,
+                timestep_emb=timestep_emb,
+                size_emb=size_emb,
+            )
+            self._last_incremental_text_info = info
+            return predicted
+        self._last_incremental_text_info = None
         if self.decomp:
             predicted_seasonal, _ = self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb)
             predicted_trend = self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb)
@@ -489,6 +522,79 @@ class CSDI_base(nn.Module):
             predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
             return predicted
         return self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
+
+    def _run_incremental_text_model(self, total_input, side_info, t, cfg_mask, context_bundle, timestep_emb=None, size_emb=None):
+        pred0 = self._run_diffusion_model(total_input, side_info, t, cfg_mask, timestep_emb=timestep_emb, size_emb=size_emb, context=None)
+        pred1 = self._run_diffusion_model(total_input, side_info, t, cfg_mask, timestep_emb=timestep_emb, size_emb=size_emb, context=context_bundle.get("context_raw"))
+        pred2 = self._run_diffusion_model(total_input, side_info, t, cfg_mask, timestep_emb=timestep_emb, size_emb=size_emb, context=context_bundle.get("context_raw_ret"))
+        pred3 = self._run_diffusion_model(total_input, side_info, t, cfg_mask, timestep_emb=timestep_emb, size_emb=size_emb, context=context_bundle.get("context_full"))
+        info = self._combine_incremental_predictions(
+            pred0,
+            pred1,
+            pred2,
+            pred3,
+            context_bundle,
+            region_mask=context_bundle.get("region_mask"),
+        )
+        return info["pred"], info
+
+    def _combine_incremental_predictions(self, pred0, pred1, pred2, pred3, context_bundle, region_mask=None):
+        base_raw = context_bundle["weight_raw"].to(pred0.device).float().reshape(-1)
+        base_ret = context_bundle["weight_ret"].to(pred0.device).float().reshape(-1)
+        base_cot = context_bundle["weight_cot"].to(pred0.device).float().reshape(-1)
+        pair_mode = pred0.shape[0] == base_raw.numel() * 2
+
+        if pair_mode:
+            batch_size = base_raw.numel()
+            stage0 = pred0[:batch_size]
+            stage1 = pred1[:batch_size]
+            stage2 = pred2[:batch_size]
+            stage3 = pred3[:batch_size]
+            uncond = pred0[batch_size:]
+            if region_mask is None:
+                region_mask = torch.ones_like(stage0)
+            else:
+                region_mask = region_mask.to(pred0.device).float()
+        else:
+            stage0, stage1, stage2, stage3 = pred0, pred1, pred2, pred3
+            uncond = None
+            if region_mask is None:
+                region_mask = torch.ones_like(stage0)
+            else:
+                region_mask = region_mask.to(pred0.device).float()
+
+        num_eval = region_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        d_ret = ((stage2 - stage1) ** 2 * region_mask).sum(dim=(1, 2)) / num_eval
+        d_cot = ((stage3 - stage2) ** 2 * region_mask).sum(dim=(1, 2)) / num_eval
+        gamma = max(self.text_incremental_risk_gamma, 0.0)
+        a_raw = base_raw.clamp(min=0.0, max=1.0)
+        a_ret = (base_ret * self.text_ret_increment_scale * torch.exp(-gamma * d_ret.detach())).clamp(min=0.0, max=1.0)
+        a_cot = (base_cot * self.text_cot_increment_scale * torch.exp(-gamma * d_cot.detach())).clamp(min=0.0, max=1.0)
+
+        combined = (
+            stage0
+            + a_raw[:, None, None] * (stage1 - stage0)
+            + a_ret[:, None, None] * (stage2 - stage1)
+            + a_cot[:, None, None] * (stage3 - stage2)
+        )
+        if pair_mode:
+            pred = torch.cat([combined, uncond], dim=0)
+        else:
+            pred = combined
+        return {
+            "pred": pred,
+            "pred0": pred0 if not pair_mode else torch.cat([stage0, uncond], dim=0),
+            "stage0": stage0,
+            "stage1": stage1,
+            "stage2": stage2,
+            "stage3": stage3,
+            "a_raw": a_raw,
+            "a_ret": a_ret,
+            "a_cot": a_cot,
+            "d_ret": d_ret,
+            "d_cot": d_cot,
+            "region_mask": region_mask,
+        }
 
     def _calc_text_consistency_loss(self, predicted, predicted_no_text, target_mask, text_mask):
         diff = (predicted - predicted_no_text) * target_mask
@@ -500,6 +606,30 @@ class CSDI_base(nn.Module):
         if not valid.any():
             return torch.zeros((), device=predicted.device)
         return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
+
+    def _calc_incremental_text_loss(self, incremental_info):
+        d_ret = incremental_info["d_ret"]
+        d_cot = incremental_info["d_cot"]
+        a_ret = incremental_info["a_ret"]
+        a_cot = incremental_info["a_cot"]
+        loss = (1.0 - a_ret).clamp(min=0.0) * d_ret + (1.0 - a_cot).clamp(min=0.0) * d_cot
+        return loss.mean()
+
+    def _calc_tail_loss(self, residual, target_mask):
+        sq_error = (residual ** 2) * target_mask
+        flat_error = sq_error.reshape(sq_error.shape[0], -1)
+        flat_mask = target_mask.reshape(target_mask.shape[0], -1) > 0
+        losses = []
+        topk_ratio = min(max(self.text_tail_topk_ratio, 0.0), 1.0)
+        for error_row, mask_row in zip(flat_error, flat_mask):
+            valid_error = error_row[mask_row]
+            if valid_error.numel() == 0:
+                continue
+            topk = max(1, int(math.ceil(valid_error.numel() * max(topk_ratio, 1.0 / valid_error.numel()))))
+            losses.append(valid_error.topk(topk).values.mean())
+        if len(losses) == 0:
+            return torch.zeros((), device=residual.device)
+        return torch.stack(losses).mean()
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -704,11 +834,20 @@ class CSDI_base(nn.Module):
             if timestep_emb is not None:
                 timestep_emb = timestep_emb.repeat(2, 1, 1, 1)
             if context is not None:
-                context = context.repeat(2, 1, 1)
+                if isinstance(context, dict) and context.get("mode") == "incremental_text":
+                    context = dict(context)
+                    for key in ("context_raw", "context_raw_ret", "context_full"):
+                        context[key] = context[key].repeat(2, 1, 1)
+                    context["region_mask"] = (1.0 - cond_mask).float()
+                else:
+                    context = context.repeat(2, 1, 1)
             cfg_mask = torch.zeros((2*B, )).to(self.device) 
             cfg_mask[:B] = 1.
         else:
             cfg_mask = None
+            if isinstance(context, dict) and context.get("mode") == "incremental_text":
+                context = dict(context)
+                context["region_mask"] = (1.0 - cond_mask).float()
 
         for i in range(n_samples):
             if self.is_unconditional == True:
@@ -897,11 +1036,16 @@ class CSDI_Forecasting(CSDI_base):
             text_gate_cot = text_gate_cot.to(self.device).float().reshape(-1)
         else:
             text_gate_cot = torch.zeros_like(text_mask)
-        trend_prior = batch.get("trend_prior")
-        if trend_prior is None:
-            trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)
+        trend_prior_text = batch.get("trend_prior_text", batch.get("trend_prior"))
+        if trend_prior_text is None:
+            trend_prior_text = torch.zeros((observed_data.shape[0], 3), device=self.device)
         else:
-            trend_prior = trend_prior.to(self.device).float()
+            trend_prior_text = trend_prior_text.to(self.device).float()
+        trend_prior_num = batch.get("trend_prior_num")
+        if trend_prior_num is None:
+            trend_prior_num = trend_prior_text
+        else:
+            trend_prior_num = trend_prior_num.to(self.device).float()
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
@@ -940,7 +1084,8 @@ class CSDI_Forecasting(CSDI_base):
             timesteps, 
             texts,
             text_mask, 
-            trend_prior,
+            trend_prior_text,
+            trend_prior_num,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -1038,7 +1183,10 @@ class CSDI_Forecasting(CSDI_base):
             gate_raw = text.get("gate_raw")
             gate_ret = text.get("gate_ret")
             gate_cot = text.get("gate_cot")
-            contexts = []
+            quality_total = text.get("quality_total")
+            context_raw = None
+            context_ret = None
+            context_cot = None
             tokens_out = {}
             for source_name, source_text, source_gate in (
                 ("raw", text_raw, gate_raw),
@@ -1047,18 +1195,36 @@ class CSDI_Forecasting(CSDI_base):
             ):
                 if source_text is None or source_gate is None:
                     continue
+                if torch.is_tensor(source_gate) and float(source_gate.max().item()) <= 0.0:
+                    continue
                 context_src, token_input = self._encode_text_source(source_text)
-                context_src = context_src * source_gate.unsqueeze(1).unsqueeze(1)
-                contexts.append(context_src)
+                if source_name == "raw":
+                    context_raw = context_src
+                elif source_name == "ret":
+                    context_ret = context_src
+                else:
+                    context_cot = context_src
                 if self.save_token:
                     tokens_out[source_name] = self.tokenizer.batch_decode(token_input['input_ids'])
-            if len(contexts) == 0:
+            if context_raw is None:
                 return (None, tokens_out) if self.save_token else None
-            context = torch.stack(contexts, dim=0).sum(dim=0)
-            context = context.permute(0, 2, 1)
+            if context_ret is None:
+                context_ret = torch.zeros_like(context_raw)
+            if context_cot is None:
+                context_cot = torch.zeros_like(context_raw)
+            bundle = {
+                "mode": "incremental_text",
+                "context_raw": context_raw.permute(0, 2, 1),
+                "context_raw_ret": (context_raw + context_ret).permute(0, 2, 1),
+                "context_full": (context_raw + context_ret + context_cot).permute(0, 2, 1),
+                "weight_raw": gate_raw.clamp(min=0.0, max=1.0),
+                "weight_ret": gate_ret.clamp(min=0.0, max=1.0),
+                "weight_cot": gate_cot.clamp(min=0.0, max=1.0),
+                "quality_total": quality_total.clamp(min=0.0, max=1.0) if quality_total is not None else gate_raw.clamp(min=0.0, max=1.0),
+            }
             if self.save_token:
-                return context, tokens_out
-            return context
+                return bundle, tokens_out
+            return bundle
 
         token_input = self.tokenizer(text,
                                      padding='max_length',
@@ -1100,7 +1266,22 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior,
+                trend_prior_num,
+            ) = data
+        elif len(data) == 11:
             (
                 observed_data,
                 observed_mask,
@@ -1114,6 +1295,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
                 trend_prior,
             ) = data
+            trend_prior_num = trend_prior
         elif len(data) == 10:
             (
                 observed_data,
@@ -1128,6 +1310,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
             ) = data
             trend_prior = None
+            trend_prior_num = None
         else:
             (
                 observed_data,
@@ -1142,6 +1325,7 @@ class CSDI_Forecasting(CSDI_base):
             texts = None
             text_mask = None
             trend_prior = None
+            trend_prior_num = None
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -1190,11 +1374,27 @@ class CSDI_Forecasting(CSDI_base):
             context=context,
             trend_prior=trend_prior,
             text_mask=text_mask,
+            trend_prior_num=trend_prior_num,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior,
+                trend_prior_num,
+            ) = data
+        elif len(data) == 11:
             (
                 observed_data,
                 observed_mask,
@@ -1208,6 +1408,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
                 trend_prior,
             ) = data
+            trend_prior_num = trend_prior
         elif len(data) == 10:
             (
                 observed_data,
@@ -1222,6 +1423,7 @@ class CSDI_Forecasting(CSDI_base):
                 text_mask,
             ) = data
             trend_prior = None
+            trend_prior_num = None
         else:
             (
                 observed_data,
@@ -1236,6 +1438,7 @@ class CSDI_Forecasting(CSDI_base):
             texts = None
             text_mask = None
             trend_prior = None
+            trend_prior_num = None
 
         with torch.no_grad():
             cond_mask = gt_mask

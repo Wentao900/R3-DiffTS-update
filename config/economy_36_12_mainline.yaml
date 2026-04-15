@@ -26,9 +26,12 @@ train:
   multi_res_ema_alpha: 0.05
   multi_res_difficulty_weight: 0.5
   multi_res_group_balance: true
+  multi_res_group_max_ratio: 2.0
   lr_warmup_epochs: 10
   max_grad_norm: 1.0
   adaptive_noise_scale: 0.0
+  text_consistency_weight: 0.05
+  auxiliary_loss_max_ratio: 0.5
 
 diffusion:
   layers: 6

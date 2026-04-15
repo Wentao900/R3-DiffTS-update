@@ -116,6 +116,9 @@ class CSDI_base(nn.Module):
         self.multi_res_ema_alpha = float(train_cfg.get("multi_res_ema_alpha", 0.05))
         self.multi_res_difficulty_weight = float(train_cfg.get("multi_res_difficulty_weight", 0.0))
         self.multi_res_group_balance = bool(train_cfg.get("multi_res_group_balance", True))
+        self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
+        self.text_consistency_weight = float(train_cfg.get("text_consistency_weight", 0.0))
+        self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
         self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
@@ -377,18 +380,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -412,15 +415,15 @@ class CSDI_base(nn.Module):
         else:
             cfg_mask = None
 
-        if self.decomp:
-            predicted_seasonal, _ = self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb)
-            predicted_trend = self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb)
-            predicted, _ = predicted_seasonal + predicted_trend
-        else:
-            if self.save_attn:
-                predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context) 
-            else:
-                predicted = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context) 
+        predicted = self._run_diffusion_model(
+            total_input,
+            side_info,
+            t,
+            cfg_mask,
+            timestep_emb=timestep_emb,
+            size_emb=size_emb,
+            context=context,
+        )
 
         if self.timestep_branch and timesteps is not None:
             predicted_from_timestep = self.timestep_pred(timesteps)
@@ -432,11 +435,64 @@ class CSDI_base(nn.Module):
         else:
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
-        loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        main_loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        auxiliary_loss = torch.zeros((), device=observed_data.device)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
-            loss = loss + self.multi_res_loss_weight * aux_loss
-        return loss
+            auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
+        if (
+            (not self.noise_esti)
+            and self.training
+            and self.with_texts
+            and context is not None
+            and self.text_consistency_weight > 0
+            and text_mask is not None
+        ):
+            predicted_no_text = self._run_diffusion_model(
+                total_input,
+                side_info,
+                t,
+                cfg_mask,
+                timestep_emb=timestep_emb,
+                size_emb=size_emb,
+                context=None,
+            )
+            if self.timestep_branch and timesteps is not None:
+                predicted_from_timestep = self.timestep_pred(timesteps)
+                predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
+            consistency_loss = self._calc_text_consistency_loss(
+                predicted,
+                predicted_no_text,
+                target_mask,
+                text_mask,
+            )
+            auxiliary_loss = auxiliary_loss + self.text_consistency_weight * consistency_loss
+        if self.auxiliary_loss_max_ratio > 0:
+            aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
+            auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
+        return main_loss + auxiliary_loss
+
+    def _run_diffusion_model(self, total_input, side_info, t, cfg_mask, timestep_emb=None, size_emb=None, context=None):
+        if self.decomp:
+            predicted_seasonal, _ = self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb)
+            predicted_trend = self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb)
+            predicted, _ = predicted_seasonal + predicted_trend
+            return predicted
+        if self.save_attn:
+            predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
+            return predicted
+        return self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
+
+    def _calc_text_consistency_loss(self, predicted, predicted_no_text, target_mask, text_mask):
+        diff = (predicted - predicted_no_text) * target_mask
+        num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        per_sample = (diff ** 2).sum(dim=(1, 2)) / num_eval
+        quality = text_mask.reshape(-1).float().clamp(min=0.0, max=1.0)
+        weights = 1.0 - quality
+        valid = weights > 0
+        if not valid.any():
+            return torch.zeros((), device=predicted.device)
+        return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -516,6 +572,20 @@ class CSDI_base(nn.Module):
         difficulty = difficulty.unsqueeze(0).expand(batch_size, -1)
         mix = float(min(max(self.multi_res_difficulty_weight, 0.0), 1.0))
         weights = (1.0 - mix) * base_weights + mix * difficulty
+        if self.multi_res_group_max_ratio > 0 and len(horizons) > 1:
+            group_to_indices = {}
+            for idx, horizon in enumerate(horizons):
+                group_name = self._get_horizon_group(horizon)
+                group_to_indices.setdefault(group_name, []).append(idx)
+            active_groups = [group_indices for group_indices in group_to_indices.values() if len(group_indices) > 0]
+            if len(active_groups) > 1:
+                group_means = [weights[:, group_indices].mean(dim=1) for group_indices in active_groups]
+                group_means_tensor = torch.stack(group_means, dim=1)
+                min_group_mean = group_means_tensor.min(dim=1, keepdim=True).values.clamp(min=1e-6)
+                upper_bound = min_group_mean * max(self.multi_res_group_max_ratio, 1.0)
+                for group_indices, group_mean in zip(active_groups, group_means):
+                    scale = torch.minimum(torch.ones_like(group_mean), upper_bound.squeeze(1) / group_mean.clamp(min=1e-6))
+                    weights[:, group_indices] = weights[:, group_indices] * scale.unsqueeze(1)
         return weights.clamp(min=1e-6)
 
     def _update_multi_res_difficulty(self, horizon, loss_value):
@@ -1023,7 +1093,19 @@ class CSDI_Forecasting(CSDI_base):
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior)
+        return loss_func(
+            observed_data,
+            cond_mask,
+            observed_mask,
+            side_info,
+            is_train,
+            timesteps=timesteps,
+            timestep_emb=timestep_emb,
+            size_emb=size_emb,
+            context=context,
+            trend_prior=trend_prior,
+            text_mask=text_mask,
+        )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)

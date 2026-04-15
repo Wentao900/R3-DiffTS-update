@@ -145,15 +145,25 @@ def build_balanced_horizons(pred_len, candidates, max_count=5):
         bucketed[get_horizon_bucket(horizon, pred_len)].append(horizon)
 
     selected = []
-    for bucket_name in ("short", "mid", "long"):
-        if bucketed[bucket_name]:
-            selected.append(bucketed[bucket_name][0])
+    if bucketed["short"]:
+        selected.append(bucketed["short"][0])
+    if bucketed["mid"]:
+        selected.append(bucketed["mid"][0])
+    if bucketed["long"]:
+        if int(pred_len) in bucketed["long"]:
+            selected.append(int(pred_len))
+        else:
+            selected.append(bucketed["long"][-1])
 
     for horizon in ordered:
         if horizon not in selected:
             selected.append(horizon)
         if len(selected) >= max_count:
             break
+    if int(pred_len) in ordered and int(pred_len) not in selected:
+        if len(selected) >= max_count:
+            selected = [h for h in selected if h != max(selected)]
+        selected.append(int(pred_len))
     return sorted(selected[:max_count])
 
 

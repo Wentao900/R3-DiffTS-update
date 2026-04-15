@@ -60,7 +60,9 @@ class Dataset_Custom(Dataset):
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
                  two_stage_gate=True, trend_slope_eps=1e-3,
                  aug_noise_std=0.0, aug_time_warp_prob=0.0,
-                 aug_segment_scale_std=0.1, adaptive_noise_scale=0.0):
+                 aug_segment_scale_std=0.1, adaptive_noise_scale=0.0,
+                 text_quality_gate=True, text_quality_min_scale=0.0,
+                 text_quality_coverage_mix=0.5):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -103,6 +105,9 @@ class Dataset_Custom(Dataset):
         self.aug_time_warp_prob = float(aug_time_warp_prob)
         self.aug_segment_scale_std = float(aug_segment_scale_std)
         self.adaptive_noise_scale = float(adaptive_noise_scale)
+        self.text_quality_gate = bool(text_quality_gate)
+        self.text_quality_min_scale = float(text_quality_min_scale)
+        self.text_quality_coverage_mix = float(text_quality_coverage_mix)
 
         self.root_path = root_path
         self.data_path = data_path
@@ -123,6 +128,9 @@ class Dataset_Custom(Dataset):
         self.domain = data_path.split('/')[0]
         self.desc = get_desc(self.domain, self.seq_len, self.pred_len)
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+        self.domain_text_coverage = 0.0
+        if len(self.num_dates) > 0:
+            self.domain_text_coverage = float(min(len(self.txt_report) / float(len(self.num_dates)), 1.0))
         if self.use_rag_cot:
             rag_cfg = RAGCoTConfig(
                 top_k=self.rag_topk,
@@ -234,6 +242,17 @@ class Dataset_Custom(Dataset):
             "peak_value": None if peak_lag is None else float(avg_acf[peak_lag]),
             "acf_head": [float(x) for x in avg_acf[: min(max_lag + 1, 16)]],
         }
+
+    def _compute_text_quality(self, text, text_mark):
+        if not self.text_quality_gate or int(text_mark) <= 0:
+            return float(text_mark)
+
+        token_count = len(text.split()) if isinstance(text, str) else 0
+        token_density = min(token_count / float(max(self.max_text_tokens, 1)), 1.0)
+        mix = min(max(self.text_quality_coverage_mix, 0.0), 1.0)
+        quality = (1.0 - mix) * token_density + mix * self.domain_text_coverage
+        quality = max(quality, self.text_quality_min_scale)
+        return float(np.clip(quality, 0.0, 1.0))
 
     def _apply_lookback_augmentation(self, seq_x):
         augmented = np.array(seq_x, copy=True)
@@ -396,6 +415,7 @@ class Dataset_Custom(Dataset):
                 seq_x_txt, txt_mark, cot_text, rag_retrieved = cached
         if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
             txt_mark = 0
+        text_quality = self._compute_text_quality(seq_x_txt, txt_mark)
 
         trend_fields = build_trend_fields(cot_text, seq_x)
         trend_prior = trend_fields_to_vector(trend_fields)
@@ -414,6 +434,7 @@ class Dataset_Custom(Dataset):
             'timesteps': timesteps,
             'texts': seq_x_txt,
             'text_mark': txt_mark,
+            'text_quality': np.asarray(text_quality, dtype=np.float32),
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior

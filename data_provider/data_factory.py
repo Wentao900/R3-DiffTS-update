@@ -43,6 +43,9 @@ def data_provider(args, flag):
         extra_kwargs['aug_time_warp_prob'] = getattr(args, "aug_time_warp_prob", 0.0)
         extra_kwargs['aug_segment_scale_std'] = getattr(args, "aug_segment_scale_std", 0.1)
         extra_kwargs['adaptive_noise_scale'] = getattr(args, "adaptive_noise_scale", 0.0)
+        extra_kwargs['text_quality_gate'] = getattr(args, "text_quality_gate", True)
+        extra_kwargs['text_quality_min_scale'] = getattr(args, "text_quality_min_scale", 0.0)
+        extra_kwargs['text_quality_coverage_mix'] = getattr(args, "text_quality_coverage_mix", 0.5)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

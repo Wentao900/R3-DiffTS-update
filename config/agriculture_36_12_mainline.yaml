@@ -15,6 +15,8 @@ train:
   multi_res_use_huber: true
   multi_res_huber_delta: 1.0
   multi_res_huber_deltas: [0.5, 0.8, 1.0, 1.5]
+  multi_res_huber_delta_mode: functional
+  multi_res_huber_delta_scale: 0.5
   multi_res_dynamic: true
   multi_res_dynamic_by_t: true
   multi_res_dynamic_by_epoch: true
@@ -23,6 +25,7 @@ train:
   multi_res_progressive: true
   multi_res_ema_alpha: 0.05
   multi_res_difficulty_weight: 0.5
+  multi_res_group_balance: true
   lr_warmup_epochs: 10
   max_grad_norm: 1.0
   adaptive_noise_scale: 0.0
@@ -67,6 +70,9 @@ model:
   llm_layers: 0
   use_rag_cot: true
   use_two_stage_rag: true
+  text_quality_gate: true
+  text_quality_min_scale: 0.0
+  text_quality_coverage_mix: 0.7
 
 dataset:
   aug_noise_std: 0.01

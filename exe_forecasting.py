@@ -124,6 +124,39 @@ def ordered_unique_horizons(candidates, pred_len, limit=5):
     return sorted(result)
 
 
+def get_horizon_bucket(horizon, pred_len):
+    horizon = int(horizon)
+    short_end = max(1, int(math.ceil(pred_len / 4.0)))
+    mid_end = max(short_end + 1, int(math.ceil(pred_len / 2.0)))
+    if horizon <= short_end:
+        return "short"
+    if horizon <= mid_end:
+        return "mid"
+    return "long"
+
+
+def build_balanced_horizons(pred_len, candidates, max_count=5):
+    ordered = ordered_unique_horizons(candidates, pred_len, limit=None)
+    if not ordered:
+        return []
+
+    bucketed = {"short": [], "mid": [], "long": []}
+    for horizon in ordered:
+        bucketed[get_horizon_bucket(horizon, pred_len)].append(horizon)
+
+    selected = []
+    for bucket_name in ("short", "mid", "long"):
+        if bucketed[bucket_name]:
+            selected.append(bucketed[bucket_name][0])
+
+    for horizon in ordered:
+        if horizon not in selected:
+            selected.append(horizon)
+        if len(selected) >= max_count:
+            break
+    return sorted(selected[:max_count])
+
+
 def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
     explicit_horizons = sanitize_multi_res_horizons(
         train_cfg.get("multi_res_horizons"),
@@ -138,11 +171,21 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
         }
 
     fallback_horizons = default_multi_res_horizons(pred_len)
+    anchor_horizons = ordered_unique_horizons(
+        [
+            1,
+            int(math.ceil(pred_len / 4.0)),
+            int(math.ceil(pred_len / 2.0)),
+            int(pred_len),
+        ],
+        pred_len,
+        limit=4,
+    )
     if not bool(train_cfg.get("multi_res_use_stat_horizons", True)):
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {},
+            "stats": {"anchor_horizons": anchor_horizons},
             "fallback_used": True,
         }
 
@@ -166,13 +209,16 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
             stats.get("decay_lag"),
             stats.get("zero_lag"),
             stats.get("peak_lag"),
+            int(math.ceil(pred_len / 4.0)),
+            int(math.ceil(pred_len / 2.0)),
             int(pred_len),
         ]
-        horizons = ordered_unique_horizons(candidate_order, pred_len, limit=5)
+        horizons = build_balanced_horizons(pred_len, candidate_order, max_count=5)
         if len(horizons) < 3:
-            horizons = ordered_unique_horizons(candidate_order + fallback_horizons, pred_len, limit=5)
+            horizons = build_balanced_horizons(pred_len, candidate_order + anchor_horizons + fallback_horizons, max_count=5)
         if len(horizons) == 0:
             raise RuntimeError("no valid horizons generated from training ACF")
+        stats["anchor_horizons"] = anchor_horizons
         return {
             "horizons": horizons,
             "source": "train_acf",
@@ -320,6 +366,9 @@ args.aug_noise_std = float(dataset_cfg.get("aug_noise_std", 0.0))
 args.aug_time_warp_prob = float(dataset_cfg.get("aug_time_warp_prob", 0.0))
 args.aug_segment_scale_std = float(dataset_cfg.get("aug_segment_scale_std", 0.1))
 args.adaptive_noise_scale = float(config.get("train", {}).get("adaptive_noise_scale", 0.0))
+args.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
+args.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
+args.text_quality_coverage_mix = float(config["model"].get("text_quality_coverage_mix", 0.5))
 
 args.batch_size = config["train"]["batch_size"]
 

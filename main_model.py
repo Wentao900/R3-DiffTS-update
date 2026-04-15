@@ -96,6 +96,8 @@ class CSDI_base(nn.Module):
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
+        self.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
+        self.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
 
         train_cfg = config.get("train", {})
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -103,6 +105,8 @@ class CSDI_base(nn.Module):
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
         self.multi_res_huber_deltas_cfg = train_cfg.get("multi_res_huber_deltas", None)
+        self.multi_res_huber_delta_mode = str(train_cfg.get("multi_res_huber_delta_mode", "fallback_uniform"))
+        self.multi_res_huber_delta_scale = float(train_cfg.get("multi_res_huber_delta_scale", 0.5))
         self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
         self.multi_res_dynamic_by_t = bool(train_cfg.get("multi_res_dynamic_by_t", True))
         self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
@@ -111,6 +115,7 @@ class CSDI_base(nn.Module):
         self.multi_res_progressive = bool(train_cfg.get("multi_res_progressive", False))
         self.multi_res_ema_alpha = float(train_cfg.get("multi_res_ema_alpha", 0.05))
         self.multi_res_difficulty_weight = float(train_cfg.get("multi_res_difficulty_weight", 0.0))
+        self.multi_res_group_balance = bool(train_cfg.get("multi_res_group_balance", True))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
         self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
@@ -237,6 +242,17 @@ class CSDI_base(nn.Module):
             return []
 
         fallback = [float(max(self.multi_res_huber_delta, 1e-6))] * len(horizons)
+        if self.multi_res_huber_delta_mode == "functional":
+            return [
+                float(
+                    max(
+                        self.multi_res_huber_delta
+                        * (1.0 + self.multi_res_huber_delta_scale * (float(horizon) / max(float(self.pred_len), 1.0))),
+                        1e-6,
+                    )
+                )
+                for horizon in horizons
+            ]
         if delta_cfg is None:
             return fallback
         if isinstance(delta_cfg, (int, float)):
@@ -278,6 +294,15 @@ class CSDI_base(nn.Module):
         active_count = min(max(active_count, 1), len(horizons))
         return horizons[:active_count]
 
+    def _get_horizon_group(self, horizon):
+        short_end = max(1, int(math.ceil(self.pred_len / 4.0)))
+        mid_end = max(short_end + 1, int(math.ceil(self.pred_len / 2.0)))
+        if int(horizon) <= short_end:
+            return "short"
+        if int(horizon) <= mid_end:
+            return "mid"
+        return "long"
+
     def get_multi_res_debug_state(self):
         active_horizons = self._get_active_multi_res_horizons()
         indices = [self.multi_res_horizon_to_index[h] for h in active_horizons if h in self.multi_res_horizon_to_index]
@@ -289,6 +314,7 @@ class CSDI_base(nn.Module):
             "active_horizons": list(active_horizons),
             "huber_deltas": list(self.multi_res_huber_deltas),
             "difficulty_ema": difficulty,
+            "horizon_groups": [self._get_horizon_group(horizon) for horizon in active_horizons],
         }
 
     def time_embedding(self, pos, d_model=128):
@@ -470,7 +496,23 @@ class CSDI_base(nn.Module):
             return base_weights.clamp(min=1e-6)
 
         difficulty = self.multi_res_difficulty_ema[active_indices].detach().clamp(min=1e-6)
-        difficulty = difficulty / difficulty.mean().clamp(min=1e-6)
+        if self.multi_res_group_balance:
+            group_to_indices = {}
+            for idx, horizon in enumerate(horizons):
+                group_name = self._get_horizon_group(horizon)
+                group_to_indices.setdefault(group_name, []).append(idx)
+            balanced = torch.ones_like(difficulty)
+            active_groups = [group_indices for group_indices in group_to_indices.values() if len(group_indices) > 0]
+            num_groups = max(len(active_groups), 1)
+            total_horizons = max(len(horizons), 1)
+            for group_indices in active_groups:
+                group_tensor = difficulty[group_indices]
+                group_tensor = group_tensor / group_tensor.mean().clamp(min=1e-6)
+                scale = float(total_horizons) / float(num_groups * len(group_indices))
+                balanced[group_indices] = group_tensor * scale
+            difficulty = balanced
+        else:
+            difficulty = difficulty / difficulty.mean().clamp(min=1e-6)
         difficulty = difficulty.unsqueeze(0).expand(batch_size, -1)
         mix = float(min(max(self.multi_res_difficulty_weight, 0.0), 1.0))
         weights = (1.0 - mix) * base_weights + mix * difficulty
@@ -752,7 +794,13 @@ class CSDI_Forecasting(CSDI_base):
         observed_mask = batch["observed_mask"].to(self.device).float()
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
-        text_mask = batch["text_mark"].to(self.device).int()
+        text_mask = batch["text_mark"].to(self.device).float().reshape(-1)
+        text_quality = batch.get("text_quality")
+        if text_quality is not None:
+            text_quality = text_quality.to(self.device).float().reshape(-1)
+            if self.text_quality_gate:
+                gated_quality = text_quality.clamp(min=self.text_quality_min_scale, max=1.0)
+                text_mask = (text_mask > 0).float() * gated_quality
         trend_prior = batch.get("trend_prior")
         if trend_prior is None:
             trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)

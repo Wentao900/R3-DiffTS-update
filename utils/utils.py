@@ -18,6 +18,9 @@ def train(
     if foldername != "":
         output_path = foldername + "/model.pth"
 
+    warmup_epochs = max(int(config.get("lr_warmup_epochs", 0)), 0)
+    max_grad_norm = float(config.get("max_grad_norm", 0.0))
+    base_lr = float(config["lr"])
     p1 = int(0.75 * config["epochs"])
     p2 = int(0.9 * config["epochs"])
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -29,6 +32,13 @@ def train(
         avg_loss = 0
         model.current_epoch = epoch_no
         model.total_epochs = max(int(config["epochs"]), 1)
+        if warmup_epochs > 0 and epoch_no < warmup_epochs:
+            warmup_factor = float(epoch_no + 1) / float(warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = base_lr * warmup_factor
+        elif warmup_epochs > 0 and epoch_no == warmup_epochs:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = base_lr
         model.train()
         with tqdm(train_loader, mininterval=1.0, maxinterval=50.0) as it:
             for batch_no, train_batch in enumerate(it, start=1):
@@ -36,6 +46,8 @@ def train(
 
                 loss = model(train_batch)
                 loss.backward()
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 avg_loss += loss.item()
                 optimizer.step()
                 it.set_postfix(
@@ -48,7 +60,10 @@ def train(
                 if batch_no >= config["itr_per_epoch"]:
                     break
 
-            lr_scheduler.step()
+            if warmup_epochs <= 0:
+                lr_scheduler.step()
+            elif epoch_no + 1 >= warmup_epochs:
+                lr_scheduler.step(epoch_no + 1)
         if valid_loader is not None and (epoch_no + 1) % valid_epoch_interval == 0:
             model.eval()
             avg_loss_valid = 0
@@ -232,13 +247,23 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     text_mark_arr = np.concatenate(all_text_marks, axis=0)
                     np.save(foldername + "trend_text_marks.npy", text_mark_arr)
 
+            crps = calc_quantile_CRPS(
+                all_target,
+                all_generated_samples,
+                all_evalpoint,
+                mean_scaler,
+                scaler,
+            )
+
             results = {
                 "guide_w": guide_w,
+                "CRPS": crps,
                 "MSE": nmse_total / evalpoints_total,
                 "MAE": nmae_total / evalpoints_total,
             }
-            with open(foldername + "config_results.json", "a") as f:
+            with open(foldername + "metrics.json", "w") as f:
                 json.dump(results, f, indent=4)
+            print("CRPS:", crps)
             print("MSE:", nmse_total / evalpoints_total)
             print("MAE:", nmae_total / evalpoints_total)
-    return nmse_total / evalpoints_total
+    return results

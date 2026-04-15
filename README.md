@@ -24,33 +24,80 @@ bash ./run.sh
   into text; it is used to modulate CFG weights along the diffusion path.
 - Optional quantized loading: `--cot_load_in_8bit` / `--cot_load_in_4bit` (requires bitsandbytes).
 
-## Multi-resolution auxiliary loss (minimal change enhancement)
-Introduce a lightweight, multi-horizon supervision term inspired by multi-resolution forecasting:
-the model is encouraged to fit several horizons (e.g., {1, 3, 6, 12}) within the prediction window.
-This adds training signal without changing the model architecture.
+## Multi-resolution auxiliary loss (latest mainline)
+Introduce a lightweight, multi-horizon supervision term inspired by multi-resolution forecasting.
+The model is encouraged to fit several horizons within the prediction window, with the final
+horizon set resolved in this order:
+1. explicit `train.multi_res_horizons`
+2. training-split ACF statistics
+3. ratio fallback based on `pred_len`
+
+This adds training signal without changing the model architecture or the original
+train / val / test workflow.
 - Config keys (under `train`):
-  - `multi_res_horizons`: list of horizons to supervise (clipped by `pred_len`).
+  - `multi_res_horizons`: explicit horizons to supervise (clipped by `pred_len`).
+  - `multi_res_use_stat_horizons`: when `multi_res_horizons` is null, derive horizons from training-set ACF.
+  - `multi_res_acf_drop_threshold`: first ACF decay threshold.
+  - `multi_res_acf_zero_threshold`: first near-zero ACF threshold.
+  - `multi_res_acf_max_lag`: max lag used for ACF analysis; `null` means auto.
+  - `multi_res_acf_num_samples`: number of sampled training windows for ACF estimation.
   - `multi_res_loss_weight`: weight for the auxiliary loss (set to 0 to disable).
   - `multi_res_use_huber`: use Huber loss (recommended for stability).
-  - `multi_res_huber_delta`: delta for Huber loss.
-  - `multi_res_dynamic`: enable A-version dynamic multi-horizon weighting.
+  - `multi_res_huber_delta`: uniform fallback delta for Huber loss.
+  - `multi_res_huber_deltas`: per-horizon delta list; falls back safely if lengths mismatch.
+  - `multi_res_dynamic`: enable dynamic multi-horizon weighting.
   - `multi_res_dynamic_by_t`: adapt horizon weights by diffusion step.
-  - `multi_res_dynamic_by_epoch`: adapt horizon weights by training epoch.
+  - `multi_res_dynamic_by_epoch`: keep epoch-aware confidence in the dynamic weighting mix.
   - `multi_res_dynamic_by_trend`: adapt horizon weights by trend prior strength/volatility.
   - `multi_res_dynamic_min_weight`: lower bound for each dynamic horizon weight.
+  - `multi_res_progressive`: progressively unlock horizons across training epochs.
+  - `multi_res_ema_alpha`: EMA update factor for per-horizon difficulty.
+  - `multi_res_difficulty_weight`: mixing weight between confidence-based weights and EMA difficulty weights.
+  - `lr_warmup_epochs`: number of warmup epochs before the original `MultiStepLR` schedule takes over.
+  - `max_grad_norm`: gradient clipping threshold; disable when `<= 0`.
+  - `adaptive_noise_scale`: optional interface for augmentation noise scaling; keep `0.0` for the mainline run.
+- Config keys (under `dataset` or `data`):
+  - `aug_noise_std`: light Gaussian noise for training lookback augmentation.
+  - `aug_time_warp_prob`: kept for backward compatibility; currently triggers local segment scaling, not strict time warping.
+  - `aug_segment_scale_std`: std used by the local segment scaling augmentation.
 - Example (YAML):
   ```yaml
   train:
-    multi_res_horizons: [1, 3, 6, 12]
+    multi_res_horizons: null
+    multi_res_use_stat_horizons: true
+    multi_res_acf_drop_threshold: 0.5
+    multi_res_acf_zero_threshold: 0.1
+    multi_res_acf_max_lag: null
+    multi_res_acf_num_samples: 128
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    multi_res_huber_deltas: [0.5, 0.8, 1.0, 1.5]
     multi_res_dynamic: true
     multi_res_dynamic_by_t: true
     multi_res_dynamic_by_epoch: true
     multi_res_dynamic_by_trend: true
     multi_res_dynamic_min_weight: 0.2
+    multi_res_progressive: true
+    multi_res_ema_alpha: 0.05
+    multi_res_difficulty_weight: 0.5
+    lr_warmup_epochs: 10
+    max_grad_norm: 1.0
+    adaptive_noise_scale: 0.0
+
+  dataset:
+    aug_noise_std: 0.01
+    aug_time_warp_prob: 0.3
+    aug_segment_scale_std: 0.1
   ```
+
+## Economy mainline config
+- Latest single-domain mainline config: `config/economy_36_12_mainline.yaml`
+- Default target:
+  - domain: `Economy`
+  - full latest mainline on: adaptive horizons, progressive curriculum, EMA difficulty,
+    per-horizon Huber delta, gradient clipping, LR warmup, lookback augmentation
+  - `adaptive_noise_scale`: kept off by default
 
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).

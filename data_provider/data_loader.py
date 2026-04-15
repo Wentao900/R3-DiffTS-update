@@ -58,7 +58,9 @@ class Dataset_Custom(Dataset):
                  cot_cache_size=1024, cot_device=None, rag_use_retrieval=True,
                  cot_load_in_8bit=False, cot_load_in_4bit=False, trend_cfg=False,
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
-                 two_stage_gate=True, trend_slope_eps=1e-3):
+                 two_stage_gate=True, trend_slope_eps=1e-3,
+                 aug_noise_std=0.0, aug_time_warp_prob=0.0,
+                 aug_segment_scale_std=0.1, adaptive_noise_scale=0.0):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -97,6 +99,10 @@ class Dataset_Custom(Dataset):
         self.two_stage_gate = two_stage_gate
         self.trend_slope_eps = trend_slope_eps
         self.guidance_cache = {}
+        self.aug_noise_std = float(aug_noise_std)
+        self.aug_time_warp_prob = float(aug_time_warp_prob)
+        self.aug_segment_scale_std = float(aug_segment_scale_std)
+        self.adaptive_noise_scale = float(adaptive_noise_scale)
 
         self.root_path = root_path
         self.data_path = data_path
@@ -147,6 +153,115 @@ class Dataset_Custom(Dataset):
             )
         else:
             self.rag_cot = None
+
+    def _sample_training_windows(self, num_samples):
+        total = len(self)
+        if total <= 0:
+            return np.asarray([], dtype=np.int64)
+        sample_count = min(max(int(num_samples), 1), total)
+        return np.linspace(0, total - 1, num=sample_count, dtype=np.int64)
+
+    def estimate_horizon_statistics(
+        self,
+        drop_threshold=0.5,
+        zero_threshold=0.1,
+        max_lag=None,
+        num_samples=128,
+    ):
+        if self.set_type != 0:
+            raise RuntimeError("horizon statistics should be estimated from the training split")
+
+        if len(self) <= 0:
+            raise RuntimeError("empty training dataset")
+
+        if max_lag is None:
+            max_lag = min(self.seq_len - 1, max(self.pred_len * 2, self.pred_len))
+        max_lag = int(max(1, min(max_lag, self.seq_len - 1)))
+
+        acf_sum = np.zeros(max_lag + 1, dtype=np.float64)
+        valid_count = 0
+        for index in self._sample_training_windows(num_samples):
+            window = np.asarray(self.data_x[index:index + self.seq_len], dtype=np.float64)
+            if window.ndim == 2:
+                window = window.mean(axis=1)
+            window = window.reshape(-1)
+            if window.size <= 1:
+                continue
+            window = window - window.mean()
+            denom = float(np.dot(window, window))
+            if denom <= 1e-12:
+                continue
+            acf = np.ones(max_lag + 1, dtype=np.float64)
+            for lag in range(1, max_lag + 1):
+                acf[lag] = float(np.dot(window[:-lag], window[lag:]) / denom)
+            acf_sum += acf
+            valid_count += 1
+
+        if valid_count <= 0:
+            raise RuntimeError("failed to compute stable ACF statistics from training windows")
+
+        avg_acf = acf_sum / float(valid_count)
+
+        drop_lag = None
+        zero_lag = None
+        peak_lag = None
+        for lag in range(1, max_lag + 1):
+            if drop_lag is None and avg_acf[lag] <= float(drop_threshold):
+                drop_lag = lag
+            if zero_lag is None and abs(avg_acf[lag]) <= float(zero_threshold):
+                zero_lag = lag
+
+        local_peaks = []
+        for lag in range(2, max_lag):
+            if avg_acf[lag] >= avg_acf[lag - 1] and avg_acf[lag] >= avg_acf[lag + 1] and avg_acf[lag] > float(zero_threshold):
+                local_peaks.append((float(avg_acf[lag]), int(lag)))
+        if local_peaks:
+            local_peaks.sort(key=lambda item: (-item[0], item[1]))
+            peak_lag = local_peaks[0][1]
+        elif max_lag >= 2:
+            peak_slice = avg_acf[2:max_lag + 1]
+            if peak_slice.size > 0 and float(np.max(peak_slice)) > float(zero_threshold):
+                peak_lag = int(np.argmax(peak_slice)) + 2
+
+        return {
+            "sample_count": int(valid_count),
+            "max_lag": int(max_lag),
+            "drop_threshold": float(drop_threshold),
+            "zero_threshold": float(zero_threshold),
+            "decay_lag": None if drop_lag is None else int(drop_lag),
+            "zero_lag": None if zero_lag is None else int(zero_lag),
+            "peak_lag": None if peak_lag is None else int(peak_lag),
+            "peak_value": None if peak_lag is None else float(avg_acf[peak_lag]),
+            "acf_head": [float(x) for x in avg_acf[: min(max_lag + 1, 16)]],
+        }
+
+    def _apply_lookback_augmentation(self, seq_x):
+        augmented = np.array(seq_x, copy=True)
+        if augmented.size == 0:
+            return augmented.astype(np.float32, copy=False)
+
+        base_std = float(self.aug_noise_std)
+        if self.adaptive_noise_scale > 0:
+            local_scale = float(np.std(augmented))
+            base_std = base_std * (1.0 + self.adaptive_noise_scale * local_scale)
+        if base_std > 0:
+            noise = np.random.normal(loc=0.0, scale=base_std, size=augmented.shape)
+            augmented = augmented + noise.astype(augmented.dtype, copy=False)
+
+        # `aug_time_warp_prob` is kept for backward compatibility, but the augmentation is
+        # local amplitude perturbation / segment scaling rather than strict time-axis warping.
+        if self.aug_time_warp_prob > 0 and np.random.rand() < self.aug_time_warp_prob:
+            length = augmented.shape[0]
+            min_seg = min(length, max(2, length // 8))
+            max_seg = min(length, max(min_seg, length // 3))
+            if max_seg >= min_seg and max_seg > 0:
+                seg_len = int(np.random.randint(min_seg, max_seg + 1))
+                start = int(np.random.randint(0, length - seg_len + 1))
+                scale = float(np.random.normal(loc=1.0, scale=max(self.aug_segment_scale_std, 1e-3)))
+                scale = float(np.clip(scale, 0.5, 1.5))
+                augmented[start:start + seg_len] = augmented[start:start + seg_len] * scale
+
+        return augmented.astype(np.float32, copy=False)
         
 
     def __read_data__(self):
@@ -247,6 +362,8 @@ class Dataset_Custom(Dataset):
         r_end = r_begin + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end, :]
+        if self.set_type == 0 and (self.aug_noise_std > 0 or self.aug_time_warp_prob > 0):
+            seq_x = self._apply_lookback_augmentation(seq_x)
         seq_y = self.data_y[r_begin:r_end, :]
     
         seq_x_stamp = self.data_stamp[s_begin:s_end]

@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import math
+import warnings
 from diff_models import diff_CSDI
 from utils.prepare4llm import get_llm
 
@@ -100,17 +102,29 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        self.multi_res_huber_deltas_cfg = train_cfg.get("multi_res_huber_deltas", None)
         self.multi_res_dynamic = bool(train_cfg.get("multi_res_dynamic", False))
         self.multi_res_dynamic_by_t = bool(train_cfg.get("multi_res_dynamic_by_t", True))
         self.multi_res_dynamic_by_epoch = bool(train_cfg.get("multi_res_dynamic_by_epoch", True))
         self.multi_res_dynamic_by_trend = bool(train_cfg.get("multi_res_dynamic_by_trend", True))
         self.multi_res_dynamic_min_weight = float(train_cfg.get("multi_res_dynamic_min_weight", 0.2))
-        if isinstance(self.multi_res_horizons, int):
-            self.multi_res_horizons = [self.multi_res_horizons]
-        elif self.multi_res_horizons is None:
-            self.multi_res_horizons = []
+        self.multi_res_progressive = bool(train_cfg.get("multi_res_progressive", False))
+        self.multi_res_ema_alpha = float(train_cfg.get("multi_res_ema_alpha", 0.05))
+        self.multi_res_difficulty_weight = float(train_cfg.get("multi_res_difficulty_weight", 0.0))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
+        self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
+        self.multi_res_horizon_to_index = {
+            int(horizon): idx for idx, horizon in enumerate(self.multi_res_horizons)
+        }
+        difficulty_size = max(len(self.multi_res_horizons), 1)
+        self.register_buffer(
+            "multi_res_difficulty_ema",
+            torch.ones(difficulty_size, dtype=torch.float32),
+        )
+        self.multi_res_huber_deltas = self._resolve_multi_res_huber_deltas(
+            self.multi_res_horizons, self.multi_res_huber_deltas_cfg
+        )
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -190,6 +204,92 @@ class CSDI_base(nn.Module):
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
+
+    def _sanitize_multi_res_horizons(self, horizons):
+        if isinstance(horizons, int):
+            horizons = [horizons]
+        elif horizons is None:
+            horizons = []
+        sanitized = []
+        for horizon in horizons:
+            try:
+                horizon = int(horizon)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= horizon <= int(self.pred_len):
+                sanitized.append(horizon)
+
+        if len(sanitized) == 0 and self.multi_res_loss_weight > 0 and self.pred_len > 0:
+            if self.pred_len <= 4:
+                sanitized = list(range(1, self.pred_len + 1))
+            else:
+                sanitized = [
+                    1,
+                    int(math.ceil(self.pred_len / 4.0)),
+                    int(math.ceil(self.pred_len / 2.0)),
+                    int(self.pred_len),
+                ]
+
+        return sorted(set(sanitized))
+
+    def _resolve_multi_res_huber_deltas(self, horizons, delta_cfg):
+        if len(horizons) == 0:
+            return []
+
+        fallback = [float(max(self.multi_res_huber_delta, 1e-6))] * len(horizons)
+        if delta_cfg is None:
+            return fallback
+        if isinstance(delta_cfg, (int, float)):
+            return [float(max(delta_cfg, 1e-6))] * len(horizons)
+        if not isinstance(delta_cfg, (list, tuple)):
+            warnings.warn(
+                "multi_res_huber_deltas is not a list/tuple; falling back to uniform delta.",
+                RuntimeWarning,
+            )
+            return fallback
+        if len(delta_cfg) != len(horizons):
+            warnings.warn(
+                "multi_res_huber_deltas length does not match final multi_res_horizons; falling back to uniform delta.",
+                RuntimeWarning,
+            )
+            return fallback
+
+        resolved = []
+        try:
+            for value in delta_cfg:
+                resolved.append(float(max(value, 1e-6)))
+        except (TypeError, ValueError):
+            warnings.warn(
+                "multi_res_huber_deltas contains invalid values; falling back to uniform delta.",
+                RuntimeWarning,
+            )
+            return fallback
+        return resolved
+
+    def _get_active_multi_res_horizons(self):
+        horizons = list(self.multi_res_horizons)
+        if len(horizons) <= 1 or not self.multi_res_progressive:
+            return horizons
+        if self.total_epochs <= 1:
+            return horizons
+
+        progress = float(min(max(self.current_epoch, 0), self.total_epochs - 1)) / float(self.total_epochs - 1)
+        active_count = 1 + int(math.floor(progress * (len(horizons) - 1) + 1e-8))
+        active_count = min(max(active_count, 1), len(horizons))
+        return horizons[:active_count]
+
+    def get_multi_res_debug_state(self):
+        active_horizons = self._get_active_multi_res_horizons()
+        indices = [self.multi_res_horizon_to_index[h] for h in active_horizons if h in self.multi_res_horizon_to_index]
+        difficulty = []
+        if indices:
+            difficulty = self.multi_res_difficulty_ema[indices].detach().cpu().tolist()
+        return {
+            "final_horizons": list(self.multi_res_horizons),
+            "active_horizons": list(active_horizons),
+            "huber_deltas": list(self.multi_res_huber_deltas),
+            "difficulty_ema": difficulty,
+        }
 
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
@@ -345,29 +445,59 @@ class CSDI_base(nn.Module):
         return torch.stack(components, dim=0).mean(dim=0)
 
     def _get_multi_res_horizon_weights(self, horizons, batch_size, t=None, trend_prior=None):
-        horizon_tensor = torch.tensor(horizons, device=self.device, dtype=torch.float32)
         if len(horizons) <= 1:
             return torch.ones((batch_size, len(horizons)), device=self.device)
 
-        if not self.multi_res_dynamic:
-            return torch.ones((batch_size, len(horizons)), device=self.device)
+        base_weights = torch.ones((batch_size, len(horizons)), device=self.device)
+        if self.multi_res_dynamic:
+            horizon_tensor = torch.tensor(horizons, device=self.device, dtype=torch.float32)
+            confidence = self._get_multi_res_confidence(batch_size, t=t, trend_prior=trend_prior).unsqueeze(1)
+            horizon_pos = (horizon_tensor - horizon_tensor.min()) / max((horizon_tensor.max() - horizon_tensor.min()).item(), 1.0)
+            horizon_pos = horizon_pos.unsqueeze(0).expand(batch_size, -1)
 
-        confidence = self._get_multi_res_confidence(batch_size, t=t, trend_prior=trend_prior).unsqueeze(1)
-        horizon_pos = (horizon_tensor - horizon_tensor.min()) / max((horizon_tensor.max() - horizon_tensor.min()).item(), 1.0)
-        horizon_pos = horizon_pos.unsqueeze(0).expand(batch_size, -1)
+            min_w = min(max(self.multi_res_dynamic_min_weight, 0.0), 1.0)
+            base_weights = min_w + (1.0 - min_w) * (1.0 - torch.abs(horizon_pos - confidence))
 
-        min_w = min(max(self.multi_res_dynamic_min_weight, 0.0), 1.0)
-        weights = min_w + (1.0 - min_w) * (1.0 - torch.abs(horizon_pos - confidence))
+        if self.multi_res_difficulty_weight <= 0:
+            return base_weights.clamp(min=1e-6)
+
+        active_indices = [
+            self.multi_res_horizon_to_index[horizon]
+            for horizon in horizons
+            if horizon in self.multi_res_horizon_to_index
+        ]
+        if len(active_indices) != len(horizons):
+            return base_weights.clamp(min=1e-6)
+
+        difficulty = self.multi_res_difficulty_ema[active_indices].detach().clamp(min=1e-6)
+        difficulty = difficulty / difficulty.mean().clamp(min=1e-6)
+        difficulty = difficulty.unsqueeze(0).expand(batch_size, -1)
+        mix = float(min(max(self.multi_res_difficulty_weight, 0.0), 1.0))
+        weights = (1.0 - mix) * base_weights + mix * difficulty
         return weights.clamp(min=1e-6)
+
+    def _update_multi_res_difficulty(self, horizon, loss_value):
+        if not self.training:
+            return
+        if self.multi_res_difficulty_weight <= 0:
+            return
+        horizon_index = self.multi_res_horizon_to_index.get(int(horizon))
+        if horizon_index is None:
+            return
+        alpha = float(min(max(self.multi_res_ema_alpha, 0.0), 1.0))
+        detached = loss_value.detach().float()
+        with torch.no_grad():
+            if alpha <= 0:
+                self.multi_res_difficulty_ema[horizon_index] = detached
+            else:
+                self.multi_res_difficulty_ema[horizon_index].mul_(1.0 - alpha).add_(alpha * detached)
 
     def _calc_multi_res_loss(self, observed_data, predicted, target_mask, t=None, trend_prior=None):
         if self.pred_len <= 0:
             return torch.zeros((), device=observed_data.device)
-        horizons = [int(h) for h in self.multi_res_horizons if int(h) > 0]
+        horizons = self._get_active_multi_res_horizons()
         if len(horizons) == 0:
             return torch.zeros((), device=observed_data.device)
-        max_pred = int(self.pred_len)
-        horizons = sorted(set(min(h, max_pred) for h in horizons))
         batch_size = observed_data.shape[0]
         horizon_weights = self._get_multi_res_horizon_weights(horizons, batch_size, t=t, trend_prior=trend_prior)
         weighted_loss_sum = torch.zeros((batch_size,), device=observed_data.device)
@@ -386,7 +516,11 @@ class CSDI_base(nn.Module):
                 continue
             residual = (observed_data - predicted) * horizon_mask
             if self.multi_res_use_huber:
-                delta = self.multi_res_huber_delta
+                full_index = self.multi_res_horizon_to_index.get(int(h))
+                if full_index is None or full_index >= len(self.multi_res_huber_deltas):
+                    delta = float(self.multi_res_huber_delta)
+                else:
+                    delta = float(self.multi_res_huber_deltas[full_index])
                 abs_res = residual.abs()
                 huber = torch.where(
                     abs_res <= delta,
@@ -399,6 +533,8 @@ class CSDI_base(nn.Module):
             weight_h = horizon_weights[:, h_idx] * valid.float()
             weighted_loss_sum = weighted_loss_sum + weight_h * loss_h
             weight_sum = weight_sum + weight_h
+            if valid.any():
+                self._update_multi_res_difficulty(h, loss_h[valid].mean())
         valid_samples = weight_sum > 0
         if not valid_samples.any():
             return torch.zeros((), device=observed_data.device)

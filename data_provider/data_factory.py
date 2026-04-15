@@ -39,6 +39,10 @@ def data_provider(args, flag):
         extra_kwargs['rag_stage2_topk'] = getattr(args, "rag_stage2_topk", -1)
         extra_kwargs['two_stage_gate'] = getattr(args, "two_stage_gate", True)
         extra_kwargs['trend_slope_eps'] = getattr(args, "trend_slope_eps", 1e-3)
+        extra_kwargs['aug_noise_std'] = getattr(args, "aug_noise_std", 0.0)
+        extra_kwargs['aug_time_warp_prob'] = getattr(args, "aug_time_warp_prob", 0.0)
+        extra_kwargs['aug_segment_scale_std'] = getattr(args, "aug_segment_scale_std", 0.1)
+        extra_kwargs['adaptive_noise_scale'] = getattr(args, "adaptive_noise_scale", 0.0)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

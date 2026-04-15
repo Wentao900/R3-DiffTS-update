@@ -1,0 +1,75 @@
+#type: args
+
+train:
+  epochs: 150
+  batch_size: 32
+  lr: 0.0025
+  itr_per_epoch: 1.0e+8
+  multi_res_horizons: null
+  multi_res_use_stat_horizons: true
+  multi_res_acf_drop_threshold: 0.5
+  multi_res_acf_zero_threshold: 0.1
+  multi_res_acf_max_lag: null
+  multi_res_acf_num_samples: 128
+  multi_res_loss_weight: 0.1
+  multi_res_use_huber: true
+  multi_res_huber_delta: 1.0
+  multi_res_huber_deltas: [0.5, 0.8, 1.0, 1.5]
+  multi_res_dynamic: true
+  multi_res_dynamic_by_t: true
+  multi_res_dynamic_by_epoch: true
+  multi_res_dynamic_by_trend: true
+  multi_res_dynamic_min_weight: 0.2
+  multi_res_progressive: true
+  multi_res_ema_alpha: 0.05
+  multi_res_difficulty_weight: 0.5
+  lr_warmup_epochs: 10
+  max_grad_norm: 1.0
+  adaptive_noise_scale: 0.0
+
+diffusion:
+  layers: 6
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.6
+  num_steps: 300
+  schedule: "quad"
+  is_linear: False
+  noise_esti: False
+  cfg: True
+  c_mask_prob: 0.05
+  ddim: True
+  sample_steps: 20
+  sample_method: "quad"
+  pre_norm: False
+
+model:
+  cot_model: ./gpt2-medium
+  cot_temperature: 0.2
+  cot_max_new_tokens: 64
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  guide_w_default: 1.0
+  target_strategy: "test"
+  num_sample_features: 64
+  rag_stage1_topk: 3
+  rag_stage2_topk: 1
+  rag_topk: 1
+  timestep_branch: False
+  timestep_emb_cat: True
+  with_texts: True
+  relative_size_emb_cat: False
+  decomp: False
+  llm: "bert"
+  llm_layers: 0
+  use_rag_cot: true
+  use_two_stage_rag: true
+
+dataset:
+  aug_noise_std: 0.01
+  # Kept for backward compatibility; this triggers local segment scaling, not strict time warping.
+  aug_time_warp_prob: 0.3
+  aug_segment_scale_std: 0.1

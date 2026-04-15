@@ -45,31 +45,76 @@ bash ./run.sh
   `--trend_cfg_random`
 - 保存趋势先验：`--save_trend_prior` 输出 `trend_priors.npy` 与 `trend_text_marks.npy`
 
-## 多分辨率辅助损失（最小改动增强）
-引入轻量多视距监督（如 {1,3,6,12}），在**不改模型结构**的前提下增强训练信号。
+## 多分辨率辅助损失（最新主线）
+引入轻量多视距监督，在**不改模型结构**、不改原有 train / val / test 工作流的前提下增强训练信号。
+最终 horizon 集合按以下顺序确定：
+1. 显式配置 `train.multi_res_horizons`
+2. 训练集 ACF 统计
+3. 基于 `pred_len` 的比例回退
+
 - 配置项（位于 `train`）：
-  - `multi_res_horizons`：监督的预测视距列表（自动裁剪到 `pred_len`）
+  - `multi_res_horizons`：显式指定监督 horizon 列表（自动裁剪到 `pred_len`）
+  - `multi_res_use_stat_horizons`：当 `multi_res_horizons` 为 `null` 时，使用训练集 ACF 自动生成 horizon
+  - `multi_res_acf_drop_threshold`：ACF 首个衰减阈值
+  - `multi_res_acf_zero_threshold`：ACF 首个近零阈值
+  - `multi_res_acf_max_lag`：ACF 最大 lag，`null` 表示自动确定
+  - `multi_res_acf_num_samples`：用于估计 ACF 的训练窗口采样数
   - `multi_res_loss_weight`：辅助损失权重（设为 0 即关闭）
   - `multi_res_use_huber`：是否使用 Huber（推荐）
-  - `multi_res_huber_delta`：Huber 的 delta
-  - `multi_res_dynamic`：是否启用 A 版动态多视距加权
+  - `multi_res_huber_delta`：统一 Huber delta 的回退值
+  - `multi_res_huber_deltas`：按 horizon 对齐的 delta 列表；长度不匹配时会安全回退
+  - `multi_res_dynamic`：是否启用动态多视距加权
   - `multi_res_dynamic_by_t`：按 diffusion step 动态调整 horizon 权重
-  - `multi_res_dynamic_by_epoch`：按训练 epoch 做 curriculum
+  - `multi_res_dynamic_by_epoch`：在动态权重中保留 epoch 相关的置信度项
   - `multi_res_dynamic_by_trend`：按 `trend_prior` 的强度/波动度调整 horizon 权重
   - `multi_res_dynamic_min_weight`：动态权重下限，避免某个 horizon 被完全压掉
+  - `multi_res_progressive`：按训练进度逐步解锁 horizon
+  - `multi_res_ema_alpha`：按 horizon 难度 EMA 的更新系数
+  - `multi_res_difficulty_weight`：置信度权重与难度 EMA 权重的混合系数
+  - `lr_warmup_epochs`：warmup epoch 数，之后切回原有 `MultiStepLR`
+  - `max_grad_norm`：梯度裁剪阈值；`<= 0` 时关闭
+  - `adaptive_noise_scale`：可选的增强噪声缩放接口；主线实验建议保持 `0.0`
+- 配置项（位于 `dataset` 或 `data`）：
+  - `aug_noise_std`：训练 lookback 轻量高斯噪声
+  - `aug_time_warp_prob`：为了兼容旧命名保留；当前实现是局部 segment scaling，不是严格时间轴 warp
+  - `aug_segment_scale_std`：局部 segment scaling 的强度
 - 示例（YAML）：
   ```yaml
   train:
-    multi_res_horizons: [1, 3, 6, 12]
+    multi_res_horizons: null
+    multi_res_use_stat_horizons: true
+    multi_res_acf_drop_threshold: 0.5
+    multi_res_acf_zero_threshold: 0.1
+    multi_res_acf_max_lag: null
+    multi_res_acf_num_samples: 128
     multi_res_loss_weight: 0.1
     multi_res_use_huber: true
     multi_res_huber_delta: 1.0
+    multi_res_huber_deltas: [0.5, 0.8, 1.0, 1.5]
     multi_res_dynamic: true
     multi_res_dynamic_by_t: true
     multi_res_dynamic_by_epoch: true
     multi_res_dynamic_by_trend: true
     multi_res_dynamic_min_weight: 0.2
+    multi_res_progressive: true
+    multi_res_ema_alpha: 0.05
+    multi_res_difficulty_weight: 0.5
+    lr_warmup_epochs: 10
+    max_grad_norm: 1.0
+    adaptive_noise_scale: 0.0
+
+  dataset:
+    aug_noise_std: 0.01
+    aug_time_warp_prob: 0.3
+    aug_segment_scale_std: 0.1
   ```
+
+## Economy 单域主线配置
+- 最新单域主线配置：`config/economy_36_12_mainline.yaml`
+- 默认目标：
+  - 域：`Economy`
+  - 主线全开：自适应 horizons、Progressive Curriculum、EMA Difficulty、Per-Horizon Huber Delta、Gradient Clipping、LR Warmup、Lookback Augmentation
+  - `adaptive_noise_scale`：默认关闭
 
 ## Guide weight 扫描
 - `--guide_w -1` 会使用内置列表自动扫描（包含 `4.5`）。

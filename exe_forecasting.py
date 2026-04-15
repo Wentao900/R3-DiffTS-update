@@ -6,6 +6,7 @@ import yaml
 import os
 import numpy as np
 import random
+import math
 
 from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
@@ -70,6 +71,134 @@ parser.add_argument('--save_token', type=bool, default=False)
 
 args = parser.parse_args()
 print(args)
+
+
+def default_multi_res_horizons(pred_len):
+    pred_len = int(pred_len)
+    if pred_len <= 0:
+        return []
+    if pred_len <= 4:
+        return list(range(1, pred_len + 1))
+    return sorted(
+        set(
+            [
+                1,
+                int(math.ceil(pred_len / 4.0)),
+                int(math.ceil(pred_len / 2.0)),
+                pred_len,
+            ]
+        )
+    )
+
+
+def sanitize_multi_res_horizons(horizons, pred_len):
+    if horizons is None:
+        return []
+    if isinstance(horizons, int):
+        horizons = [horizons]
+    sanitized = []
+    for horizon in horizons:
+        try:
+            horizon = int(horizon)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= horizon <= int(pred_len):
+            sanitized.append(horizon)
+    return sorted(set(sanitized))
+
+
+def ordered_unique_horizons(candidates, pred_len, limit=5):
+    result = []
+    seen = set()
+    for candidate in candidates:
+        sanitized = sanitize_multi_res_horizons([candidate], pred_len)
+        if not sanitized:
+            continue
+        horizon = sanitized[0]
+        if horizon in seen:
+            continue
+        result.append(horizon)
+        seen.add(horizon)
+        if limit is not None and len(result) >= limit:
+            break
+    return sorted(result)
+
+
+def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
+    explicit_horizons = sanitize_multi_res_horizons(
+        train_cfg.get("multi_res_horizons"),
+        pred_len,
+    )
+    if explicit_horizons:
+        return {
+            "horizons": explicit_horizons,
+            "source": "explicit",
+            "stats": {},
+            "fallback_used": False,
+        }
+
+    fallback_horizons = default_multi_res_horizons(pred_len)
+    if not bool(train_cfg.get("multi_res_use_stat_horizons", True)):
+        return {
+            "horizons": fallback_horizons,
+            "source": "ratio_fallback",
+            "stats": {},
+            "fallback_used": True,
+        }
+
+    if train_dataset is None or not hasattr(train_dataset, "estimate_horizon_statistics"):
+        return {
+            "horizons": fallback_horizons,
+            "source": "ratio_fallback",
+            "stats": {"reason": "training dataset does not expose ACF statistics"},
+            "fallback_used": True,
+        }
+
+    try:
+        stats = train_dataset.estimate_horizon_statistics(
+            drop_threshold=train_cfg.get("multi_res_acf_drop_threshold", 0.5),
+            zero_threshold=train_cfg.get("multi_res_acf_zero_threshold", 0.1),
+            max_lag=train_cfg.get("multi_res_acf_max_lag"),
+            num_samples=train_cfg.get("multi_res_acf_num_samples", 128),
+        )
+        candidate_order = [
+            1,
+            stats.get("decay_lag"),
+            stats.get("zero_lag"),
+            stats.get("peak_lag"),
+            int(pred_len),
+        ]
+        horizons = ordered_unique_horizons(candidate_order, pred_len, limit=5)
+        if len(horizons) < 3:
+            horizons = ordered_unique_horizons(candidate_order + fallback_horizons, pred_len, limit=5)
+        if len(horizons) == 0:
+            raise RuntimeError("no valid horizons generated from training ACF")
+        return {
+            "horizons": horizons,
+            "source": "train_acf",
+            "stats": stats,
+            "fallback_used": False,
+        }
+    except Exception as exc:
+        return {
+            "horizons": fallback_horizons,
+            "source": "ratio_fallback",
+            "stats": {"reason": str(exc)},
+            "fallback_used": True,
+        }
+
+
+def write_run_summary(foldername, config, horizon_info, metrics=None, extra=None):
+    summary = {
+        "config": config,
+        "multi_res": horizon_info,
+    }
+    if metrics is not None:
+        summary["metrics"] = metrics
+    if extra is not None:
+        summary.update(extra)
+    with open(os.path.join(foldername, "run_summary.json"), "w") as f:
+        json.dump(summary, f, indent=4)
 
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
@@ -184,16 +313,20 @@ if args.sample_steps_override > 0:
 if args.lr > 0:
     config["train"]["lr"] = args.lr
 
-args.batch_size = config["train"]["batch_size"]
+dataset_cfg = {}
+dataset_cfg.update(config.get("data", {}))
+dataset_cfg.update(config.get("dataset", {}))
+args.aug_noise_std = float(dataset_cfg.get("aug_noise_std", 0.0))
+args.aug_time_warp_prob = float(dataset_cfg.get("aug_time_warp_prob", 0.0))
+args.aug_segment_scale_std = float(dataset_cfg.get("aug_segment_scale_std", 0.1))
+args.adaptive_noise_scale = float(config.get("train", {}).get("adaptive_noise_scale", 0.0))
 
-print(json.dumps(config, indent=4))
+args.batch_size = config["train"]["batch_size"]
 
 current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 foldername = "./save/forecasting_" + args.data_path.split('/')[0] + '_' + current_time + "/"
 print('model folder:', foldername)
 os.makedirs(foldername, exist_ok=True)
-with open(foldername + "config_results.json", "w") as f:
-    json.dump(config, f, indent=4)
 
 train_loader, valid_loader, test_loader, scaler, mean_scaler = get_dataloader(
     datatype=args.datatype,
@@ -202,7 +335,30 @@ train_loader, valid_loader, test_loader, scaler, mean_scaler = get_dataloader(
     args=args
 )
 
+horizon_info = resolve_multi_res_horizons(
+    config["train"],
+    getattr(train_loader, "dataset", None),
+    args.pred_len,
+)
+config["train"]["multi_res_horizons"] = horizon_info["horizons"]
+config["train"]["multi_res_horizon_source"] = horizon_info["source"]
+config["train"]["multi_res_horizon_stats"] = horizon_info["stats"]
+print("resolved multi_res_horizons:", horizon_info["horizons"])
+print("multi_res source:", horizon_info["source"])
+print(json.dumps(config, indent=4))
+with open(foldername + "config_results.json", "w") as f:
+    json.dump(config, f, indent=4)
+write_run_summary(foldername, config, horizon_info)
+
 model = CSDI_Forecasting(config, args.device, target_dim, window_lens=[args.seq_len, args.pred_len]).to(args.device)
+write_run_summary(
+    foldername,
+    config,
+    {
+        **horizon_info,
+        "model_state": model.get_multi_res_debug_state(),
+    },
+)
 
 if args.modelfolder == "":
     train(
@@ -218,9 +374,10 @@ else:
 model.target_dim = target_dim
 if config["diffusion"]["cfg"]:
     best_mse = 10e10
+    best_metrics = None
     guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
     for guide_w in guide_list:
-        mse = evaluate(
+        metrics = evaluate(
             model,
             test_loader,
             nsample=args.nsample,
@@ -233,8 +390,11 @@ if config["diffusion"]["cfg"]:
             save_token=args.save_token,
             save_trend_prior=args.save_trend_prior
         )
+        if metrics["MSE"] < best_mse:
+            best_mse = metrics["MSE"]
+            best_metrics = metrics
 else:
-    evaluate(
+    best_metrics = evaluate(
             model,
             test_loader,
             nsample=args.nsample,
@@ -246,3 +406,16 @@ else:
             save_token=args.save_token,
             save_trend_prior=args.save_trend_prior
         )
+
+if config["diffusion"]["cfg"] and best_metrics is None:
+    best_metrics = {"MSE": best_mse}
+
+write_run_summary(
+    foldername,
+    config,
+    {
+        **horizon_info,
+        "model_state": model.get_multi_res_debug_state(),
+    },
+    metrics=best_metrics,
+)

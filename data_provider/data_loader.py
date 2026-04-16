@@ -681,7 +681,8 @@ class Dataset_Custom(Dataset):
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior_num,
             'trend_prior_num': trend_prior_num,
-            'trend_prior_text': trend_prior_text
+            'trend_prior_text': trend_prior_text,
+            'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
 
         return s

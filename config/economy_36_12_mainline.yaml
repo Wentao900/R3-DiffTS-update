@@ -35,6 +35,7 @@ train:
   text_benefit_weight: 0.05
   text_aug_benefit_weight: 0.05
   text_aug_reg_weight: 0.01
+  text_notext_fallback_weight: 0.05
 
 diffusion:
   layers: 6
@@ -97,6 +98,8 @@ model:
   text_numeric_align_gamma: 2.0
   multi_res_trend_source: numeric_only
   text_aug_max_ratio: 0.3
+  coverage_power: 2.0
+  coverage_cfg_boost: 0.15
 
 dataset:
   aug_noise_std: 0.01

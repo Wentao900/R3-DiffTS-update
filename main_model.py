@@ -117,6 +117,9 @@ class CSDI_base(nn.Module):
         self.text_numeric_align_gamma = float(config["model"].get("text_numeric_align_gamma", 2.0))
         self.multi_res_trend_source = str(config["model"].get("multi_res_trend_source", "numeric_only")).lower()
         self.text_aug_max_ratio = float(config["model"].get("text_aug_max_ratio", 0.3))
+        self.coverage_power = float(config["model"].get("coverage_power", 2.0))
+        self.coverage_cfg_boost = float(config["model"].get("coverage_cfg_boost", 0.15))
+        self.text_notext_fallback_weight = float(train_cfg.get("text_notext_fallback_weight", 0.0))
 
         train_cfg = config.get("train", {})
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -204,7 +207,7 @@ class CSDI_base(nn.Module):
             self.text_hidden_dim = int(text_hidden_dim)
             benefit_hidden_dim = int(config["model"].get("text_benefit_hidden_dim", 128))
             self.text_benefit_head = nn.Sequential(
-                nn.Linear(text_hidden_dim + 6, benefit_hidden_dim),
+                nn.Linear(text_hidden_dim + 7, benefit_hidden_dim),
                 nn.LayerNorm(benefit_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(benefit_hidden_dim, 1),
@@ -425,20 +428,20 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None, domain_coverage=None
     ):
         loss_sum = 0
-        for t in range(self.num_steps): 
+        for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, benefit_gate=benefit_gate, context_raw=context_raw, aug_gate=aug_gate
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, benefit_gate=benefit_gate, context_raw=context_raw, aug_gate=aug_gate, domain_coverage=domain_coverage
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None, set_t=-1
-    ):  
-        
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None, domain_coverage=None, set_t=-1
+    ):
+
         B, K, L = observed_data.shape
         if not self.noise_esti:
             means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
@@ -448,15 +451,20 @@ class CSDI_base(nn.Module):
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
         else:
-            t = torch.randint(0, self.num_steps, [B]).to(self.device) 
-        current_alpha = self.alpha_torch[t]  
+            t = torch.randint(0, self.num_steps, [B]).to(self.device)
+        current_alpha = self.alpha_torch[t]
         noise = torch.randn_like(observed_data)
         noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
 
-        total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask) 
+        total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask)
 
         if self.cfg:
-            cfg_mask = torch.bernoulli(torch.ones((B, )) - self.c_mask_prob).to(self.device) 
+            effective_mask_prob = self.c_mask_prob
+            if self.coverage_cfg_boost > 0 and domain_coverage is not None:
+                mean_cov = domain_coverage.mean().item()
+                effective_mask_prob = self.c_mask_prob + (1.0 - mean_cov) * self.coverage_cfg_boost
+                effective_mask_prob = min(effective_mask_prob, 0.5)
+            cfg_mask = torch.bernoulli(torch.ones((B, )) - effective_mask_prob).to(self.device)
         else:
             cfg_mask = None
 
@@ -495,6 +503,7 @@ class CSDI_base(nn.Module):
                 or (self.text_benefit_weight > 0 and benefit_gate is not None)
                 or (self.text_aug_benefit_weight > 0 and aug_gate is not None)
                 or (self.text_aug_reg_weight > 0 and aug_gate is not None)
+                or (self.text_notext_fallback_weight > 0 and domain_coverage is not None)
             )
         )
         if needs_text_baseline:
@@ -563,6 +572,15 @@ class CSDI_base(nn.Module):
                     aug_gate,
                 )
                 auxiliary_loss = auxiliary_loss + self.text_aug_reg_weight * aug_reg_loss
+            if self.text_notext_fallback_weight > 0 and domain_coverage is not None:
+                fallback_loss = self._calc_notext_fallback_loss(
+                    predicted,
+                    predicted_no_text,
+                    observed_data,
+                    target_mask,
+                    domain_coverage,
+                )
+                auxiliary_loss = auxiliary_loss + self.text_notext_fallback_weight * fallback_loss
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -621,6 +639,22 @@ class CSDI_base(nn.Module):
         if not valid.any():
             return torch.zeros((), device=predicted_aug.device)
         return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
+
+    def _calc_notext_fallback_loss(self, predicted, predicted_no_text, observed_data, target_mask, domain_coverage):
+        """Penalize text-conditioned predictions that are worse than no-text baseline.
+
+        Weighted by (1 - coverage): strongest for low-coverage domains.
+        Only incurs loss when text *hurts* — asymmetric hinge so helpful text is not penalized.
+        """
+        text_loss = self._calc_per_sample_forecast_loss(predicted, observed_data, target_mask)
+        base_loss = self._calc_per_sample_forecast_loss(predicted_no_text, observed_data, target_mask)
+        degradation = (text_loss - base_loss.detach()).clamp(min=0.0)
+        cov = domain_coverage.reshape(-1).float().clamp(0.0, 1.0)
+        weights = (1.0 - cov).clamp(min=0.0)
+        valid = weights > 0
+        if not valid.any():
+            return torch.zeros((), device=predicted.device)
+        return (degradation[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -1019,6 +1053,11 @@ class CSDI_Forecasting(CSDI_base):
             trend_prior_text = trend_prior_num.clone()
         else:
             trend_prior_text = trend_prior_text.to(self.device).float()
+        domain_coverage = batch.get("domain_text_coverage")
+        if domain_coverage is not None:
+            domain_coverage = domain_coverage.to(self.device).float().reshape(-1)
+        else:
+            domain_coverage = torch.ones(observed_data.shape[0], device=self.device)
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
@@ -1039,18 +1078,19 @@ class CSDI_Forecasting(CSDI_base):
         feature_id=torch.arange(self.target_dim_base).unsqueeze(0).expand(observed_data.shape[0],-1).to(self.device)
 
         return (
-            observed_data, 
+            observed_data,
             observed_mask,
-            observed_tp, 
+            observed_tp,
             gt_mask,
-            for_pattern_mask, 
+            for_pattern_mask,
             cut_length,
             feature_id,
-            timesteps, 
+            timesteps,
             texts,
-            text_mask, 
+            text_mask,
             trend_prior_num,
             trend_prior_text,
+            domain_coverage,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -1182,7 +1222,7 @@ class CSDI_Forecasting(CSDI_base):
             dim=1,
         )
 
-    def _compute_text_benefit_gate(self, observed_data, cond_mask, text_pooled, text_mask, trend_align):
+    def _compute_text_benefit_gate(self, observed_data, cond_mask, text_pooled, text_mask, trend_align, domain_coverage=None):
         if text_pooled is None or text_mask is None:
             return None
         numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
@@ -1190,8 +1230,13 @@ class CSDI_Forecasting(CSDI_base):
         if trend_align is None:
             trend_align = torch.ones_like(quality.squeeze(1))
         align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
-        benefit_input = torch.cat([numeric_summary, text_pooled, quality, align], dim=1)
+        if domain_coverage is None:
+            domain_coverage = torch.ones(text_pooled.shape[0], device=text_pooled.device)
+        cov = domain_coverage.reshape(-1, 1).float().clamp(0.0, 1.0)
+        benefit_input = torch.cat([numeric_summary, text_pooled, quality, align, cov], dim=1)
         benefit_gate = torch.sigmoid(self.text_benefit_head(benefit_input)).reshape(-1)
+        coverage_cap = domain_coverage.reshape(-1).float().clamp(0.0, 1.0).pow(self.coverage_power)
+        benefit_gate = benefit_gate * coverage_cap
         return benefit_gate
 
     def _get_aug_inputs(self, batch):
@@ -1289,7 +1334,23 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 12:
+        if len(data) == 13:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior_num,
+                trend_prior_text,
+                domain_coverage,
+            ) = data
+        elif len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -1304,6 +1365,7 @@ class CSDI_Forecasting(CSDI_base):
                 trend_prior_num,
                 trend_prior_text,
             ) = data
+            domain_coverage = None
         elif len(data) == 11:
             (
                 observed_data,
@@ -1319,6 +1381,7 @@ class CSDI_Forecasting(CSDI_base):
                 trend_prior_num,
             ) = data
             trend_prior_text = trend_prior_num
+            domain_coverage = None
         elif len(data) == 10:
             (
                 observed_data,
@@ -1334,6 +1397,7 @@ class CSDI_Forecasting(CSDI_base):
             ) = data
             trend_prior_num = None
             trend_prior_text = None
+            domain_coverage = None
         else:
             (
                 observed_data,
@@ -1349,6 +1413,7 @@ class CSDI_Forecasting(CSDI_base):
             text_mask = None
             trend_prior_num = None
             trend_prior_text = None
+            domain_coverage = None
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -1381,7 +1446,7 @@ class CSDI_Forecasting(CSDI_base):
             encoded_text = None
             text_pooled = None
         trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
-        benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align)
+        benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align, domain_coverage)
         raw_gate = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
         context_raw = self._build_text_context(encoded_text, raw_gate) if encoded_text is not None else None
         raw_token_len = encoded_text.shape[1] if encoded_text is not None else None
@@ -1417,11 +1482,28 @@ class CSDI_Forecasting(CSDI_base):
             benefit_gate=benefit_gate,
             context_raw=context_raw,
             aug_gate=aug_gate,
+            domain_coverage=domain_coverage,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 12:
+        if len(data) == 13:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior_num,
+                trend_prior_text,
+                domain_coverage,
+            ) = data
+        elif len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -1436,6 +1518,7 @@ class CSDI_Forecasting(CSDI_base):
                 trend_prior_num,
                 trend_prior_text,
             ) = data
+            domain_coverage = None
         elif len(data) == 11:
             (
                 observed_data,
@@ -1451,6 +1534,7 @@ class CSDI_Forecasting(CSDI_base):
                 trend_prior_num,
             ) = data
             trend_prior_text = trend_prior_num
+            domain_coverage = None
         elif len(data) == 10:
             (
                 observed_data,
@@ -1466,6 +1550,7 @@ class CSDI_Forecasting(CSDI_base):
             ) = data
             trend_prior_num = None
             trend_prior_text = None
+            domain_coverage = None
         else:
             (
                 observed_data,
@@ -1481,6 +1566,7 @@ class CSDI_Forecasting(CSDI_base):
             text_mask = None
             trend_prior_num = None
             trend_prior_text = None
+            domain_coverage = None
 
         with torch.no_grad():
             cond_mask = gt_mask
@@ -1501,7 +1587,7 @@ class CSDI_Forecasting(CSDI_base):
             trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
             if self.with_texts:
                 encoded_text, text_pooled, token_input = self._encode_text_source(texts)
-                benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align)
+                benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align, domain_coverage)
                 raw_gate = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
                 context_raw = self._build_text_context(encoded_text, raw_gate)
                 raw_token_len = encoded_text.shape[1]

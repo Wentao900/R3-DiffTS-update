@@ -384,6 +384,11 @@ args.text_trust_ret = float(config["model"].get("text_trust_ret", 0.75))
 args.text_trust_cot = float(config["model"].get("text_trust_cot", 0.5))
 args.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
 args.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
+args.text_trend_ret_scale = float(config["model"].get("text_trend_ret_scale", 0.5))
+args.text_trend_cot_scale = float(config["model"].get("text_trend_cot_scale", 0.3))
+args.text_trend_raw_weight = float(config["model"].get("text_trend_raw_weight", 1.0))
+args.text_trend_ret_weight = float(config["model"].get("text_trend_ret_weight", 0.35))
+args.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
 
 args.batch_size = config["train"]["batch_size"]
 

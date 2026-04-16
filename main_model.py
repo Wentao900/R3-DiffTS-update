@@ -105,6 +105,16 @@ class CSDI_base(nn.Module):
         self.text_quality_weights = quality_weights / max(float(np.sum(quality_weights)), 1e-6)
         self.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
         self.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
+        self.text_use_ret_in_context = bool(config["model"].get("text_use_ret_in_context", False))
+        self.text_use_cot_in_context = bool(config["model"].get("text_use_cot_in_context", False))
+        self.text_trend_only_guidance = bool(config["model"].get("text_trend_only_guidance", True))
+        self.text_trend_ret_scale = float(config["model"].get("text_trend_ret_scale", 0.5))
+        self.text_trend_cot_scale = float(config["model"].get("text_trend_cot_scale", 0.3))
+        self.text_trend_raw_weight = float(config["model"].get("text_trend_raw_weight", 1.0))
+        self.text_trend_ret_weight = float(config["model"].get("text_trend_ret_weight", 0.35))
+        self.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
+        self.text_numeric_align_gamma = float(config["model"].get("text_numeric_align_gamma", 2.0))
+        self.multi_res_trend_source = str(config["model"].get("multi_res_trend_source", "numeric_only")).lower()
 
         train_cfg = config.get("train", {})
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -479,12 +489,22 @@ class CSDI_base(nn.Module):
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
         return main_loss + auxiliary_loss
 
+    def _unwrap_diffmodel_output(self, output):
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
     def _run_diffusion_model(self, total_input, side_info, t, cfg_mask, timestep_emb=None, size_emb=None, context=None):
         if self.decomp:
-            predicted_seasonal, _ = self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb)
-            predicted_trend = self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb)
-            predicted, _ = predicted_seasonal + predicted_trend
-            return predicted
+            seasonal_context = None if self.text_trend_only_guidance else context
+            trend_context = context
+            predicted_seasonal = self._unwrap_diffmodel_output(
+                self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb, seasonal_context)
+            )
+            predicted_trend = self._unwrap_diffmodel_output(
+                self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb, trend_context)
+            )
+            return predicted_seasonal + predicted_trend
         if self.save_attn:
             predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
             return predicted
@@ -735,8 +755,14 @@ class CSDI_base(nn.Module):
                         if self.cfg:
                             res_input = res_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
                             moving_mean_input = moving_mean_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
-                        predicted_seasonal = self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
-                        predicted_trend = self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
+                        seasonal_context = None if self.text_trend_only_guidance else context
+                        trend_context = context
+                        predicted_seasonal = self._unwrap_diffmodel_output(
+                            self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, seasonal_context)
+                        ) # (2*B, K, L)
+                        predicted_trend = self._unwrap_diffmodel_output(
+                            self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, trend_context)
+                        ) # (2*B, K, L)
                         predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
                     else:
                         cond_obs = (cond_mask * observed_data).unsqueeze(1) # (B, 1, K, L)
@@ -874,49 +900,31 @@ class CSDI_Forecasting(CSDI_base):
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
         text_mask = batch["text_mark"].to(self.device).float().reshape(-1)
-        text_quality_total = batch.get("text_quality_total", batch.get("text_quality"))
-        if text_quality_total is not None:
-            text_quality_total = text_quality_total.to(self.device).float().reshape(-1)
+        text_quality_raw = batch.get("text_quality_raw")
+        if text_quality_raw is not None:
+            text_quality_raw = text_quality_raw.to(self.device).float().reshape(-1)
             if self.text_quality_gate:
-                gated_quality = text_quality_total.clamp(min=self.text_quality_min_scale, max=1.0)
+                gated_quality = text_quality_raw.clamp(min=self.text_quality_min_scale, max=1.0)
                 text_mask = (text_mask > 0).float() * gated_quality
         else:
-            text_quality_total = text_mask
-        text_gate_raw = batch.get("text_gate_raw")
-        text_gate_ret = batch.get("text_gate_ret")
-        text_gate_cot = batch.get("text_gate_cot")
-        if text_gate_raw is not None:
-            text_gate_raw = text_gate_raw.to(self.device).float().reshape(-1)
+            text_quality_raw = text_mask
+        trend_prior_num = batch.get("trend_prior_num", batch.get("trend_prior"))
+        if trend_prior_num is None:
+            trend_prior_num = torch.zeros((observed_data.shape[0], 3), device=self.device)
         else:
-            text_gate_raw = text_mask
-        if text_gate_ret is not None:
-            text_gate_ret = text_gate_ret.to(self.device).float().reshape(-1)
+            trend_prior_num = trend_prior_num.to(self.device).float()
+        trend_prior_text = batch.get("trend_prior_text")
+        if trend_prior_text is None:
+            trend_prior_text = trend_prior_num.clone()
         else:
-            text_gate_ret = torch.zeros_like(text_mask)
-        if text_gate_cot is not None:
-            text_gate_cot = text_gate_cot.to(self.device).float().reshape(-1)
-        else:
-            text_gate_cot = torch.zeros_like(text_mask)
-        trend_prior = batch.get("trend_prior")
-        if trend_prior is None:
-            trend_prior = torch.zeros((observed_data.shape[0], 3), device=self.device)
-        else:
-            trend_prior = trend_prior.to(self.device).float()
+            trend_prior_text = trend_prior_text.to(self.device).float()
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
         else:
             timesteps = None
         if self.with_texts:
-            texts = {
-                "raw": batch.get("text_raw", batch.get("texts")),
-                "ret": batch.get("text_ret", batch.get("retrieved_text")),
-                "cot": batch.get("text_cot", batch.get("cot_text")),
-                "gate_raw": text_gate_raw,
-                "gate_ret": text_gate_ret,
-                "gate_cot": text_gate_cot,
-                "quality_total": text_quality_total,
-            }
+            texts = batch.get("text_raw", batch.get("texts"))
         else:
             texts = None
 
@@ -940,7 +948,8 @@ class CSDI_Forecasting(CSDI_base):
             timesteps, 
             texts,
             text_mask, 
-            trend_prior,
+            trend_prior_num,
+            trend_prior_text,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -1019,6 +1028,20 @@ class CSDI_Forecasting(CSDI_base):
         strength = strength_choices[torch.randint(0, 3, (batch_size,), device=device)]
         volatility = volatility_choices[torch.randint(0, 3, (batch_size,), device=device)]
         return torch.stack([direction, strength, volatility], dim=1)
+
+    def fuse_trend_priors(self, trend_prior_num, trend_prior_text, text_mask=None):
+        if trend_prior_num is None and trend_prior_text is None:
+            return None, None
+        if trend_prior_num is None:
+            trend_prior_num = trend_prior_text
+        if trend_prior_text is None:
+            trend_prior_text = trend_prior_num
+        diff = torch.abs(trend_prior_text - trend_prior_num).sum(dim=1)
+        align = torch.exp(-self.text_numeric_align_gamma * diff).clamp(0.0, 1.0)
+        if text_mask is not None:
+            align = align * text_mask.reshape(-1).float().clamp(0.0, 1.0)
+        fused = align.unsqueeze(1) * trend_prior_text + (1.0 - align).unsqueeze(1) * trend_prior_num
+        return fused, align
     
     def _encode_text_source(self, text):
         token_input = self.tokenizer(
@@ -1031,35 +1054,6 @@ class CSDI_Forecasting(CSDI_base):
         return context, token_input
 
     def get_text_info(self, text, text_mask):
-        if isinstance(text, dict):
-            text_raw = text.get("raw")
-            text_ret = text.get("ret")
-            text_cot = text.get("cot")
-            gate_raw = text.get("gate_raw")
-            gate_ret = text.get("gate_ret")
-            gate_cot = text.get("gate_cot")
-            contexts = []
-            tokens_out = {}
-            for source_name, source_text, source_gate in (
-                ("raw", text_raw, gate_raw),
-                ("ret", text_ret, gate_ret),
-                ("cot", text_cot, gate_cot),
-            ):
-                if source_text is None or source_gate is None:
-                    continue
-                context_src, token_input = self._encode_text_source(source_text)
-                context_src = context_src * source_gate.unsqueeze(1).unsqueeze(1)
-                contexts.append(context_src)
-                if self.save_token:
-                    tokens_out[source_name] = self.tokenizer.batch_decode(token_input['input_ids'])
-            if len(contexts) == 0:
-                return (None, tokens_out) if self.save_token else None
-            context = torch.stack(contexts, dim=0).sum(dim=0)
-            context = context.permute(0, 2, 1)
-            if self.save_token:
-                return context, tokens_out
-            return context
-
         token_input = self.tokenizer(text,
                                      padding='max_length',
                                      truncation=True,
@@ -1100,7 +1094,7 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -1112,8 +1106,24 @@ class CSDI_Forecasting(CSDI_base):
                 timesteps,
                 texts,
                 text_mask,
-                trend_prior,
+                trend_prior_num,
+                trend_prior_text,
             ) = data
+        elif len(data) == 11:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior_num,
+            ) = data
+            trend_prior_text = trend_prior_num
         elif len(data) == 10:
             (
                 observed_data,
@@ -1127,7 +1137,8 @@ class CSDI_Forecasting(CSDI_base):
                 texts,
                 text_mask,
             ) = data
-            trend_prior = None
+            trend_prior_num = None
+            trend_prior_text = None
         else:
             (
                 observed_data,
@@ -1141,7 +1152,8 @@ class CSDI_Forecasting(CSDI_base):
             timesteps = None
             texts = None
             text_mask = None
-            trend_prior = None
+            trend_prior_num = None
+            trend_prior_text = None
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -1175,6 +1187,11 @@ class CSDI_Forecasting(CSDI_base):
                 context = self.get_text_info(texts, text_mask)
         else:
             context = None
+        trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
+        effective_text_mask = text_mask * trend_align if (text_mask is not None and trend_align is not None) else text_mask
+        trend_prior_for_multires = trend_prior_num
+        if self.multi_res_trend_source in {"text_fused", "fused", "text"} and trend_prior_eff is not None:
+            trend_prior_for_multires = trend_prior_eff
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
@@ -1188,13 +1205,13 @@ class CSDI_Forecasting(CSDI_base):
             timestep_emb=timestep_emb,
             size_emb=size_emb,
             context=context,
-            trend_prior=trend_prior,
-            text_mask=text_mask,
+            trend_prior=trend_prior_for_multires,
+            text_mask=effective_text_mask,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 11:
+        if len(data) == 12:
             (
                 observed_data,
                 observed_mask,
@@ -1206,8 +1223,24 @@ class CSDI_Forecasting(CSDI_base):
                 timesteps,
                 texts,
                 text_mask,
-                trend_prior,
+                trend_prior_num,
+                trend_prior_text,
             ) = data
+        elif len(data) == 11:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                feature_id,
+                timesteps,
+                texts,
+                text_mask,
+                trend_prior_num,
+            ) = data
+            trend_prior_text = trend_prior_num
         elif len(data) == 10:
             (
                 observed_data,
@@ -1221,7 +1254,8 @@ class CSDI_Forecasting(CSDI_base):
                 texts,
                 text_mask,
             ) = data
-            trend_prior = None
+            trend_prior_num = None
+            trend_prior_text = None
         else:
             (
                 observed_data,
@@ -1235,7 +1269,8 @@ class CSDI_Forecasting(CSDI_base):
             timesteps = None
             texts = None
             text_mask = None
-            trend_prior = None
+            trend_prior_num = None
+            trend_prior_text = None
 
         with torch.no_grad():
             cond_mask = gt_mask
@@ -1260,11 +1295,14 @@ class CSDI_Forecasting(CSDI_base):
                     context = self.get_text_info(texts, text_mask)
             else:
                 context = None
+            trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
             text_mask_f = text_mask.float() if text_mask is not None else None
+            if text_mask_f is not None and trend_align is not None:
+                text_mask_f = text_mask_f * trend_align.float()
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior_eff, text_mask=text_mask_f)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask_f)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior_eff, text_mask=text_mask_f)
 
         if self.save_attn:
             if self.save_token:

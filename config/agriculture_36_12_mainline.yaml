@@ -68,7 +68,7 @@ model:
   timestep_emb_cat: True
   with_texts: True
   relative_size_emb_cat: False
-  decomp: False
+  decomp: True
   llm: "bert"
   llm_layers: 0
   use_rag_cot: true
@@ -81,6 +81,16 @@ model:
   text_trust_cot: 0.5
   text_quality_drop_threshold: 0.3
   text_quality_mid_threshold: 0.6
+  text_use_ret_in_context: false
+  text_use_cot_in_context: false
+  text_trend_only_guidance: true
+  text_trend_ret_scale: 0.5
+  text_trend_cot_scale: 0.3
+  text_trend_raw_weight: 1.0
+  text_trend_ret_weight: 0.35
+  text_trend_cot_weight: 0.15
+  text_numeric_align_gamma: 2.0
+  multi_res_trend_source: numeric_only
 
 dataset:
   aug_noise_std: 0.01

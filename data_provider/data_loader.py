@@ -68,7 +68,12 @@ class Dataset_Custom(Dataset):
                  text_trust_ret=0.75,
                  text_trust_cot=0.5,
                  text_quality_drop_threshold=0.3,
-                 text_quality_mid_threshold=0.6):
+                 text_quality_mid_threshold=0.6,
+                 text_trend_ret_scale=0.5,
+                 text_trend_cot_scale=0.3,
+                 text_trend_raw_weight=1.0,
+                 text_trend_ret_weight=0.35,
+                 text_trend_cot_weight=0.15):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -124,6 +129,11 @@ class Dataset_Custom(Dataset):
         self.text_trust_cot = float(np.clip(text_trust_cot, 0.0, self.text_trust_ret))
         self.text_quality_drop_threshold = float(np.clip(text_quality_drop_threshold, 0.0, 1.0))
         self.text_quality_mid_threshold = float(np.clip(text_quality_mid_threshold, self.text_quality_drop_threshold, 1.0))
+        self.text_trend_ret_scale = float(max(text_trend_ret_scale, 0.0))
+        self.text_trend_cot_scale = float(max(text_trend_cot_scale, 0.0))
+        self.text_trend_raw_weight = float(max(text_trend_raw_weight, 0.0))
+        self.text_trend_ret_weight = float(max(text_trend_ret_weight, 0.0))
+        self.text_trend_cot_weight = float(max(text_trend_cot_weight, 0.0))
 
         self.root_path = root_path
         self.data_path = data_path
@@ -434,23 +444,30 @@ class Dataset_Custom(Dataset):
             "level": int(level),
         }
 
-    def _merge_trend_prior(self, raw_text, ret_text, cot_text, quality_pkg, seq_x):
+    def _build_numeric_trend_prior(self, seq_x):
+        return trend_fields_to_vector(self._infer_numeric_trend_fields(seq_x))
+
+    def _build_text_trend_prior(self, raw_text, ret_text, cot_text, quality_pkg, seq_x):
         source_fields = []
         source_weights = []
-        for source_name, text_value, gate_key in (
-            ("raw", raw_text, "gate_raw"),
-            ("ret", ret_text, "gate_ret"),
-            ("cot", cot_text, "gate_cot"),
+        raw_gate = float(np.clip(quality_pkg["quality_raw"], 0.0, 1.0))
+        ret_gate = min(float(np.clip(quality_pkg["quality_ret"], 0.0, 1.0)), self.text_trend_ret_scale * raw_gate)
+        cot_gate = min(float(np.clip(quality_pkg["quality_cot"], 0.0, 1.0)), self.text_trend_cot_scale * ret_gate)
+
+        for source_name, text_value, gate_value, source_weight in (
+            ("raw", raw_text, raw_gate, self.text_trend_raw_weight),
+            ("ret", ret_text, ret_gate, self.text_trend_ret_weight),
+            ("cot", cot_text, cot_gate, self.text_trend_cot_weight),
         ):
-            if quality_pkg[gate_key] <= 0:
+            if gate_value <= 0 or source_weight <= 0:
                 continue
             fields = self._infer_text_trend_fields(text_value)
             if fields is None:
                 continue
             source_fields.append(fields)
-            source_weights.append(float(quality_pkg[gate_key]))
+            source_weights.append(float(gate_value * source_weight))
         if len(source_fields) == 0:
-            return trend_fields_to_vector(self._infer_numeric_trend_fields(seq_x))
+            return self._build_numeric_trend_prior(seq_x)
         direction_map = {"down": -1.0, "flat": 0.0, "up": 1.0}
         strength_map = {"weak": 0.5, "moderate": 1.0, "strong": 1.5}
         volatility_map = {"low": 0.0, "medium": 0.5, "high": 1.0}
@@ -631,7 +648,8 @@ class Dataset_Custom(Dataset):
         if quality_pkg["quality_total"] <= 0:
             txt_mark = 0
 
-        trend_prior = self._merge_trend_prior(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
+        trend_prior_num = self._build_numeric_trend_prior(seq_x)
+        trend_prior_text = self._build_text_trend_prior(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -645,7 +663,7 @@ class Dataset_Custom(Dataset):
             'timepoints': np.arange(self.seq_len + self.pred_len).astype(np.float32), 
             'feature_id': np.arange(seq_x.shape[1]).astype(np.float32),
             'timesteps': timesteps,
-            'texts': composed_text,
+            'texts': raw_text,
             'text_raw': raw_text,
             'text_ret': rag_retrieved,
             'text_cot': cot_text,
@@ -661,7 +679,9 @@ class Dataset_Custom(Dataset):
             'text_level': np.asarray(quality_pkg['level'], dtype=np.int64),
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
-            'trend_prior': trend_prior
+            'trend_prior': trend_prior_num,
+            'trend_prior_num': trend_prior_num,
+            'trend_prior_text': trend_prior_text
         }
 
         return s

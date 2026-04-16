@@ -135,6 +135,7 @@ class CSDI_base(nn.Module):
         self.multi_res_group_balance = bool(train_cfg.get("multi_res_group_balance", True))
         self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
         self.text_consistency_weight = float(train_cfg.get("text_consistency_weight", 0.0))
+        self.text_benefit_weight = float(train_cfg.get("text_benefit_weight", 0.0))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
@@ -195,6 +196,14 @@ class CSDI_base(nn.Module):
                     pad_token = '[PAD]'
                     self.tokenizer.add_special_tokens({'pad_token': pad_token})
                     self.tokenizer.pad_token = pad_token
+            text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
+            benefit_hidden_dim = int(config["model"].get("text_benefit_hidden_dim", 128))
+            self.text_benefit_head = nn.Sequential(
+                nn.Linear(text_hidden_dim + 6, benefit_hidden_dim),
+                nn.LayerNorm(benefit_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(benefit_hidden_dim, 1),
+            )
 
         config_diff = config["diffusion"]
         config_diff["side_dim"] = self.emb_total_dim
@@ -397,18 +406,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, benefit_gate=benefit_gate
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -457,14 +466,17 @@ class CSDI_base(nn.Module):
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
             auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
-        if (
+        needs_text_baseline = (
             (not self.noise_esti)
             and self.training
             and self.with_texts
             and context is not None
-            and self.text_consistency_weight > 0
-            and text_mask is not None
-        ):
+            and (
+                (self.text_consistency_weight > 0 and text_mask is not None)
+                or (self.text_benefit_weight > 0 and benefit_gate is not None)
+            )
+        )
+        if needs_text_baseline:
             predicted_no_text = self._run_diffusion_model(
                 total_input,
                 side_info,
@@ -477,13 +489,23 @@ class CSDI_base(nn.Module):
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
-            consistency_loss = self._calc_text_consistency_loss(
-                predicted,
-                predicted_no_text,
-                target_mask,
-                text_mask,
-            )
-            auxiliary_loss = auxiliary_loss + self.text_consistency_weight * consistency_loss
+            if self.text_consistency_weight > 0 and text_mask is not None:
+                consistency_loss = self._calc_text_consistency_loss(
+                    predicted,
+                    predicted_no_text,
+                    target_mask,
+                    text_mask,
+                )
+                auxiliary_loss = auxiliary_loss + self.text_consistency_weight * consistency_loss
+            if self.text_benefit_weight > 0 and benefit_gate is not None:
+                benefit_loss = self._calc_text_benefit_loss(
+                    predicted,
+                    predicted_no_text,
+                    observed_data,
+                    target_mask,
+                    benefit_gate,
+                )
+                auxiliary_loss = auxiliary_loss + self.text_benefit_weight * benefit_loss
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -520,6 +542,18 @@ class CSDI_base(nn.Module):
         if not valid.any():
             return torch.zeros((), device=predicted.device)
         return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
+
+    def _calc_per_sample_forecast_loss(self, predicted, observed_data, target_mask):
+        residual = (observed_data - predicted) * target_mask
+        num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        return (residual ** 2).sum(dim=(1, 2)) / num_eval
+
+    def _calc_text_benefit_loss(self, predicted, predicted_no_text, observed_data, target_mask, benefit_gate):
+        text_loss = self._calc_per_sample_forecast_loss(predicted, observed_data, target_mask)
+        base_loss = self._calc_per_sample_forecast_loss(predicted_no_text, observed_data, target_mask)
+        target = (base_loss.detach() > text_loss.detach()).float()
+        gate = benefit_gate.reshape(-1).float().clamp(min=1e-4, max=1.0 - 1e-4)
+        return F.binary_cross_entropy(gate, target)
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -1050,18 +1084,52 @@ class CSDI_Forecasting(CSDI_base):
             truncation=True,
             return_tensors='pt',
         ).to(self.device)
-        context = self.text_encoder(**token_input).last_hidden_state
-        return context, token_input
+        encoded = self.text_encoder(**token_input).last_hidden_state
+        pooled = encoded.mean(dim=1)
+        return encoded, pooled, token_input
+
+    def _build_text_context(self, encoded_text, text_scale):
+        if encoded_text is None or text_scale is None:
+            return None
+        context = encoded_text * text_scale.unsqueeze(1).unsqueeze(1)
+        return context.permute(0, 2, 1)
+
+    def _summarize_numeric_context(self, observed_data, cond_mask):
+        lookback = observed_data[:, :, :self.lookback_len]
+        lookback_mask = cond_mask[:, :, :self.lookback_len]
+        denom = lookback_mask.sum(dim=2).clamp(min=1.0)
+        mean = (lookback * lookback_mask).sum(dim=2) / denom
+        centered = (lookback - mean.unsqueeze(2)) * lookback_mask
+        std = torch.sqrt((centered ** 2).sum(dim=2) / denom + 1e-6)
+        first = lookback[:, :, 0]
+        last = lookback[:, :, self.lookback_len - 1]
+        slope = last - first
+        mean_abs = (lookback.abs() * lookback_mask).sum(dim=2) / denom
+        return torch.stack(
+            [
+                mean.mean(dim=1),
+                std.mean(dim=1),
+                slope.mean(dim=1),
+                mean_abs.mean(dim=1),
+            ],
+            dim=1,
+        )
+
+    def _compute_text_benefit_gate(self, observed_data, cond_mask, text_pooled, text_mask, trend_align):
+        if text_pooled is None or text_mask is None:
+            return None
+        numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
+        quality = text_mask.reshape(-1, 1).float().clamp(0.0, 1.0)
+        if trend_align is None:
+            trend_align = torch.ones_like(quality.squeeze(1))
+        align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
+        benefit_input = torch.cat([numeric_summary, text_pooled, quality, align], dim=1)
+        benefit_gate = torch.sigmoid(self.text_benefit_head(benefit_input)).reshape(-1)
+        return benefit_gate
 
     def get_text_info(self, text, text_mask):
-        token_input = self.tokenizer(text,
-                                     padding='max_length',
-                                     truncation=True,
-                                     return_tensors='pt',
-                                     ).to(self.device)
-        context = self.text_encoder(**token_input).last_hidden_state
-        context = context * text_mask.unsqueeze(1).unsqueeze(1)
-        context = context.permute(0, 2, 1) 
+        encoded_text, _, token_input = self._encode_text_source(text)
+        context = self._build_text_context(encoded_text, text_mask)
         if self.save_token:
             tokens_str = self.tokenizer.batch_decode(token_input['input_ids'])
             return context, tokens_str
@@ -1181,14 +1249,15 @@ class CSDI_Forecasting(CSDI_base):
             size_emb = None
 
         if self.with_texts:
-            if self.save_token:
-                context, _ = self.get_text_info(texts, text_mask)
-            else:
-                context = self.get_text_info(texts, text_mask)
+            encoded_text, text_pooled, token_input = self._encode_text_source(texts)
         else:
-            context = None
+            encoded_text = None
+            text_pooled = None
         trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
-        effective_text_mask = text_mask * trend_align if (text_mask is not None and trend_align is not None) else text_mask
+        benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align)
+        semantic_text_mask = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
+        context = self._build_text_context(encoded_text, semantic_text_mask) if encoded_text is not None else None
+        effective_text_mask = semantic_text_mask * trend_align if (semantic_text_mask is not None and trend_align is not None) else semantic_text_mask
         trend_prior_for_multires = trend_prior_num
         if self.multi_res_trend_source in {"text_fused", "fused", "text"} and trend_prior_eff is not None:
             trend_prior_for_multires = trend_prior_eff
@@ -1207,6 +1276,7 @@ class CSDI_Forecasting(CSDI_base):
             context=context,
             trend_prior=trend_prior_for_multires,
             text_mask=effective_text_mask,
+            benefit_gate=benefit_gate,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -1288,15 +1358,21 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 size_emb = None
 
+            trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
             if self.with_texts:
+                encoded_text, text_pooled, token_input = self._encode_text_source(texts)
+                benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align)
+                semantic_text_mask = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
+                context = self._build_text_context(encoded_text, semantic_text_mask)
                 if self.save_token:
-                    context, tokens = self.get_text_info(texts, text_mask)
-                else:
-                    context = self.get_text_info(texts, text_mask)
+                    tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
                 context = None
-            trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
+                benefit_gate = None
+                semantic_text_mask = text_mask
             text_mask_f = text_mask.float() if text_mask is not None else None
+            if semantic_text_mask is not None:
+                text_mask_f = semantic_text_mask.float()
             if text_mask_f is not None and trend_align is not None:
                 text_mask_f = text_mask_f * trend_align.float()
             if self.save_attn:

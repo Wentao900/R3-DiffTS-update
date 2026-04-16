@@ -116,6 +116,7 @@ class CSDI_base(nn.Module):
         self.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
         self.text_numeric_align_gamma = float(config["model"].get("text_numeric_align_gamma", 2.0))
         self.multi_res_trend_source = str(config["model"].get("multi_res_trend_source", "numeric_only")).lower()
+        self.text_aug_max_ratio = float(config["model"].get("text_aug_max_ratio", 0.3))
 
         train_cfg = config.get("train", {})
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -137,6 +138,8 @@ class CSDI_base(nn.Module):
         self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
         self.text_consistency_weight = float(train_cfg.get("text_consistency_weight", 0.0))
         self.text_benefit_weight = float(train_cfg.get("text_benefit_weight", 0.0))
+        self.text_aug_benefit_weight = float(train_cfg.get("text_aug_benefit_weight", 0.0))
+        self.text_aug_reg_weight = float(train_cfg.get("text_aug_reg_weight", 0.0))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
@@ -198,12 +201,27 @@ class CSDI_base(nn.Module):
                     self.tokenizer.add_special_tokens({'pad_token': pad_token})
                     self.tokenizer.pad_token = pad_token
             text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
+            self.text_hidden_dim = int(text_hidden_dim)
             benefit_hidden_dim = int(config["model"].get("text_benefit_hidden_dim", 128))
             self.text_benefit_head = nn.Sequential(
                 nn.Linear(text_hidden_dim + 6, benefit_hidden_dim),
                 nn.LayerNorm(benefit_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(benefit_hidden_dim, 1),
+            )
+            aug_hidden_dim = int(config["model"].get("text_aug_hidden_dim", 128))
+            aug_input_dim = text_hidden_dim * 2 + 9
+            self.text_aug_gate_head = nn.Sequential(
+                nn.Linear(aug_input_dim, aug_hidden_dim),
+                nn.LayerNorm(aug_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(aug_hidden_dim, 1),
+            )
+            self.text_aug_adapter = nn.Sequential(
+                nn.Linear(aug_input_dim, aug_hidden_dim),
+                nn.LayerNorm(aug_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(aug_hidden_dim, text_hidden_dim),
             )
 
         config_diff = config["diffusion"]
@@ -407,18 +425,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, benefit_gate=benefit_gate
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, benefit_gate=benefit_gate, context_raw=context_raw, aug_gate=aug_gate
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -471,10 +489,12 @@ class CSDI_base(nn.Module):
             (not self.noise_esti)
             and self.training
             and self.with_texts
-            and context is not None
+            and (context is not None or context_raw is not None)
             and (
                 (self.text_consistency_weight > 0 and text_mask is not None)
                 or (self.text_benefit_weight > 0 and benefit_gate is not None)
+                or (self.text_aug_benefit_weight > 0 and aug_gate is not None)
+                or (self.text_aug_reg_weight > 0 and aug_gate is not None)
             )
         )
         if needs_text_baseline:
@@ -490,23 +510,59 @@ class CSDI_base(nn.Module):
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
-            if self.text_consistency_weight > 0 and text_mask is not None:
+            predicted_raw = None
+            if context_raw is not None and (
+                self.text_consistency_weight > 0
+                or self.text_benefit_weight > 0
+                or self.text_aug_benefit_weight > 0
+                or self.text_aug_reg_weight > 0
+            ):
+                predicted_raw = self._run_diffusion_model(
+                    total_input,
+                    side_info,
+                    t,
+                    cfg_mask,
+                    timestep_emb=timestep_emb,
+                    size_emb=size_emb,
+                    context=context_raw,
+                )
+                if self.timestep_branch and timesteps is not None:
+                    predicted_from_timestep = self.timestep_pred(timesteps)
+                    predicted_raw = 0.9 * predicted_raw + 0.1 * predicted_from_timestep
+            if self.text_consistency_weight > 0 and text_mask is not None and predicted_raw is not None:
                 consistency_loss = self._calc_text_consistency_loss(
-                    predicted,
+                    predicted_raw,
                     predicted_no_text,
                     target_mask,
                     text_mask,
                 )
                 auxiliary_loss = auxiliary_loss + self.text_consistency_weight * consistency_loss
-            if self.text_benefit_weight > 0 and benefit_gate is not None:
+            if self.text_benefit_weight > 0 and benefit_gate is not None and predicted_raw is not None:
                 benefit_loss = self._calc_text_benefit_loss(
-                    predicted,
+                    predicted_raw,
                     predicted_no_text,
                     observed_data,
                     target_mask,
                     benefit_gate,
                 )
                 auxiliary_loss = auxiliary_loss + self.text_benefit_weight * benefit_loss
+            if self.text_aug_benefit_weight > 0 and aug_gate is not None and predicted_raw is not None:
+                aug_benefit_loss = self._calc_text_benefit_loss(
+                    predicted,
+                    predicted_raw,
+                    observed_data,
+                    target_mask,
+                    aug_gate,
+                )
+                auxiliary_loss = auxiliary_loss + self.text_aug_benefit_weight * aug_benefit_loss
+            if self.text_aug_reg_weight > 0 and aug_gate is not None and predicted_raw is not None:
+                aug_reg_loss = self._calc_text_aug_reg_loss(
+                    predicted,
+                    predicted_raw,
+                    target_mask,
+                    aug_gate,
+                )
+                auxiliary_loss = auxiliary_loss + self.text_aug_reg_weight * aug_reg_loss
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -555,6 +611,16 @@ class CSDI_base(nn.Module):
         target = (base_loss.detach() > text_loss.detach()).float()
         gate = benefit_gate.reshape(-1).float().clamp(min=1e-4, max=1.0 - 1e-4)
         return F.binary_cross_entropy(gate, target)
+
+    def _calc_text_aug_reg_loss(self, predicted_aug, predicted_raw, target_mask, aug_gate):
+        diff = (predicted_aug - predicted_raw) * target_mask
+        num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        per_sample = (diff ** 2).sum(dim=(1, 2)) / num_eval
+        weights = 1.0 - aug_gate.reshape(-1).float().clamp(min=0.0, max=1.0)
+        valid = weights > 0
+        if not valid.any():
+            return torch.zeros((), device=predicted_aug.device)
+        return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -1128,6 +1194,66 @@ class CSDI_Forecasting(CSDI_base):
         benefit_gate = torch.sigmoid(self.text_benefit_head(benefit_input)).reshape(-1)
         return benefit_gate
 
+    def _get_aug_inputs(self, batch):
+        text_ret = batch.get("text_ret", batch.get("retrieved_text"))
+        text_cot = batch.get("text_cot", batch.get("cot_text"))
+        quality_ret = batch.get("text_quality_ret")
+        quality_cot = batch.get("text_quality_cot")
+        if quality_ret is not None:
+            quality_ret = quality_ret.to(self.device).float().reshape(-1)
+        if quality_cot is not None:
+            quality_cot = quality_cot.to(self.device).float().reshape(-1)
+        return text_ret, text_cot, quality_ret, quality_cot
+
+    def _build_augmented_context(
+        self,
+        batch,
+        context_raw,
+        raw_gate,
+        trend_prior_num,
+        trend_prior_text,
+        trend_align,
+        raw_token_len,
+    ):
+        if context_raw is None or raw_gate is None or raw_token_len is None:
+            return context_raw, None
+        text_ret, text_cot, quality_ret, quality_cot = self._get_aug_inputs(batch)
+        if text_ret is None or text_cot is None or quality_ret is None or quality_cot is None:
+            return context_raw, None
+        _, pooled_ret, _ = self._encode_text_source(text_ret)
+        _, pooled_cot, _ = self._encode_text_source(text_cot)
+        if trend_prior_num is None:
+            trend_prior_num = torch.zeros((pooled_ret.shape[0], 3), device=self.device)
+        if trend_prior_text is None:
+            trend_prior_text = trend_prior_num
+        if trend_align is None:
+            trend_align = torch.ones((pooled_ret.shape[0],), device=self.device)
+        align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
+        q_ret = quality_ret.reshape(-1, 1).float().clamp(0.0, 1.0)
+        q_cot = quality_cot.reshape(-1, 1).float().clamp(0.0, 1.0)
+        aug_features = torch.cat(
+            [
+                pooled_ret,
+                pooled_cot,
+                trend_prior_text.float(),
+                trend_prior_num.float(),
+                q_ret,
+                q_cot,
+                align,
+            ],
+            dim=1,
+        )
+        aug_base_gate = torch.sigmoid(self.text_aug_gate_head(aug_features)).reshape(-1)
+        aug_available = torch.maximum(q_ret.reshape(-1), q_cot.reshape(-1))
+        raw_gate = raw_gate.reshape(-1).float().clamp(0.0, 1.0)
+        aug_gate = self.text_aug_max_ratio * raw_gate * aug_base_gate * aug_available
+        if torch.all(aug_gate <= 0):
+            return context_raw, aug_gate
+        aug_residual = self.text_aug_adapter(aug_features)
+        aug_residual = aug_residual.unsqueeze(2).expand(-1, self.text_hidden_dim, raw_token_len)
+        context_aug = context_raw + aug_gate.reshape(-1, 1, 1) * aug_residual
+        return context_aug, aug_gate
+
     def get_text_info(self, text, text_mask):
         encoded_text, _, token_input = self._encode_text_source(text)
         context = self._build_text_context(encoded_text, text_mask)
@@ -1256,8 +1382,19 @@ class CSDI_Forecasting(CSDI_base):
             text_pooled = None
         trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, text_mask)
         benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align)
-        semantic_text_mask = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
-        context = self._build_text_context(encoded_text, semantic_text_mask) if encoded_text is not None else None
+        raw_gate = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
+        context_raw = self._build_text_context(encoded_text, raw_gate) if encoded_text is not None else None
+        raw_token_len = encoded_text.shape[1] if encoded_text is not None else None
+        context, aug_gate = self._build_augmented_context(
+            batch,
+            context_raw,
+            raw_gate,
+            trend_prior_num,
+            trend_prior_text,
+            trend_align,
+            raw_token_len,
+        )
+        semantic_text_mask = raw_gate
         effective_text_mask = semantic_text_mask * trend_align if (semantic_text_mask is not None and trend_align is not None) else semantic_text_mask
         trend_prior_for_multires = trend_prior_num
         if self.multi_res_trend_source in {"text_fused", "fused", "text"} and trend_prior_eff is not None:
@@ -1278,6 +1415,8 @@ class CSDI_Forecasting(CSDI_base):
             trend_prior=trend_prior_for_multires,
             text_mask=effective_text_mask,
             benefit_gate=benefit_gate,
+            context_raw=context_raw,
+            aug_gate=aug_gate,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -1363,13 +1502,26 @@ class CSDI_Forecasting(CSDI_base):
             if self.with_texts:
                 encoded_text, text_pooled, token_input = self._encode_text_source(texts)
                 benefit_gate = self._compute_text_benefit_gate(observed_data, cond_mask, text_pooled, text_mask, trend_align)
-                semantic_text_mask = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
-                context = self._build_text_context(encoded_text, semantic_text_mask)
+                raw_gate = text_mask * benefit_gate if (text_mask is not None and benefit_gate is not None) else text_mask
+                context_raw = self._build_text_context(encoded_text, raw_gate)
+                raw_token_len = encoded_text.shape[1]
+                context, aug_gate = self._build_augmented_context(
+                    batch,
+                    context_raw,
+                    raw_gate,
+                    trend_prior_num,
+                    trend_prior_text,
+                    trend_align,
+                    raw_token_len,
+                )
+                semantic_text_mask = raw_gate
                 if self.save_token:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
                 context = None
                 benefit_gate = None
+                aug_gate = None
+                context_raw = None
                 semantic_text_mask = text_mask
             text_mask_f = text_mask.float() if text_mask is not None else None
             if semantic_text_mask is not None:

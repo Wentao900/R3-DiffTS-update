@@ -32,10 +32,6 @@ train:
   adaptive_noise_scale: 0.0
   text_consistency_weight: 0.05
   auxiliary_loss_max_ratio: 0.5
-  text_incremental_risk_gamma: 2.0
-  text_incremental_loss_weight: 0.05
-  text_tail_loss_weight: 0.02
-  text_tail_topk_ratio: 0.2
 
 diffusion:
   layers: 6
@@ -85,8 +81,6 @@ model:
   text_trust_cot: 0.5
   text_quality_drop_threshold: 0.3
   text_quality_mid_threshold: 0.6
-  text_ret_increment_scale: 0.75
-  text_cot_increment_scale: 0.5
 
 dataset:
   aug_noise_std: 0.01

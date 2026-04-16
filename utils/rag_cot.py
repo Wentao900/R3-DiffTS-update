@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 @dataclass
@@ -102,7 +102,7 @@ class RAGCoTPipeline:
     def _init_generator(self, config: RAGCoTConfig):
         if config.cot_model is None:
             return None
-        device_index = self._resolve_device_index(config.device)
+        device = self._resolve_device(config.device)
         trust_remote = config.trust_remote_code or (config.cot_model and "qwen" in config.cot_model.lower())
         try:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -116,18 +116,26 @@ class RAGCoTPipeline:
             }
             if config.load_in_8bit:
                 model_kwargs["load_in_8bit"] = True
+                model_kwargs["device_map"] = "auto"
             if config.load_in_4bit:
                 model_kwargs["load_in_4bit"] = True
+                model_kwargs["device_map"] = "auto"
             model = AutoModelForCausalLM.from_pretrained(
                 config.cot_model,
                 **model_kwargs,
             )
-            return pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                device=device_index,
-            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            if device.type == "cuda" and not (config.load_in_8bit or config.load_in_4bit):
+                model = model.to(device)
+            model.eval()
+            return {
+                "model": model,
+                "tokenizer": tokenizer,
+                "device": device,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
         except Exception as exc:  # noqa: BLE001
             warnings.warn(
                 f"Falling back to template CoT because model '{config.cot_model}' "
@@ -139,13 +147,12 @@ class RAGCoTPipeline:
             )
             return None
 
-    def _resolve_device_index(self, device: Optional[str]) -> int:
+    def _resolve_device(self, device: Optional[str]) -> torch.device:
         if device is None:
-            return 0 if torch.cuda.is_available() else -1
+            return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         if device.startswith("cuda") and torch.cuda.is_available():
-            parts = device.split(":")
-            return int(parts[1]) if len(parts) > 1 else 0
-        return -1
+            return torch.device(device)
+        return torch.device("cpu")
 
     def _retrieve(self, query_text: str, top_k: Optional[int] = None) -> List[str]:
         k = self.config.top_k if top_k is None else int(top_k)
@@ -299,15 +306,29 @@ class RAGCoTPipeline:
         if self.generator is None:
             return self._fallback_cot(numeric_summary, retrieved)
         try:
-            output = self.generator(
+            tokenizer = self.generator["tokenizer"]
+            model = self.generator["model"]
+            device = self.generator["device"]
+            token_input = tokenizer(
                 prompt,
-                max_new_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-                num_return_sequences=1,
-                do_sample=True,
+                return_tensors="pt",
+                truncation=True,
             )
-            text = output[0]["generated_text"]
-            return text[len(prompt) :].strip() if text.startswith(prompt) else text.strip()
+            if not (self.config.load_in_8bit or self.config.load_in_4bit):
+                token_input = {k: v.to(device) for k, v in token_input.items()}
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    **token_input,
+                    max_new_tokens=self.config.max_new_tokens,
+                    temperature=self.config.temperature,
+                    do_sample=self.config.temperature > 0,
+                    num_return_sequences=1,
+                    pad_token_id=self.generator["pad_token_id"],
+                    eos_token_id=self.generator["eos_token_id"],
+                )
+            generated_ids = output_ids[0][token_input["input_ids"].shape[1]:]
+            text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return text.strip()
         except Exception as exc:  # noqa: BLE001
             warnings.warn(f"Falling back to template CoT because generation failed ({exc}).")
             return self._fallback_cot(numeric_summary, retrieved)

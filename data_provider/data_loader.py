@@ -64,6 +64,8 @@ class Dataset_Custom(Dataset):
                  aug_segment_scale_std=0.1, adaptive_noise_scale=0.0,
                  text_quality_gate=True, text_quality_min_scale=0.0,
                  text_quality_coverage_mix=0.5,
+                 text_recency_tau_days=14.0,
+                 text_coverage_kappa=3.0,
                  text_quality_weights=None,
                  text_trust_ret=0.75,
                  text_trust_cot=0.5,
@@ -119,6 +121,8 @@ class Dataset_Custom(Dataset):
         self.text_quality_gate = bool(text_quality_gate)
         self.text_quality_min_scale = float(text_quality_min_scale)
         self.text_quality_coverage_mix = float(text_quality_coverage_mix)
+        self.text_recency_tau_days = float(max(text_recency_tau_days, 1e-6))
+        self.text_coverage_kappa = float(max(text_coverage_kappa, 1e-6))
         source_weights = text_quality_weights if text_quality_weights is not None else [0.5, 0.3, 0.2]
         if len(source_weights) != 3:
             source_weights = [0.5, 0.3, 0.2]
@@ -403,10 +407,7 @@ class Dataset_Custom(Dataset):
         informativeness = self._score_text_informativeness(text)
         alignment = self._score_text_alignment(text, seq_x)
         trust = self._get_source_trust(source_name)
-        mix = min(max(self.text_quality_coverage_mix, 0.0), 1.0)
-        coverage = self.domain_text_coverage if source_name == "raw" else 1.0
         quality = availability * informativeness * alignment * trust
-        quality = (1.0 - mix) * quality + mix * quality * coverage
         quality = max(quality, self.text_quality_min_scale if quality > 0 else 0.0)
         return float(np.clip(quality, 0.0, 1.0))
 
@@ -447,9 +448,15 @@ class Dataset_Custom(Dataset):
     def _build_numeric_trend_prior(self, seq_x):
         return trend_fields_to_vector(self._infer_numeric_trend_fields(seq_x))
 
-    def _build_text_trend_prior(self, raw_text, ret_text, cot_text, quality_pkg, seq_x):
+    def _build_text_trend_components(self, raw_text, ret_text, cot_text, quality_pkg, seq_x):
         source_fields = []
         source_weights = []
+        base_prior = self._build_numeric_trend_prior(seq_x)
+        source_vectors = {
+            "raw": base_prior,
+            "ret": base_prior,
+            "cot": base_prior,
+        }
         raw_gate = float(np.clip(quality_pkg["quality_raw"], 0.0, 1.0))
         ret_gate = min(float(np.clip(quality_pkg["quality_ret"], 0.0, 1.0)), self.text_trend_ret_scale * raw_gate)
         cot_gate = min(float(np.clip(quality_pkg["quality_cot"], 0.0, 1.0)), self.text_trend_cot_scale * ret_gate)
@@ -466,8 +473,9 @@ class Dataset_Custom(Dataset):
                 continue
             source_fields.append(fields)
             source_weights.append(float(gate_value * source_weight))
+            source_vectors[source_name] = trend_fields_to_vector(fields)
         if len(source_fields) == 0:
-            return self._build_numeric_trend_prior(seq_x)
+            return base_prior, source_vectors
         direction_map = {"down": -1.0, "flat": 0.0, "up": 1.0}
         strength_map = {"weak": 0.5, "moderate": 1.0, "strong": 1.5}
         volatility_map = {"low": 0.0, "medium": 0.5, "high": 1.0}
@@ -480,7 +488,55 @@ class Dataset_Custom(Dataset):
             direction_value += norm_weight * direction_map[fields["direction"]]
             strength_value += norm_weight * strength_map[fields["strength"]]
             volatility_value += norm_weight * volatility_map[fields["volatility"]]
-        return np.array([direction_value, strength_value, volatility_value], dtype=np.float32)
+        aggregate = np.array([direction_value, strength_value, volatility_value], dtype=np.float32)
+        return aggregate, source_vectors
+
+    def _build_text_trend_prior(self, raw_text, ret_text, cot_text, quality_pkg, seq_x):
+        aggregate, _ = self._build_text_trend_components(raw_text, ret_text, cot_text, quality_pkg, seq_x)
+        return aggregate
+
+    def _build_window_evidence(self, quality_pkg, trend_prior_num, trend_prior_text, source_priors, window_meta):
+        report_count = float(max(window_meta.get("report_count", 0), 0))
+        coverage = report_count / (report_count + self.text_coverage_kappa) if report_count > 0 else 0.0
+
+        recency_days = window_meta.get("recency_days")
+        if recency_days is None:
+            recency = 0.0
+        else:
+            recency = float(np.exp(-float(max(recency_days, 0.0)) / self.text_recency_tau_days))
+
+        source_vectors = []
+        source_weights = []
+        for source_name, quality_key in (("raw", "quality_raw"), ("ret", "quality_ret"), ("cot", "quality_cot")):
+            prior = source_priors.get(source_name)
+            quality = float(np.clip(quality_pkg.get(quality_key, 0.0), 0.0, 1.0))
+            if prior is None or quality <= 0:
+                continue
+            source_vectors.append(np.asarray(prior, dtype=np.float32))
+            source_weights.append(quality)
+        if len(source_vectors) <= 1:
+            consistency = 1.0 if len(source_vectors) == 1 else 0.0
+        else:
+            weights = np.asarray(source_weights, dtype=np.float32)
+            weights = weights / max(float(weights.sum()), 1e-6)
+            stacked = np.stack(source_vectors, axis=0)
+            mean_vec = np.sum(stacked * weights[:, None], axis=0)
+            mean_l1 = np.abs(stacked - mean_vec[None, :]).sum(axis=1).mean()
+            consistency = float(np.exp(-mean_l1))
+
+        trend_diff = float(np.abs(np.asarray(trend_prior_text) - np.asarray(trend_prior_num)).sum())
+        numeric_align = float(np.exp(-2.0 * trend_diff))
+
+        return np.asarray(
+            [
+                float(np.clip(quality_pkg.get("quality_total", 0.0), 0.0, 1.0)),
+                float(np.clip(coverage, 0.0, 1.0)),
+                float(np.clip(recency, 0.0, 1.0)),
+                float(np.clip(consistency, 0.0, 1.0)),
+                float(np.clip(numeric_align, 0.0, 1.0)),
+            ],
+            dtype=np.float32,
+        )
 
     def _apply_lookback_augmentation(self, seq_x):
         augmented = np.array(seq_x, copy=True)
@@ -575,10 +631,20 @@ class Dataset_Custom(Dataset):
         self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[(df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)]
         self.search_df = df_search[['start_date', 'end_date', 'fact']]
 
+    def _collect_window_reports(self, start_date, end_date):
+        return self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
+
     def collect_text(self, start_date, end_date):
-        report = self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
+        report = self._collect_window_reports(start_date, end_date)
         def add_datemark(row):
             return row['start_date'].strftime("%Y-%m-%d") + " to " + row['end_date'].strftime("%Y-%m-%d") + ": " + row['fact']
+        meta = {
+            "report_count": int(len(report)),
+            "recency_days": None,
+        }
+        if not report.empty:
+            latest_end = report['end_date'].max()
+            meta["recency_days"] = float(max((pd.Timestamp(end_date) - latest_end).days, 0))
         if not report.empty:
             report = report.apply(add_datemark, axis=1).to_list()
             report.insert(0, self.desc)
@@ -599,7 +665,7 @@ class Dataset_Custom(Dataset):
         if len(tokens) > self.max_text_tokens:
             tokens = tokens[:self.max_text_tokens]
         all_txt = ' '.join(tokens)
-        return all_txt, text_mark
+        return all_txt, text_mark, meta
     
     def __getitem__(self, index):
         s_begin = index
@@ -619,7 +685,7 @@ class Dataset_Custom(Dataset):
         text_begin = s_end - self.text_len
         text_end = s_end
 
-        raw_text, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
+        raw_text, txt_mark, text_meta = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
         text_dropped = False
         if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
             raw_text, txt_mark = 'NA', 0
@@ -649,7 +715,14 @@ class Dataset_Custom(Dataset):
             txt_mark = 0
 
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
-        trend_prior_text = self._build_text_trend_prior(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
+        trend_prior_text, source_trend_priors = self._build_text_trend_components(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
+        text_evidence_vec = self._build_window_evidence(
+            quality_pkg,
+            trend_prior_num,
+            trend_prior_text,
+            source_trend_priors,
+            text_meta,
+        )
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -682,6 +755,7 @@ class Dataset_Custom(Dataset):
             'trend_prior': trend_prior_num,
             'trend_prior_num': trend_prior_num,
             'trend_prior_text': trend_prior_text,
+            'text_evidence_vec': text_evidence_vec,
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
 

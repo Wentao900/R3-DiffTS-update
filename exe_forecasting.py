@@ -244,13 +244,15 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
         }
 
 
-def write_run_summary(foldername, config, horizon_info, metrics=None, extra=None):
+def write_run_summary(foldername, config, horizon_info, metrics=None, guide_sweep=None, extra=None):
     summary = {
         "config": config,
         "multi_res": horizon_info,
     }
     if metrics is not None:
         summary["metrics"] = metrics
+    if guide_sweep is not None:
+        summary["guide_sweep"] = guide_sweep
     if extra is not None:
         summary.update(extra)
     with open(os.path.join(foldername, "run_summary.json"), "w") as f:
@@ -379,6 +381,8 @@ args.adaptive_noise_scale = float(config.get("train", {}).get("adaptive_noise_sc
 args.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
 args.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
 args.text_quality_coverage_mix = float(config["model"].get("text_quality_coverage_mix", 0.5))
+args.text_recency_tau_days = float(dataset_cfg.get("text_recency_tau_days", 14.0))
+args.text_coverage_kappa = float(dataset_cfg.get("text_coverage_kappa", 3.0))
 args.text_quality_weights = config["model"].get("text_quality_weights", [0.5, 0.3, 0.2])
 args.text_trust_ret = float(config["model"].get("text_trust_ret", 0.75))
 args.text_trust_cot = float(config["model"].get("text_trust_cot", 0.5))
@@ -441,6 +445,7 @@ if args.modelfolder == "":
 else:
     model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth"))
 model.target_dim = target_dim
+guide_sweep_metrics = []
 if config["diffusion"]["cfg"]:
     best_mse = 10e10
     best_metrics = None
@@ -459,6 +464,7 @@ if config["diffusion"]["cfg"]:
             save_token=args.save_token,
             save_trend_prior=args.save_trend_prior
         )
+        guide_sweep_metrics.append(metrics)
         if metrics["MSE"] < best_mse:
             best_mse = metrics["MSE"]
             best_metrics = metrics
@@ -475,6 +481,7 @@ else:
             save_token=args.save_token,
             save_trend_prior=args.save_trend_prior
         )
+    guide_sweep_metrics.append(best_metrics)
 
 if config["diffusion"]["cfg"] and best_metrics is None:
     best_metrics = {"MSE": best_mse}
@@ -487,4 +494,5 @@ write_run_summary(
         "model_state": model.get_multi_res_debug_state(),
     },
     metrics=best_metrics,
+    guide_sweep=guide_sweep_metrics,
 )

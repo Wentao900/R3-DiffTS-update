@@ -46,6 +46,8 @@ def data_provider(args, flag):
         extra_kwargs['text_quality_gate'] = getattr(args, "text_quality_gate", True)
         extra_kwargs['text_quality_min_scale'] = getattr(args, "text_quality_min_scale", 0.0)
         extra_kwargs['text_quality_coverage_mix'] = getattr(args, "text_quality_coverage_mix", 0.5)
+        extra_kwargs['text_recency_tau_days'] = getattr(args, "text_recency_tau_days", 14.0)
+        extra_kwargs['text_coverage_kappa'] = getattr(args, "text_coverage_kappa", 3.0)
         extra_kwargs['text_quality_weights'] = getattr(args, "text_quality_weights", [0.5, 0.3, 0.2])
         extra_kwargs['text_trust_ret'] = getattr(args, "text_trust_ret", 0.75)
         extra_kwargs['text_trust_cot'] = getattr(args, "text_trust_cot", 0.5)

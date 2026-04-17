@@ -85,7 +85,7 @@ model:
   use_rag_cot: true
   use_two_stage_rag: true
   text_quality_gate: true
-  text_quality_min_scale: 0.05
+  text_quality_min_scale: 0.0
   text_quality_coverage_mix: 0.5
   text_quality_weights: [0.5, 0.3, 0.2]
   text_trust_ret: 0.75
@@ -112,12 +112,17 @@ model:
   text_max_length: 160
   event_text_max_length: 64
   text_encode_batch_size: 4
-  use_gate_min: 0.08
-  strength_gate_min: 0.03
+  use_gate_min: 0.1
+  strength_gate_min: 0.04
   strength_use_mix_floor: 0.5
   horizon_strength_bias: 0.15
+  text_context_ratio_min: 0.1
+  text_context_ratio_max: 0.6
+  text_context_max_base: 0.03
+  text_context_max_boost: 0.07
+  text_context_horizon_bias: 0.15
   use_gate_warmup_epochs: 10
-  strength_gate_warmup_epochs: 20
+  strength_gate_warmup_epochs: 16
 
 dataset:
   aug_noise_std: 0.01

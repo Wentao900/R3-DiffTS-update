@@ -138,6 +138,11 @@ class CSDI_base(nn.Module):
         self.strength_gate_min = float(config["model"].get("strength_gate_min", 0.0))
         self.strength_use_mix_floor = float(config["model"].get("strength_use_mix_floor", 0.5))
         self.horizon_strength_bias = float(config["model"].get("horizon_strength_bias", 0.0))
+        self.text_context_ratio_min = float(config["model"].get("text_context_ratio_min", config["model"].get("text_context_strength_scale", 0.1)))
+        self.text_context_ratio_max = float(config["model"].get("text_context_ratio_max", 0.6))
+        self.text_context_max_base = float(config["model"].get("text_context_max_base", min(config["model"].get("text_context_strength_max", 0.03), 1.0)))
+        self.text_context_max_boost = float(config["model"].get("text_context_max_boost", 0.07))
+        self.text_context_horizon_bias = float(config["model"].get("text_context_horizon_bias", config["model"].get("horizon_strength_bias", 0.0)))
         self.use_gate_warmup_epochs = int(config["model"].get("use_gate_warmup_epochs", max(1, int(train_cfg.get("lr_warmup_epochs", 0)))))
         self.strength_gate_warmup_epochs = int(config["model"].get("strength_gate_warmup_epochs", max(self.use_gate_warmup_epochs + 1, int(0.2 * max(int(train_cfg.get("epochs", 1)), 1)))))
         self.text_use_weight = float(train_cfg.get("text_use_weight", train_cfg.get("text_benefit_weight", 0.0)))
@@ -1436,13 +1441,20 @@ class CSDI_Forecasting(CSDI_base):
             return value
         return torch.full((batch_size,), float(value), device=device)
 
-    def _update_reliability_debug(self, use_gate, strength_gate=None, evidence_vec=None):
-        if use_gate is None and strength_gate is None:
+    def _update_reliability_debug(self, use_gate, strength_gate=None, evidence_vec=None, context_gate=None, guide_gate=None):
+        if use_gate is None and strength_gate is None and context_gate is None and guide_gate is None:
             self.latest_reliability_stats = {}
             return
         use_values = None if use_gate is None else use_gate.detach().reshape(-1).float().cpu()
         strength_values = None if strength_gate is None else strength_gate.detach().reshape(-1).float().cpu()
-        if (use_values is None or use_values.numel() == 0) and (strength_values is None or strength_values.numel() == 0):
+        context_values = None if context_gate is None else context_gate.detach().reshape(-1).float().cpu()
+        guide_values = None if guide_gate is None else guide_gate.detach().reshape(-1).float().cpu()
+        if (
+            (use_values is None or use_values.numel() == 0)
+            and (strength_values is None or strength_values.numel() == 0)
+            and (context_values is None or context_values.numel() == 0)
+            and (guide_values is None or guide_values.numel() == 0)
+        ):
             self.latest_reliability_stats = {}
             return
         stats = {}
@@ -1472,6 +1484,23 @@ class CSDI_Forecasting(CSDI_base):
                 labels = ("near", "mid", "far")
                 for label, chunk in zip(labels, thirds):
                     stats["strength_gate"][label] = float(chunk.mean().item())
+        for gate_name, gate, values in (
+            ("context_gate", context_gate, context_values),
+            ("guide_gate", guide_gate, guide_values),
+        ):
+            if values is not None and values.numel() > 0:
+                stats[gate_name] = {
+                    "mean": float(values.mean().item()),
+                    "std": float(values.std(unbiased=False).item()),
+                    "p10": float(torch.quantile(values, 0.1).item()),
+                    "p50": float(torch.quantile(values, 0.5).item()),
+                    "p90": float(torch.quantile(values, 0.9).item()),
+                }
+                if gate.dim() > 1:
+                    thirds = torch.chunk(gate.detach().float().cpu(), 3, dim=1)
+                    labels = ("near", "mid", "far")
+                    for label, chunk in zip(labels, thirds):
+                        stats[gate_name][label] = float(chunk.mean().item())
         if evidence_vec is not None:
             evidence_mean = evidence_vec.detach().float().mean(dim=0).cpu().tolist()
             stats["evidence_mean"] = [float(v) for v in evidence_mean]
@@ -1536,6 +1565,59 @@ class CSDI_Forecasting(CSDI_base):
         if future_len > 0:
             seq_weight[:, self.lookback_len:self.lookback_len + future_len] = weight[:, :future_len]
         return seq_weight.unsqueeze(1)
+
+    def _combine_text_evidence(self, text_evidence_vec, event_quality_summary):
+        base_evidence = None if text_evidence_vec is None else text_evidence_vec.float()
+        event_evidence = None if event_quality_summary is None else event_quality_summary.float()
+        if event_evidence is not None and base_evidence is not None:
+            return 0.4 * base_evidence + 0.6 * event_evidence
+        if event_evidence is not None:
+            return event_evidence
+        return base_evidence
+
+    def _compute_context_gate(self, strength_gate, evidence_vec=None):
+        if strength_gate is None:
+            return None
+        gate = self._ensure_horizon_gate(strength_gate.float(), self.pred_len).clamp(min=0.0, max=1.0)
+        if evidence_vec is None:
+            ratio = torch.full_like(gate, min(max(float(self.text_context_ratio_min), 0.0), 1.0))
+            dynamic_max = torch.full_like(gate, min(max(float(self.text_context_max_base), 0.0), 1.0))
+        else:
+            evidence = evidence_vec.float().clamp(min=0.0, max=1.0)
+            if evidence.dim() == 1:
+                evidence = evidence.reshape(-1, 1)
+            quality = evidence[:, 0:1]
+            density = evidence[:, 1:2] if evidence.shape[1] > 1 else quality
+            freshness = evidence[:, 2:3] if evidence.shape[1] > 2 else quality
+            novelty = evidence[:, 3:4] if evidence.shape[1] > 3 else quality
+            agreement = evidence[:, 4:5] if evidence.shape[1] > 4 else quality
+            regime = evidence[:, 5:6] if evidence.shape[1] > 5 else quality
+            event_score = evidence[:, 6:7] if evidence.shape[1] > 6 else quality
+            temporal_support = (0.5 * density + 0.5 * freshness).clamp(min=0.0, max=1.0)
+            semantic_support = (0.5 * agreement + 0.5 * event_score).clamp(min=0.0, max=1.0)
+            risk_adjusted = (
+                quality
+                * (0.35 + 0.65 * temporal_support)
+                * (0.5 + 0.5 * agreement)
+                * (0.6 + 0.4 * novelty)
+                * (0.5 + 0.5 * event_score)
+                * (0.7 + 0.3 * regime)
+            ).clamp(min=0.0, max=1.0)
+            ratio_min = min(max(float(self.text_context_ratio_min), 0.0), 1.0)
+            ratio_max = min(max(float(self.text_context_ratio_max), ratio_min), 1.0)
+            ratio = ratio_min + (ratio_max - ratio_min) * risk_adjusted
+            dynamic_max = max(float(self.text_context_max_base), 0.0) + max(float(self.text_context_max_boost), 0.0) * (
+                quality * temporal_support * semantic_support
+            )
+            ratio = ratio.expand(-1, self.pred_len)
+            dynamic_max = dynamic_max.expand(-1, self.pred_len).clamp(min=0.0, max=1.0)
+        if self.text_context_horizon_bias != 0.0:
+            horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=gate.device, dtype=gate.dtype).view(1, -1)
+            horizon_bias = (1.0 + self.text_context_horizon_bias * (0.5 - horizon_pos)).clamp(min=0.0)
+            ratio = ratio * horizon_bias
+        context_gate = gate * ratio
+        context_gate = torch.minimum(context_gate, dynamic_max)
+        return context_gate.clamp(min=0.0, max=1.0)
 
     def _compute_horizon_quality_prior(self, text_event_quality_feats, text_event_time_deltas, text_event_mask, fallback_quality):
         fallback = fallback_quality.reshape(-1, 1).float().clamp(0.0, 1.0).expand(-1, self.pred_len)
@@ -1707,13 +1789,7 @@ class CSDI_Forecasting(CSDI_base):
             strength_gate = text_mask
             self._update_reliability_debug(use_gate, strength_gate, None)
             return use_gate, strength_gate, None
-        base_evidence = None if text_evidence_vec is None else text_evidence_vec.float()
-        if event_quality_summary is not None and base_evidence is not None:
-            evidence = 0.4 * base_evidence + 0.6 * event_quality_summary.float()
-        elif event_quality_summary is not None:
-            evidence = event_quality_summary.float()
-        else:
-            evidence = base_evidence
+        evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
         if text_mask is not None:
             text_mask = text_mask.reshape(-1).float().clamp(0.0, 1.0)
         base_quality = evidence[:, 0].clamp(0.0, 1.0)
@@ -2076,18 +2152,22 @@ class CSDI_Forecasting(CSDI_base):
             semantic_state,
             text_mask=use_gate,
         )
-        context_raw = self._build_text_context(encoded_text, strength_gate) if encoded_text is not None else None
+        context_evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
+        context_gate = self._compute_context_gate(strength_gate, context_evidence)
+        guide_gate = strength_gate
+        self._update_reliability_debug(use_gate, strength_gate, text_evidence_vec, context_gate=context_gate, guide_gate=guide_gate)
+        context_raw = self._build_text_context(encoded_text, context_gate) if encoded_text is not None else None
         raw_token_len = encoded_text.shape[1] if encoded_text is not None else None
         context, aug_gate = self._build_augmented_context(
             batch,
             context_raw,
-            strength_gate,
+            context_gate,
             trend_prior_num,
             trend_prior_text,
             trend_align,
             raw_token_len,
         )
-        semantic_text_mask = strength_gate
+        semantic_text_mask = guide_gate
         effective_text_mask = semantic_text_mask * trend_align if (semantic_text_mask is not None and trend_align is not None) else semantic_text_mask
         trend_prior_for_multires = trend_prior_num
         if self.multi_res_trend_source in {"text_fused", "fused", "text"} and trend_prior_eff is not None:
@@ -2172,18 +2252,22 @@ class CSDI_Forecasting(CSDI_base):
                     semantic_state,
                     text_mask=use_gate,
                 )
-                context_raw = self._build_text_context(encoded_text, strength_gate)
+                context_evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
+                context_gate = self._compute_context_gate(strength_gate, context_evidence)
+                guide_gate = strength_gate
+                self._update_reliability_debug(use_gate, strength_gate, text_evidence_vec, context_gate=context_gate, guide_gate=guide_gate)
+                context_raw = self._build_text_context(encoded_text, context_gate)
                 raw_token_len = encoded_text.shape[1]
                 context, aug_gate = self._build_augmented_context(
                     batch,
                     context_raw,
-                    strength_gate,
+                    context_gate,
                     trend_prior_num,
                     trend_prior_text,
                     trend_align,
                     raw_token_len,
                 )
-                semantic_text_mask = strength_gate
+                semantic_text_mask = guide_gate
                 if self.save_token:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
@@ -2215,7 +2299,11 @@ class CSDI_Forecasting(CSDI_base):
                 context = None
                 aug_gate = None
                 context_raw = None
-                semantic_text_mask = strength_gate
+                context_evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
+                context_gate = self._compute_context_gate(strength_gate, context_evidence)
+                guide_gate = strength_gate
+                self._update_reliability_debug(use_gate, strength_gate, text_evidence_vec, context_gate=context_gate, guide_gate=guide_gate)
+                semantic_text_mask = guide_gate
             text_mask_f = text_mask.float() if text_mask is not None else None
             if semantic_text_mask is not None:
                 text_mask_f = semantic_text_mask.float()

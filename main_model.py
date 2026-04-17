@@ -134,6 +134,10 @@ class CSDI_base(nn.Module):
         self.text_max_length = int(config["model"].get("text_max_length", 192))
         self.event_text_max_length = int(config["model"].get("event_text_max_length", min(self.text_max_length, 96)))
         self.text_encode_batch_size = int(config["model"].get("text_encode_batch_size", 8))
+        self.use_gate_min = float(config["model"].get("use_gate_min", 0.0))
+        self.strength_gate_min = float(config["model"].get("strength_gate_min", 0.0))
+        self.strength_use_mix_floor = float(config["model"].get("strength_use_mix_floor", 0.5))
+        self.horizon_strength_bias = float(config["model"].get("horizon_strength_bias", 0.0))
         self.use_gate_warmup_epochs = int(config["model"].get("use_gate_warmup_epochs", max(1, int(train_cfg.get("lr_warmup_epochs", 0)))))
         self.strength_gate_warmup_epochs = int(config["model"].get("strength_gate_warmup_epochs", max(self.use_gate_warmup_epochs + 1, int(0.2 * max(int(train_cfg.get("epochs", 1)), 1)))))
         self.text_use_weight = float(train_cfg.get("text_use_weight", train_cfg.get("text_benefit_weight", 0.0)))
@@ -1544,7 +1548,7 @@ class CSDI_Forecasting(CSDI_base):
         event_time = text_event_time_deltas.float().unsqueeze(-1)
         relevance = torch.exp(-torch.abs(event_time - horizon_index) / max(self.text_recency_tau_days, 1e-6))
         weighted = event_strength.unsqueeze(-1) * relevance
-        denom = event_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        denom = (relevance * event_mask.unsqueeze(-1)).sum(dim=1).clamp(min=1e-6)
         horizon_prior = weighted.sum(dim=1) / denom
         return torch.maximum(horizon_prior.clamp(0.0, 1.0), fallback)
 
@@ -1732,6 +1736,7 @@ class CSDI_Forecasting(CSDI_base):
         raw_use_gate = self.reliability_min + (1.0 - self.reliability_min) * raw_use_gate
         use_scale = self._get_gate_warmup_scale("use")
         use_gate = (1.0 - use_scale) * horizon_quality_prior + use_scale * raw_use_gate
+        use_gate = self.use_gate_min + (1.0 - self.use_gate_min) * use_gate
         if text_mask is not None:
             use_gate = use_gate * text_mask.unsqueeze(1)
 
@@ -1755,9 +1760,16 @@ class CSDI_Forecasting(CSDI_base):
         raw_strength_gate = self.reliability_min + (1.0 - self.reliability_min) * raw_strength_gate
         strength_scale = self._get_gate_warmup_scale("strength")
         strength_gate = (1.0 - strength_scale) * horizon_quality_prior + strength_scale * raw_strength_gate
-        strength_gate = strength_gate * use_gate
+        use_floor = min(max(self.strength_use_mix_floor, 0.0), 1.0)
+        strength_gate = strength_gate * (use_floor + (1.0 - use_floor) * use_gate)
+        if self.horizon_strength_bias != 0.0:
+            horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=strength_gate.device, dtype=strength_gate.dtype).view(1, -1)
+            bias = (1.0 + self.horizon_strength_bias * (0.5 - horizon_pos)).clamp(min=0.0)
+            strength_gate = strength_gate * bias
+        strength_gate = self.strength_gate_min + (1.0 - self.strength_gate_min) * strength_gate
         if text_mask is not None:
             strength_gate = strength_gate * text_mask.unsqueeze(1)
+        strength_gate = strength_gate.clamp(min=0.0, max=1.0)
 
         self._update_reliability_debug(use_gate, strength_gate, evidence)
         return use_gate, strength_gate, semantic_state

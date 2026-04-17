@@ -111,6 +111,10 @@ model:
   text_max_length: 192
   event_text_max_length: 80
   text_encode_batch_size: 8
+  use_gate_min: 0.12
+  strength_gate_min: 0.05
+  strength_use_mix_floor: 0.5
+  horizon_strength_bias: 0.25
   use_gate_warmup_epochs: 10
   strength_gate_warmup_epochs: 12
 

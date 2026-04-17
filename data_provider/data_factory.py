@@ -58,6 +58,7 @@ def data_provider(args, flag):
         extra_kwargs['text_trend_raw_weight'] = getattr(args, "text_trend_raw_weight", 1.0)
         extra_kwargs['text_trend_ret_weight'] = getattr(args, "text_trend_ret_weight", 0.35)
         extra_kwargs['text_trend_cot_weight'] = getattr(args, "text_trend_cot_weight", 0.15)
+        extra_kwargs['max_text_events'] = getattr(args, "max_text_events", 12)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

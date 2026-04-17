@@ -126,12 +126,16 @@ class CSDI_base(nn.Module):
         self.event_quality_dim = int(config["model"].get("event_quality_dim", 6))
         self.event_quality_beta = float(config["model"].get("event_quality_beta", 4.0))
         self.semantic_trend_scale = float(config["model"].get("semantic_trend_scale", 0.25))
+        self.text_max_length = int(config["model"].get("text_max_length", 192))
+        self.event_text_max_length = int(config["model"].get("event_text_max_length", min(self.text_max_length, 96)))
+        self.text_encode_batch_size = int(config["model"].get("text_encode_batch_size", 8))
         self.use_gate_warmup_epochs = int(config["model"].get("use_gate_warmup_epochs", max(1, int(train_cfg.get("lr_warmup_epochs", 0)))))
         self.strength_gate_warmup_epochs = int(config["model"].get("strength_gate_warmup_epochs", max(self.use_gate_warmup_epochs + 1, int(0.2 * max(int(train_cfg.get("epochs", 1)), 1)))))
         self.text_use_weight = float(train_cfg.get("text_use_weight", train_cfg.get("text_benefit_weight", 0.0)))
         self.text_use_margin = float(train_cfg.get("text_use_margin", 0.02))
         self.text_strength_weight = float(train_cfg.get("text_strength_weight", train_cfg.get("text_uplift_weight", train_cfg.get("text_notext_fallback_weight", 0.0))))
         self.text_strength_tau = float(train_cfg.get("text_strength_tau", train_cfg.get("text_uplift_tau", 0.1)))
+        self.detach_text_baselines = bool(train_cfg.get("detach_text_baselines", True))
         self.text_uplift_weight = self.text_strength_weight
         self.text_uplift_tau = self.text_strength_tau
         self.latest_reliability_stats = {}
@@ -555,18 +559,33 @@ class CSDI_base(nn.Module):
             )
         )
         if needs_text_baseline:
-            predicted_no_text = self._run_diffusion_model(
-                total_input,
-                side_info,
-                t,
-                cfg_mask,
-                timestep_emb=timestep_emb,
-                size_emb=size_emb,
-                context=None,
-            )
-            if self.timestep_branch and timesteps is not None:
-                predicted_from_timestep = self.timestep_pred(timesteps)
-                predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
+            if self.detach_text_baselines:
+                with torch.no_grad():
+                    predicted_no_text = self._run_diffusion_model(
+                        total_input,
+                        side_info,
+                        t,
+                        cfg_mask,
+                        timestep_emb=timestep_emb,
+                        size_emb=size_emb,
+                        context=None,
+                    )
+                    if self.timestep_branch and timesteps is not None:
+                        predicted_from_timestep = self.timestep_pred(timesteps)
+                        predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
+            else:
+                predicted_no_text = self._run_diffusion_model(
+                    total_input,
+                    side_info,
+                    t,
+                    cfg_mask,
+                    timestep_emb=timestep_emb,
+                    size_emb=size_emb,
+                    context=None,
+                )
+                if self.timestep_branch and timesteps is not None:
+                    predicted_from_timestep = self.timestep_pred(timesteps)
+                    predicted_no_text = 0.9 * predicted_no_text + 0.1 * predicted_from_timestep
             predicted_raw = None
             if context_raw is not None and (
                 self.text_consistency_weight > 0
@@ -574,19 +593,34 @@ class CSDI_base(nn.Module):
                 or self.text_aug_benefit_weight > 0
                 or self.text_aug_reg_weight > 0
             ):
-                predicted_raw = self._run_diffusion_model(
-                    total_input,
-                    side_info,
-                    t,
-                    cfg_mask,
-                    timestep_emb=timestep_emb,
-                    size_emb=size_emb,
-                    context=context_raw,
-                )
-                if self.timestep_branch and timesteps is not None:
-                    predicted_from_timestep = self.timestep_pred(timesteps)
-                    predicted_raw = 0.9 * predicted_raw + 0.1 * predicted_from_timestep
-            if self.text_consistency_weight > 0 and text_mask is not None and predicted_raw is not None:
+                if self.detach_text_baselines:
+                    with torch.no_grad():
+                        predicted_raw = self._run_diffusion_model(
+                            total_input,
+                            side_info,
+                            t,
+                            cfg_mask,
+                            timestep_emb=timestep_emb,
+                            size_emb=size_emb,
+                            context=context_raw,
+                        )
+                        if self.timestep_branch and timesteps is not None:
+                            predicted_from_timestep = self.timestep_pred(timesteps)
+                            predicted_raw = 0.9 * predicted_raw + 0.1 * predicted_from_timestep
+                else:
+                    predicted_raw = self._run_diffusion_model(
+                        total_input,
+                        side_info,
+                        t,
+                        cfg_mask,
+                        timestep_emb=timestep_emb,
+                        size_emb=size_emb,
+                        context=context_raw,
+                    )
+                    if self.timestep_branch and timesteps is not None:
+                        predicted_from_timestep = self.timestep_pred(timesteps)
+                        predicted_raw = 0.9 * predicted_raw + 0.1 * predicted_from_timestep
+            if (not self.detach_text_baselines) and self.text_consistency_weight > 0 and text_mask is not None and predicted_raw is not None:
                 consistency_loss = self._calc_text_consistency_loss(
                     predicted_raw,
                     predicted_no_text,
@@ -1559,14 +1593,12 @@ class CSDI_Forecasting(CSDI_base):
                 row = list(row) + ["NA"] * max(event_count - len(row), 0)
                 row = row[:event_count]
             flat_texts.extend(row)
-        token_input = self.tokenizer(
+        _, pooled, _ = self._encode_text_source_with_options(
             flat_texts,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt',
-        ).to(self.device)
-        encoded = self.text_encoder(**token_input).last_hidden_state
-        pooled = encoded.mean(dim=1).reshape(batch_size, event_count, -1)
+            max_length=self.event_text_max_length,
+            return_sequence=False,
+        )
+        pooled = pooled.reshape(batch_size, event_count, -1)
         if text_event_mask is not None:
             pooled = pooled * text_event_mask.unsqueeze(-1).float()
         return pooled
@@ -1758,15 +1790,49 @@ class CSDI_Forecasting(CSDI_base):
         return fused, align
     
     def _encode_text_source(self, text):
-        token_input = self.tokenizer(
-            text,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt',
-        ).to(self.device)
-        encoded = self.text_encoder(**token_input).last_hidden_state
-        pooled = encoded.mean(dim=1)
-        return encoded, pooled, token_input
+        return self._encode_text_source_with_options(text, max_length=self.text_max_length, return_sequence=True)
+
+    def _encode_text_source_with_options(self, text, max_length=None, return_sequence=True):
+        if isinstance(text, str):
+            texts = [text]
+        elif isinstance(text, (list, tuple)):
+            texts = [str(item) if item is not None else "NA" for item in text]
+        else:
+            texts = [str(text)]
+
+        max_length = int(max_length or self.text_max_length)
+        chunk_size = max(int(self.text_encode_batch_size), 1)
+        encoded_chunks = []
+        pooled_chunks = []
+        input_id_chunks = []
+        attention_chunks = []
+
+        for start in range(0, len(texts), chunk_size):
+            text_chunk = texts[start:start + chunk_size]
+            token_input = self.tokenizer(
+                text_chunk,
+                padding='max_length',
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt',
+            ).to(self.device)
+            with torch.inference_mode():
+                encoded = self.text_encoder(**token_input).last_hidden_state
+            attention_mask = token_input["attention_mask"].unsqueeze(-1).to(encoded.dtype)
+            pooled = (encoded * attention_mask).sum(dim=1) / attention_mask.sum(dim=1).clamp(min=1.0)
+            if return_sequence:
+                encoded_chunks.append(encoded.detach())
+            pooled_chunks.append(pooled.detach())
+            input_id_chunks.append(token_input["input_ids"].detach())
+            attention_chunks.append(token_input["attention_mask"].detach())
+
+        encoded_text = torch.cat(encoded_chunks, dim=0) if return_sequence else None
+        pooled_text = torch.cat(pooled_chunks, dim=0)
+        token_input = {
+            "input_ids": torch.cat(input_id_chunks, dim=0),
+            "attention_mask": torch.cat(attention_chunks, dim=0),
+        }
+        return encoded_text, pooled_text, token_input
 
     def _build_text_context(self, encoded_text, text_scale):
         if encoded_text is None or text_scale is None:

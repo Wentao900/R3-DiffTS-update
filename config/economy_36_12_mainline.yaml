@@ -30,8 +30,9 @@ train:
   lr_warmup_epochs: 10
   max_grad_norm: 1.0
   adaptive_noise_scale: 0.0
-  text_consistency_weight: 0.05
+  text_consistency_weight: 0.0
   auxiliary_loss_max_ratio: 0.5
+  detach_text_baselines: true
   text_use_weight: 0.03
   text_use_margin: 0.02
   text_aug_benefit_weight: 0.05
@@ -107,6 +108,9 @@ model:
   reliability_hidden_dim: 32
   guide_reliability_power: 1.0
   semantic_dim: 6
+  text_max_length: 160
+  event_text_max_length: 64
+  text_encode_batch_size: 4
   use_gate_warmup_epochs: 10
   strength_gate_warmup_epochs: 20
 
@@ -117,3 +121,4 @@ dataset:
   aug_segment_scale_std: 0.1
   text_recency_tau_days: 14.0
   text_coverage_kappa: 3.0
+  max_text_events: 8

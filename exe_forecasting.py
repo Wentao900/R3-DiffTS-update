@@ -393,6 +393,7 @@ args.text_trend_cot_scale = float(config["model"].get("text_trend_cot_scale", 0.
 args.text_trend_raw_weight = float(config["model"].get("text_trend_raw_weight", 1.0))
 args.text_trend_ret_weight = float(config["model"].get("text_trend_ret_weight", 0.35))
 args.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
+args.max_text_events = int(dataset_cfg.get("max_text_events", 12))
 
 args.batch_size = config["train"]["batch_size"]
 

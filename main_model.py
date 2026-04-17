@@ -94,6 +94,9 @@ class CSDI_base(nn.Module):
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
+        dataset_cfg = {}
+        dataset_cfg.update(config.get("data", {}))
+        dataset_cfg.update(config.get("dataset", {}))
         self.llm = config["model"]["llm"]
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
@@ -126,6 +129,8 @@ class CSDI_base(nn.Module):
         self.event_quality_dim = int(config["model"].get("event_quality_dim", 6))
         self.event_quality_beta = float(config["model"].get("event_quality_beta", 4.0))
         self.semantic_trend_scale = float(config["model"].get("semantic_trend_scale", 0.25))
+        self.text_recency_tau_days = float(dataset_cfg.get("text_recency_tau_days", 14.0))
+        self.text_coverage_kappa = float(dataset_cfg.get("text_coverage_kappa", 3.0))
         self.text_max_length = int(config["model"].get("text_max_length", 192))
         self.event_text_max_length = int(config["model"].get("event_text_max_length", min(self.text_max_length, 96)))
         self.text_encode_batch_size = int(config["model"].get("text_encode_batch_size", 8))

@@ -1560,10 +1560,21 @@ class CSDI_Forecasting(CSDI_base):
         if semantic_state is not None and hasattr(self, "semantic_to_trend"):
             semantic_delta = self.semantic_to_trend(semantic_state.float()).reshape(-1, self.pred_len, 3)
             semantic_delta = torch.tanh(semantic_delta)
-            semantic_delta[:, :, 0] = semantic_delta[:, :, 0]
-            semantic_delta[:, :, 1:] = 0.5 * semantic_delta[:, :, 1:]
+            semantic_delta = torch.cat(
+                [
+                    semantic_delta[:, :, :1],
+                    0.5 * semantic_delta[:, :, 1:],
+                ],
+                dim=-1,
+            )
             text_prior = text_prior + self.semantic_trend_scale * semantic_delta
-            text_prior[:, :, 1:] = text_prior[:, :, 1:].clamp(min=0.0)
+            text_prior = torch.cat(
+                [
+                    text_prior[:, :, :1],
+                    text_prior[:, :, 1:].clamp(min=0.0),
+                ],
+                dim=-1,
+            )
         diff = torch.abs(text_prior - num_prior).sum(dim=-1)
         align = torch.exp(-self.text_numeric_align_gamma * diff).clamp(0.0, 1.0)
         if text_mask is not None:

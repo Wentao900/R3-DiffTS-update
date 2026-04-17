@@ -32,12 +32,13 @@ train:
   adaptive_noise_scale: 0.0
   text_consistency_weight: 0.05
   auxiliary_loss_max_ratio: 0.5
-  text_benefit_weight: 0.0
+  text_use_weight: 0.03
+  text_use_margin: 0.02
   text_aug_benefit_weight: 0.05
   text_aug_reg_weight: 0.01
   text_notext_fallback_weight: 0.0
-  text_uplift_weight: 0.05
-  text_uplift_tau: 0.1
+  text_strength_weight: 0.03
+  text_strength_tau: 0.1
 
 diffusion:
   layers: 6
@@ -105,6 +106,9 @@ model:
   reliability_min: 0.1
   reliability_hidden_dim: 32
   guide_reliability_power: 1.0
+  semantic_dim: 6
+  use_gate_warmup_epochs: 10
+  strength_gate_warmup_epochs: 20
 
 dataset:
   aug_noise_std: 0.01

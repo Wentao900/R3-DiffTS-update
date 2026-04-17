@@ -169,6 +169,31 @@ class RAGCoTPipeline:
             if sims[i] > 0 and len(self.search_df.iloc[i].fact.strip()) > 0
         ]
 
+    def _retrieve_records(self, query_text: str, top_k: Optional[int] = None) -> List[Dict[str, object]]:
+        k = self.config.top_k if top_k is None else int(top_k)
+        if not self.retriever or not self.config.use_retrieval or k <= 0:
+            return []
+        query_vec = self.retriever["vectorizer"].transform([query_text])
+        sims = cosine_similarity(query_vec, self.retriever["matrix"]).ravel()
+        if sims.size == 0:
+            return []
+        top_idx = sims.argsort()[::-1][:k]
+        records: List[Dict[str, object]] = []
+        for i in top_idx:
+            row = self.search_df.iloc[i]
+            fact = str(row.fact).strip()
+            if sims[i] <= 0 or len(fact) == 0:
+                continue
+            records.append(
+                {
+                    "fact": fact,
+                    "start_date": row.start_date if "start_date" in self.search_df.columns else None,
+                    "end_date": row.end_date if "end_date" in self.search_df.columns else None,
+                    "score": float(sims[i]),
+                }
+            )
+        return records
+
     def _summarize_numeric(self, numeric_history: Sequence[float]) -> str:
         arr = np.asarray(numeric_history, dtype=float).flatten()
         if arr.size == 0:
@@ -458,13 +483,16 @@ class RAGCoTPipeline:
     ) -> Dict[str, str]:
         numeric_summary = self._summarize_numeric(numeric_history)
         query = self._build_query(numeric_summary, base_text)
-        retrieved = self._retrieve(query)
+        retrieved_records = self._retrieve_records(query)
+        retrieved = [record["fact"] for record in retrieved_records]
         prompt = self._format_prompt(numeric_summary, retrieved)
         cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
         composed_text = self._compose_text(base_text, retrieved, cot_text)
         return {
             "cot_text": cot_text,
             "retrieved_text": " ".join(retrieved),
+            "retrieved_items": list(retrieved),
+            "retrieved_records": retrieved_records,
             "composed_text": composed_text,
         }
 
@@ -497,7 +525,8 @@ class RAGCoTPipeline:
                 self.cache.popitem(last=False)
             return packaged
 
-        retrieved_stage1 = self._retrieve(query, top_k=self.rag_stage1_topk)
+        retrieved_stage1_records = self._retrieve_records(query, top_k=self.rag_stage1_topk)
+        retrieved_stage1 = [record["fact"] for record in retrieved_stage1_records]
         if not retrieved_stage1:
             packaged = self._build_one_shot_guidance(numeric_history, base_text)
             self.cache[cache_key] = packaged
@@ -515,7 +544,8 @@ class RAGCoTPipeline:
         trend_hypothesis = self._augment_trend_hypothesis(trend_hypothesis, numeric_stats)
         trend_query_text = self._trend_hypothesis_to_query_text(trend_hypothesis)
         stage2_query = self._build_stage2_query(query, trend_query_text)
-        retrieved_stage2 = self._retrieve(stage2_query, top_k=self.rag_stage2_topk)
+        retrieved_stage2_records = self._retrieve_records(stage2_query, top_k=self.rag_stage2_topk)
+        retrieved_stage2 = [record["fact"] for record in retrieved_stage2_records]
         if retrieved_stage2:
             final_retrieved = self._merge_retrieved(
                 retrieved_stage2,
@@ -524,6 +554,12 @@ class RAGCoTPipeline:
             )
         else:
             final_retrieved = retrieved_stage1
+        record_lookup = OrderedDict()
+        for record in retrieved_stage2_records + retrieved_stage1_records:
+            fact = str(record.get("fact", "")).strip()
+            if fact and fact not in record_lookup:
+                record_lookup[fact] = record
+        final_records = [record_lookup[item] for item in final_retrieved if item in record_lookup]
         composed_text = self._compose_two_stage_text(
             base_text,
             numeric_summary,
@@ -534,6 +570,8 @@ class RAGCoTPipeline:
         packaged = {
             "cot_text": trend_hypothesis,
             "retrieved_text": " ".join(final_retrieved),
+            "retrieved_items": list(final_retrieved),
+            "retrieved_records": final_records,
             "composed_text": composed_text,
         }
         self.cache[cache_key] = packaged

@@ -75,7 +75,8 @@ class Dataset_Custom(Dataset):
                  text_trend_cot_scale=0.3,
                  text_trend_raw_weight=1.0,
                  text_trend_ret_weight=0.35,
-                 text_trend_cot_weight=0.15):
+                 text_trend_cot_weight=0.15,
+                 max_text_events=12):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -138,6 +139,7 @@ class Dataset_Custom(Dataset):
         self.text_trend_raw_weight = float(max(text_trend_raw_weight, 0.0))
         self.text_trend_ret_weight = float(max(text_trend_ret_weight, 0.0))
         self.text_trend_cot_weight = float(max(text_trend_cot_weight, 0.0))
+        self.max_text_events = int(max(max_text_events, 4))
 
         self.root_path = root_path
         self.data_path = data_path
@@ -411,6 +413,147 @@ class Dataset_Custom(Dataset):
         quality = max(quality, self.text_quality_min_scale if quality > 0 else 0.0)
         return float(np.clip(quality, 0.0, 1.0))
 
+    def _tokenize_text_simple(self, text):
+        normalized = self._normalize_text(text).lower()
+        if not normalized:
+            return set()
+        return set(re.findall(r"[a-z0-9]+", normalized))
+
+    def _text_jaccard_distance(self, text_a, text_b):
+        tokens_a = self._tokenize_text_simple(text_a)
+        tokens_b = self._tokenize_text_simple(text_b)
+        if not tokens_a and not tokens_b:
+            return 0.0
+        union = len(tokens_a | tokens_b)
+        if union <= 0:
+            return 0.0
+        overlap = len(tokens_a & tokens_b) / float(union)
+        return float(np.clip(1.0 - overlap, 0.0, 1.0))
+
+    def _score_event_trigger(self, *texts):
+        combined = " ".join(self._normalize_text(text).lower() for text in texts if self._normalize_text(text))
+        if not combined:
+            return 0.0
+        event_keywords = (
+            "increase", "rise", "rising", "up", "upward", "higher",
+            "decrease", "decline", "drop", "fall", "down", "downward", "lower",
+            "surge", "plunge", "jump", "slump", "shock", "risk", "policy",
+            "recover", "recovery", "rebound", "slowdown", "acceleration", "volatile",
+        )
+        match_count = sum(1 for keyword in event_keywords if keyword in combined)
+        score = match_count / 4.0
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _score_regime_shift(self, seq_x):
+        values = np.asarray(seq_x, dtype=np.float32)
+        if values.ndim == 2:
+            values = values.mean(axis=1)
+        if values.size < 4:
+            return 0.0
+        mid = max(values.shape[0] // 2, 1)
+        early = values[:mid]
+        late = values[mid:]
+        if late.size == 0:
+            return 0.0
+        early_mean = float(np.mean(early))
+        late_mean = float(np.mean(late))
+        early_std = float(np.std(early))
+        late_std = float(np.std(late))
+        scale = max(float(np.std(values)), 1e-6)
+        mean_shift = abs(late_mean - early_mean) / scale
+        std_shift = abs(late_std - early_std) / max(scale, 1e-6)
+        score = 1.0 / (1.0 + np.exp(-(0.8 * mean_shift + 0.4 * std_shift - 1.0)))
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _build_event_quality_features(self, text, source_name, seq_x, time_delta_days, raw_reference_text):
+        q_src = float(np.clip(self._get_source_trust(source_name), 0.0, 1.0))
+        q_time = float(np.exp(-float(max(time_delta_days, 0.0)) / self.text_recency_tau_days))
+        q_info = float(np.clip(self._score_text_informativeness(text), 0.0, 1.0))
+        if source_name == "raw":
+            q_nov = 1.0
+        else:
+            q_nov = float(np.clip(self._text_jaccard_distance(raw_reference_text, text), 0.0, 1.0))
+        q_agree = float(np.clip(self._score_text_alignment(text, seq_x), 0.0, 1.0))
+        q_event = float(np.clip(self._score_event_trigger(text), 0.0, 1.0))
+        return [
+            q_src,
+            q_time,
+            q_info,
+            q_nov,
+            q_agree,
+            q_event,
+        ]
+
+    def _pad_text_events(self, event_entries):
+        padded_texts = ["NA"] * self.max_text_events
+        padded_source_ids = np.zeros((self.max_text_events,), dtype=np.int64)
+        padded_time_deltas = np.zeros((self.max_text_events,), dtype=np.float32)
+        padded_quality_feats = np.zeros((self.max_text_events, 6), dtype=np.float32)
+        padded_mask = np.zeros((self.max_text_events,), dtype=np.float32)
+        for idx, entry in enumerate(event_entries[: self.max_text_events]):
+            padded_texts[idx] = entry["text"]
+            padded_source_ids[idx] = int(entry["source_id"])
+            padded_time_deltas[idx] = float(entry["time_delta"])
+            padded_quality_feats[idx] = np.asarray(entry["quality_feats"], dtype=np.float32)
+            padded_mask[idx] = 1.0
+        return padded_texts, padded_source_ids, padded_time_deltas, padded_quality_feats, padded_mask
+
+    def _build_text_events(self, raw_events, retrieved_records, cot_text, seq_x, forecast_start_date, raw_text):
+        source_to_id = {"raw": 0, "ret": 1, "cot": 2}
+        forecast_anchor = pd.Timestamp(forecast_start_date)
+        raw_entries = []
+        for event in raw_events:
+            event_end = pd.Timestamp(event.get("end_date", forecast_anchor))
+            time_delta = float(max((forecast_anchor - event_end).days, 0))
+            text = self._normalize_text(event.get("text", ""))
+            if not text:
+                continue
+            raw_entries.append(
+                {
+                    "text": text,
+                    "source_id": source_to_id["raw"],
+                    "time_delta": time_delta,
+                    "quality_feats": self._build_event_quality_features(text, "raw", seq_x, time_delta, raw_text),
+                }
+            )
+        raw_entries = sorted(raw_entries, key=lambda item: item["time_delta"])[: self.max_text_events]
+
+        ret_entries = []
+        for record in retrieved_records:
+            text = self._normalize_text(record.get("fact", ""))
+            if not text:
+                continue
+            record_end = record.get("end_date", forecast_anchor)
+            if pd.isna(record_end):
+                record_end = forecast_anchor
+            time_delta = float(max((forecast_anchor - pd.Timestamp(record_end)).days, 0))
+            ret_entries.append(
+                {
+                    "text": text,
+                    "source_id": source_to_id["ret"],
+                    "time_delta": time_delta,
+                    "quality_feats": self._build_event_quality_features(text, "ret", seq_x, time_delta, raw_text),
+                }
+            )
+
+        cot_entries = []
+        normalized_cot = self._normalize_text(cot_text)
+        if normalized_cot:
+            cot_entries.append(
+                {
+                    "text": normalized_cot,
+                    "source_id": source_to_id["cot"],
+                    "time_delta": 0.0,
+                    "quality_feats": self._build_event_quality_features(normalized_cot, "cot", seq_x, 0.0, raw_text),
+                }
+            )
+
+        reserved_slots = len(ret_entries) + len(cot_entries)
+        raw_budget = max(self.max_text_events - reserved_slots, 0)
+        selected_entries = raw_entries[:raw_budget] + ret_entries + cot_entries
+        selected_entries = selected_entries[: self.max_text_events]
+        return self._pad_text_events(selected_entries)
+
     def _build_text_quality_package(self, raw_text, ret_text, cot_text, seq_x):
         q_raw = self._compute_text_quality(raw_text, "raw", seq_x)
         q_ret = self._compute_text_quality(ret_text, "ret", seq_x)
@@ -495,45 +638,50 @@ class Dataset_Custom(Dataset):
         aggregate, _ = self._build_text_trend_components(raw_text, ret_text, cot_text, quality_pkg, seq_x)
         return aggregate
 
-    def _build_window_evidence(self, quality_pkg, trend_prior_num, trend_prior_text, source_priors, window_meta):
+    def _build_window_evidence(self, raw_text, ret_text, cot_text, quality_pkg, source_priors, window_meta, seq_x):
         report_count = float(max(window_meta.get("report_count", 0), 0))
-        coverage = report_count / (report_count + self.text_coverage_kappa) if report_count > 0 else 0.0
+        recent_report_count = float(max(window_meta.get("recent_report_count", 0), 0))
+        recent_density = recent_report_count / (report_count + self.text_coverage_kappa) if report_count > 0 else 0.0
 
         recency_days = window_meta.get("recency_days")
         if recency_days is None:
-            recency = 0.0
+            freshness = 0.0
         else:
-            recency = float(np.exp(-float(max(recency_days, 0.0)) / self.text_recency_tau_days))
+            freshness = float(np.exp(-float(max(recency_days, 0.0)) / self.text_recency_tau_days))
 
-        source_vectors = []
-        source_weights = []
+        directions = []
         for source_name, quality_key in (("raw", "quality_raw"), ("ret", "quality_ret"), ("cot", "quality_cot")):
             prior = source_priors.get(source_name)
             quality = float(np.clip(quality_pkg.get(quality_key, 0.0), 0.0, 1.0))
             if prior is None or quality <= 0:
                 continue
-            source_vectors.append(np.asarray(prior, dtype=np.float32))
-            source_weights.append(quality)
-        if len(source_vectors) <= 1:
-            consistency = 1.0 if len(source_vectors) == 1 else 0.0
+            direction = int(np.sign(float(np.asarray(prior)[0])))
+            directions.append(direction)
+        if len(directions) <= 1:
+            agreement = 1.0 if len(directions) == 1 else 0.0
         else:
-            weights = np.asarray(source_weights, dtype=np.float32)
-            weights = weights / max(float(weights.sum()), 1e-6)
-            stacked = np.stack(source_vectors, axis=0)
-            mean_vec = np.sum(stacked * weights[:, None], axis=0)
-            mean_l1 = np.abs(stacked - mean_vec[None, :]).sum(axis=1).mean()
-            consistency = float(np.exp(-mean_l1))
+            pair_matches = []
+            for idx in range(len(directions)):
+                for jdx in range(idx + 1, len(directions)):
+                    pair_matches.append(1.0 if directions[idx] == directions[jdx] else 0.0)
+            agreement = float(np.mean(pair_matches)) if pair_matches else 0.0
 
-        trend_diff = float(np.abs(np.asarray(trend_prior_text) - np.asarray(trend_prior_num)).sum())
-        numeric_align = float(np.exp(-2.0 * trend_diff))
+        novelty_ret = self._text_jaccard_distance(raw_text, ret_text)
+        novelty_cot = self._text_jaccard_distance(raw_text, cot_text)
+        novelty = 0.5 * novelty_ret + 0.5 * novelty_cot
+
+        regime_shift = self._score_regime_shift(seq_x)
+        event_score = self._score_event_trigger(raw_text, ret_text, cot_text)
 
         return np.asarray(
             [
                 float(np.clip(quality_pkg.get("quality_total", 0.0), 0.0, 1.0)),
-                float(np.clip(coverage, 0.0, 1.0)),
-                float(np.clip(recency, 0.0, 1.0)),
-                float(np.clip(consistency, 0.0, 1.0)),
-                float(np.clip(numeric_align, 0.0, 1.0)),
+                float(np.clip(recent_density, 0.0, 1.0)),
+                float(np.clip(freshness, 0.0, 1.0)),
+                float(np.clip(novelty, 0.0, 1.0)),
+                float(np.clip(agreement, 0.0, 1.0)),
+                float(np.clip(regime_shift, 0.0, 1.0)),
+                float(np.clip(event_score, 0.0, 1.0)),
             ],
             dtype=np.float32,
         )
@@ -638,13 +786,27 @@ class Dataset_Custom(Dataset):
         report = self._collect_window_reports(start_date, end_date)
         def add_datemark(row):
             return row['start_date'].strftime("%Y-%m-%d") + " to " + row['end_date'].strftime("%Y-%m-%d") + ": " + row['fact']
+        recent_window_days = max(int(self.pred_len), 7)
         meta = {
             "report_count": int(len(report)),
+            "recent_report_count": 0,
             "recency_days": None,
+            "raw_events": [],
         }
         if not report.empty:
             latest_end = report['end_date'].max()
             meta["recency_days"] = float(max((pd.Timestamp(end_date) - latest_end).days, 0))
+            recent_cutoff = pd.Timestamp(end_date) - pd.Timedelta(days=recent_window_days)
+            recent_report = report.loc[report['end_date'] >= recent_cutoff]
+            meta["recent_report_count"] = int(len(recent_report))
+            meta["raw_events"] = [
+                {
+                    "text": add_datemark(row),
+                    "start_date": row["start_date"],
+                    "end_date": row["end_date"],
+                }
+                for _, row in report.iterrows()
+            ]
         if not report.empty:
             report = report.apply(add_datemark, axis=1).to_list()
             report.insert(0, self.desc)
@@ -692,6 +854,7 @@ class Dataset_Custom(Dataset):
             text_dropped = True
         composed_text = raw_text
         rag_retrieved, cot_text = '', ''
+        retrieved_records = []
         if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
             cached = self.guidance_cache.get(index, None)
             if cached is None:
@@ -704,10 +867,15 @@ class Dataset_Custom(Dataset):
                 composed_text = guidance["composed_text"]
                 cot_text = guidance["cot_text"]
                 rag_retrieved = guidance["retrieved_text"]
+                retrieved_records = guidance.get("retrieved_records", [])
                 txt_mark = 1 if any(len(self._normalize_text(text_value)) > 0 for text_value in (raw_text, rag_retrieved, cot_text)) else 0
-                self.guidance_cache[index] = (composed_text, txt_mark, cot_text, rag_retrieved)
+                self.guidance_cache[index] = (composed_text, txt_mark, cot_text, rag_retrieved, retrieved_records)
             else:
-                composed_text, txt_mark, cot_text, rag_retrieved = cached
+                if len(cached) >= 5:
+                    composed_text, txt_mark, cot_text, rag_retrieved, retrieved_records = cached[:5]
+                else:
+                    composed_text, txt_mark, cot_text, rag_retrieved = cached
+                    retrieved_records = []
         if txt_mark <= 0 and len(self._normalize_text(raw_text)) == 0:
             txt_mark = 0
         quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
@@ -717,11 +885,21 @@ class Dataset_Custom(Dataset):
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
         trend_prior_text, source_trend_priors = self._build_text_trend_components(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
         text_evidence_vec = self._build_window_evidence(
+            raw_text,
+            rag_retrieved,
+            cot_text,
             quality_pkg,
-            trend_prior_num,
-            trend_prior_text,
             source_trend_priors,
             text_meta,
+            seq_x,
+        )
+        text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
+            raw_events=text_meta.get("raw_events", []),
+            retrieved_records=retrieved_records,
+            cot_text=cot_text,
+            seq_x=seq_x,
+            forecast_start_date=self.num_dates.start_date[r_begin],
+            raw_text=raw_text,
         )
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
@@ -736,10 +914,16 @@ class Dataset_Custom(Dataset):
             'timepoints': np.arange(self.seq_len + self.pred_len).astype(np.float32), 
             'feature_id': np.arange(seq_x.shape[1]).astype(np.float32),
             'timesteps': timesteps,
-            'texts': raw_text,
+            'texts': composed_text,
+            'text_composed': composed_text,
             'text_raw': raw_text,
             'text_ret': rag_retrieved,
             'text_cot': cot_text,
+            'text_event_texts': text_event_texts,
+            'text_event_source_ids': text_event_source_ids,
+            'text_event_time_deltas': text_event_time_deltas,
+            'text_event_quality_feats': text_event_quality_feats,
+            'text_event_mask': text_event_mask,
             'text_mark': txt_mark,
             'text_quality': np.asarray(quality_pkg['quality_total'], dtype=np.float32),
             'text_quality_raw': np.asarray(quality_pkg['quality_raw'], dtype=np.float32),

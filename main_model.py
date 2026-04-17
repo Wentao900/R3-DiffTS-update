@@ -122,8 +122,18 @@ class CSDI_base(nn.Module):
         self.coverage_cfg_boost = float(config["model"].get("coverage_cfg_boost", 0.15))
         self.reliability_min = float(config["model"].get("reliability_min", 0.1))
         self.guide_reliability_power = float(config["model"].get("guide_reliability_power", 1.0))
-        self.text_uplift_weight = float(train_cfg.get("text_uplift_weight", train_cfg.get("text_notext_fallback_weight", 0.0)))
-        self.text_uplift_tau = float(train_cfg.get("text_uplift_tau", 0.1))
+        self.semantic_dim = int(config["model"].get("semantic_dim", 6))
+        self.event_quality_dim = int(config["model"].get("event_quality_dim", 6))
+        self.event_quality_beta = float(config["model"].get("event_quality_beta", 4.0))
+        self.semantic_trend_scale = float(config["model"].get("semantic_trend_scale", 0.25))
+        self.use_gate_warmup_epochs = int(config["model"].get("use_gate_warmup_epochs", max(1, int(train_cfg.get("lr_warmup_epochs", 0)))))
+        self.strength_gate_warmup_epochs = int(config["model"].get("strength_gate_warmup_epochs", max(self.use_gate_warmup_epochs + 1, int(0.2 * max(int(train_cfg.get("epochs", 1)), 1)))))
+        self.text_use_weight = float(train_cfg.get("text_use_weight", train_cfg.get("text_benefit_weight", 0.0)))
+        self.text_use_margin = float(train_cfg.get("text_use_margin", 0.02))
+        self.text_strength_weight = float(train_cfg.get("text_strength_weight", train_cfg.get("text_uplift_weight", train_cfg.get("text_notext_fallback_weight", 0.0))))
+        self.text_strength_tau = float(train_cfg.get("text_strength_tau", train_cfg.get("text_uplift_tau", 0.1)))
+        self.text_uplift_weight = self.text_strength_weight
+        self.text_uplift_tau = self.text_strength_tau
         self.latest_reliability_stats = {}
 
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
@@ -144,7 +154,7 @@ class CSDI_base(nn.Module):
         self.multi_res_group_balance = bool(train_cfg.get("multi_res_group_balance", True))
         self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
         self.text_consistency_weight = float(train_cfg.get("text_consistency_weight", 0.0))
-        self.text_benefit_weight = float(train_cfg.get("text_benefit_weight", 0.0))
+        self.text_benefit_weight = self.text_use_weight
         self.text_aug_benefit_weight = float(train_cfg.get("text_aug_benefit_weight", 0.0))
         self.text_aug_reg_weight = float(train_cfg.get("text_aug_reg_weight", 0.0))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
@@ -210,19 +220,50 @@ class CSDI_base(nn.Module):
             text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
             self.text_hidden_dim = int(text_hidden_dim)
             benefit_hidden_dim = int(config["model"].get("text_benefit_hidden_dim", 128))
+            event_source_embed_dim = int(config["model"].get("event_source_embed_dim", 4))
             self.text_benefit_head = nn.Sequential(
                 nn.Linear(text_hidden_dim + 7, benefit_hidden_dim),
                 nn.LayerNorm(benefit_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(benefit_hidden_dim, 1),
             )
-            reliability_hidden_dim = int(config["model"].get("reliability_hidden_dim", 32))
-            self.reliability_head = nn.Sequential(
-                nn.Linear(5, reliability_hidden_dim),
-                nn.LayerNorm(reliability_hidden_dim),
+            gate_hidden_dim = int(config["model"].get("reliability_hidden_dim", 32))
+            evidence_dim = 7
+            self.event_source_embed = nn.Embedding(3, event_source_embed_dim)
+            self.event_semantic_proj = nn.Sequential(
+                nn.Linear(text_hidden_dim + event_source_embed_dim + self.event_quality_dim, gate_hidden_dim),
+                nn.LayerNorm(gate_hidden_dim),
                 nn.ReLU(),
-                nn.Linear(reliability_hidden_dim, 1),
+                nn.Linear(gate_hidden_dim, self.semantic_dim),
             )
+            self.semantic_proj = nn.Sequential(
+                nn.Linear(text_hidden_dim, gate_hidden_dim),
+                nn.LayerNorm(gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(gate_hidden_dim, self.semantic_dim),
+            )
+            self.semantic_to_trend = nn.Sequential(
+                nn.Linear(self.semantic_dim, gate_hidden_dim),
+                nn.LayerNorm(gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(gate_hidden_dim, self.pred_len * 3),
+            )
+            self.use_gate_head = nn.Sequential(
+                nn.Linear(evidence_dim, gate_hidden_dim),
+                nn.LayerNorm(gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(gate_hidden_dim, self.pred_len),
+            )
+            self.strength_gate_head = nn.Sequential(
+                nn.Linear(evidence_dim + self.semantic_dim + 6, gate_hidden_dim),
+                nn.LayerNorm(gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(gate_hidden_dim, self.pred_len),
+            )
+            nn.init.zeros_(self.use_gate_head[-1].weight)
+            nn.init.constant_(self.use_gate_head[-1].bias, -1.5)
+            nn.init.zeros_(self.strength_gate_head[-1].weight)
+            nn.init.constant_(self.strength_gate_head[-1].bias, -2.0)
             aug_hidden_dim = int(config["model"].get("text_aug_hidden_dim", 128))
             aug_input_dim = text_hidden_dim * 2 + 9
             self.text_aug_gate_head = nn.Sequential(
@@ -440,18 +481,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None, reliability_gate=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, benefit_gate=benefit_gate, context_raw=context_raw, aug_gate=aug_gate, reliability_gate=reliability_gate
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, benefit_gate=None, context_raw=None, aug_gate=None, reliability_gate=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, set_t=-1
     ):
 
         B, K, L = observed_data.shape
@@ -507,10 +548,10 @@ class CSDI_base(nn.Module):
             and (context is not None or context_raw is not None)
             and (
                 (self.text_consistency_weight > 0 and text_mask is not None)
-                or (self.text_benefit_weight > 0 and benefit_gate is not None)
+                or (self.text_use_weight > 0 and use_gate is not None)
                 or (self.text_aug_benefit_weight > 0 and aug_gate is not None)
                 or (self.text_aug_reg_weight > 0 and aug_gate is not None)
-                or (self.text_uplift_weight > 0 and reliability_gate is not None)
+                or (self.text_strength_weight > 0 and strength_gate is not None)
             )
         )
         if needs_text_baseline:
@@ -553,15 +594,16 @@ class CSDI_base(nn.Module):
                     text_mask,
                 )
                 auxiliary_loss = auxiliary_loss + self.text_consistency_weight * consistency_loss
-            if self.text_benefit_weight > 0 and benefit_gate is not None and predicted_raw is not None:
-                benefit_loss = self._calc_text_benefit_loss(
-                    predicted_raw,
+            use_loss_weight = self.text_use_weight * self._get_gate_loss_scale("use")
+            if use_loss_weight > 0 and use_gate is not None:
+                use_loss = self._calc_text_use_loss(
+                    predicted,
                     predicted_no_text,
                     observed_data,
                     target_mask,
-                    benefit_gate,
+                    use_gate,
                 )
-                auxiliary_loss = auxiliary_loss + self.text_benefit_weight * benefit_loss
+                auxiliary_loss = auxiliary_loss + use_loss_weight * use_loss
             if self.text_aug_benefit_weight > 0 and aug_gate is not None and predicted_raw is not None:
                 aug_benefit_loss = self._calc_text_benefit_loss(
                     predicted,
@@ -579,15 +621,16 @@ class CSDI_base(nn.Module):
                     aug_gate,
                 )
                 auxiliary_loss = auxiliary_loss + self.text_aug_reg_weight * aug_reg_loss
-            if self.text_uplift_weight > 0 and reliability_gate is not None:
-                uplift_loss = self._calc_text_uplift_loss(
+            strength_loss_weight = self.text_strength_weight * self._get_gate_loss_scale("strength")
+            if strength_loss_weight > 0 and strength_gate is not None:
+                strength_loss = self._calc_text_strength_loss(
                     predicted,
                     predicted_no_text,
                     observed_data,
                     target_mask,
-                    reliability_gate,
+                    strength_gate,
                 )
-                auxiliary_loss = auxiliary_loss + self.text_uplift_weight * uplift_loss
+                auxiliary_loss = auxiliary_loss + strength_loss_weight * strength_loss
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -618,7 +661,11 @@ class CSDI_base(nn.Module):
         diff = (predicted - predicted_no_text) * target_mask
         num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
         per_sample = (diff ** 2).sum(dim=(1, 2)) / num_eval
-        quality = text_mask.reshape(-1).float().clamp(min=0.0, max=1.0)
+        quality = text_mask.float().clamp(min=0.0, max=1.0)
+        if quality.dim() > 1:
+            quality = quality.mean(dim=1)
+        else:
+            quality = quality.reshape(-1)
         weights = 1.0 - quality
         valid = weights > 0
         if not valid.any():
@@ -630,29 +677,59 @@ class CSDI_base(nn.Module):
         num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
         return (residual ** 2).sum(dim=(1, 2)) / num_eval
 
+    def _calc_per_horizon_forecast_loss(self, predicted, observed_data, target_mask):
+        future_slice = slice(self.lookback_len, self.lookback_len + self.pred_len)
+        future_residual = (observed_data - predicted)[:, :, future_slice] * target_mask[:, :, future_slice]
+        future_mask = target_mask[:, :, future_slice]
+        num_eval = future_mask.sum(dim=1).clamp(min=1.0)
+        return (future_residual ** 2).sum(dim=1) / num_eval
+
     def _calc_text_benefit_loss(self, predicted, predicted_no_text, observed_data, target_mask, benefit_gate):
         text_loss = self._calc_per_sample_forecast_loss(predicted, observed_data, target_mask)
         base_loss = self._calc_per_sample_forecast_loss(predicted_no_text, observed_data, target_mask)
         target = (base_loss.detach() > text_loss.detach()).float()
-        gate = benefit_gate.reshape(-1).float().clamp(min=1e-4, max=1.0 - 1e-4)
+        if benefit_gate.dim() > 1:
+            gate = benefit_gate.float().mean(dim=1)
+        else:
+            gate = benefit_gate.reshape(-1).float()
+        gate = gate.clamp(min=1e-4, max=1.0 - 1e-4)
+        return F.binary_cross_entropy(gate, target)
+
+    def _calc_text_use_loss(self, predicted, predicted_no_text, observed_data, target_mask, use_gate):
+        gate = self._ensure_horizon_gate(use_gate)
+        if gate is None:
+            return torch.zeros((), device=predicted.device)
+        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
+        base_loss = self._calc_per_horizon_forecast_loss(predicted_no_text, observed_data, target_mask)
+        margin = max(float(self.text_use_margin), 0.0)
+        target = (text_loss.detach() <= (base_loss.detach() + margin)).float()
+        gate = gate.float().clamp(min=1e-4, max=1.0 - 1e-4)
         return F.binary_cross_entropy(gate, target)
 
     def _calc_text_aug_reg_loss(self, predicted_aug, predicted_raw, target_mask, aug_gate):
         diff = (predicted_aug - predicted_raw) * target_mask
         num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
         per_sample = (diff ** 2).sum(dim=(1, 2)) / num_eval
-        weights = 1.0 - aug_gate.reshape(-1).float().clamp(min=0.0, max=1.0)
+        if aug_gate.dim() > 1:
+            aug_weight = aug_gate.float().mean(dim=1)
+        else:
+            aug_weight = aug_gate.reshape(-1).float()
+        weights = 1.0 - aug_weight.clamp(min=0.0, max=1.0)
         valid = weights > 0
         if not valid.any():
             return torch.zeros((), device=predicted_aug.device)
         return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
 
-    def _calc_text_uplift_loss(self, predicted, predicted_no_text, observed_data, target_mask, reliability_gate):
-        text_loss = self._calc_per_sample_forecast_loss(predicted, observed_data, target_mask)
-        base_loss = self._calc_per_sample_forecast_loss(predicted_no_text, observed_data, target_mask)
-        tau = max(self.text_uplift_tau, 1e-6)
-        target = torch.sigmoid((base_loss.detach() - text_loss.detach()) / tau)
-        gate = reliability_gate.reshape(-1).float()
+    def _calc_text_strength_loss(self, predicted, predicted_no_text, observed_data, target_mask, strength_gate):
+        gate = self._ensure_horizon_gate(strength_gate)
+        if gate is None:
+            return torch.zeros((), device=predicted.device)
+        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
+        base_loss = self._calc_per_horizon_forecast_loss(predicted_no_text, observed_data, target_mask)
+        tau = max(self.text_strength_tau, 1e-6)
+        usable_target = (text_loss.detach() <= (base_loss.detach() + max(float(self.text_use_margin), 0.0))).float()
+        target = torch.sigmoid((base_loss.detach() - text_loss.detach()) / tau) * usable_target
+        gate = gate.float()
         valid = gate > 0
         if not valid.any():
             return torch.zeros((), device=predicted.device)
@@ -679,9 +756,13 @@ class CSDI_base(nn.Module):
             components.append(torch.full((batch_size,), epoch_conf, device=self.device))
 
         if self.multi_res_dynamic_by_trend and trend_prior is not None:
-            strength = trend_prior[:, 1].clamp(min=0.5, max=1.5)
+            if trend_prior.dim() == 3:
+                strength = trend_prior[:, :, 1].mean(dim=1).clamp(min=0.5, max=1.5)
+                volatility = trend_prior[:, :, 2].mean(dim=1).clamp(min=0.0, max=1.0)
+            else:
+                strength = trend_prior[:, 1].clamp(min=0.5, max=1.5)
+                volatility = trend_prior[:, 2].clamp(min=0.0, max=1.0)
             strength_conf = (strength - 0.5) / 1.0
-            volatility = trend_prior[:, 2].clamp(min=0.0, max=1.0)
             stability_conf = 1.0 - volatility
             trend_conf = 0.5 * (strength_conf + stability_conf)
             components.append(trend_conf.clamp(0.0, 1.0))
@@ -839,7 +920,10 @@ class CSDI_base(nn.Module):
         B, K, L = observed_data.shape
         guide_w_tensor = self._to_samplewise_weight(guide_w, B, observed_data.device)
         if text_mask is not None:
-            effective_guide_w = guide_w_tensor * text_mask.clamp(min=0.0, max=1.0).pow(self.guide_reliability_power)
+            if text_mask.dim() > 1:
+                effective_guide_w = guide_w_tensor.unsqueeze(1) * text_mask.clamp(min=0.0, max=1.0).pow(self.guide_reliability_power)
+            else:
+                effective_guide_w = guide_w_tensor * text_mask.clamp(min=0.0, max=1.0).pow(self.guide_reliability_power)
         else:
             effective_guide_w = guide_w_tensor
         if self.ddim:
@@ -923,11 +1007,23 @@ class CSDI_base(nn.Module):
                         if trend_prior is not None:
                             step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None)
                             trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w_tensor, text_mask)
-                            predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
+                            seq_trend_weight = self._build_future_seq_weight(trend_weight, L)
+                            if seq_trend_weight is None:
+                                predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
+                            else:
+                                predicted = predicted_uncond + seq_trend_weight * (predicted_cond - predicted_uncond)
                         else:
-                            predicted = predicted_uncond + effective_guide_w[:, None, None] * (predicted_cond - predicted_uncond)
+                            seq_weight = self._build_future_seq_weight(effective_guide_w, L)
+                            if seq_weight is None:
+                                predicted = predicted_uncond + effective_guide_w[:, None, None] * (predicted_cond - predicted_uncond)
+                            else:
+                                predicted = predicted_uncond + seq_weight * (predicted_cond - predicted_uncond)
                     else:
-                        predicted = predicted_uncond + effective_guide_w[:, None, None] * (predicted_cond - predicted_uncond)
+                        seq_weight = self._build_future_seq_weight(effective_guide_w, L)
+                        if seq_weight is None:
+                            predicted = predicted_uncond + effective_guide_w[:, None, None] * (predicted_cond - predicted_uncond)
+                        else:
+                            predicted = predicted_uncond + seq_weight * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -1040,10 +1136,14 @@ class CSDI_Forecasting(CSDI_base):
         observed_mask = batch["observed_mask"].to(self.device).float()
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
+        batch_size = observed_data.shape[0]
         text_mask = batch["text_mark"].to(self.device).float().reshape(-1).clamp(0.0, 1.0)
         text_quality_raw = batch.get("text_quality_raw")
         if text_quality_raw is not None:
             text_quality_raw = text_quality_raw.to(self.device).float().reshape(-1)
+            if self.text_quality_gate:
+                gated_quality = text_quality_raw.clamp(min=self.text_quality_min_scale, max=1.0)
+                text_mask = (text_mask > 0).float() * gated_quality
         else:
             text_quality_raw = text_mask
         trend_prior_num = batch.get("trend_prior_num", batch.get("trend_prior"))
@@ -1067,6 +1167,8 @@ class CSDI_Forecasting(CSDI_base):
                     text_quality_raw,
                     text_quality_raw,
                     text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
                 ],
                 dim=1,
             )
@@ -1076,9 +1178,27 @@ class CSDI_Forecasting(CSDI_base):
         else:
             timesteps = None
         if self.with_texts:
-            texts = batch.get("text_raw", batch.get("texts"))
+            texts = batch.get("texts", batch.get("text_raw"))
+            text_event_texts = self._reshape_text_event_batch(batch.get("text_event_texts"), batch_size)
+            text_event_source_ids = batch.get("text_event_source_ids")
+            text_event_time_deltas = batch.get("text_event_time_deltas")
+            text_event_quality_feats = batch.get("text_event_quality_feats")
+            text_event_mask = batch.get("text_event_mask")
+            if text_event_source_ids is not None:
+                text_event_source_ids = text_event_source_ids.to(self.device).long()
+            if text_event_time_deltas is not None:
+                text_event_time_deltas = text_event_time_deltas.to(self.device).float()
+            if text_event_quality_feats is not None:
+                text_event_quality_feats = text_event_quality_feats.to(self.device).float()
+            if text_event_mask is not None:
+                text_event_mask = text_event_mask.to(self.device).float()
         else:
             texts = None
+            text_event_texts = None
+            text_event_source_ids = None
+            text_event_time_deltas = None
+            text_event_quality_feats = None
+            text_event_mask = None
 
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
@@ -1103,7 +1223,118 @@ class CSDI_Forecasting(CSDI_base):
             trend_prior_num,
             trend_prior_text,
             text_evidence_vec,
+            text_event_texts,
+            text_event_source_ids,
+            text_event_time_deltas,
+            text_event_quality_feats,
+            text_event_mask,
         )        
+
+    def _unpack_forecasting_batch(self, data):
+        defaults = {
+            "feature_id": None,
+            "timesteps": None,
+            "texts": None,
+            "text_mask": None,
+            "trend_prior_num": None,
+            "trend_prior_text": None,
+            "text_evidence_vec": None,
+            "text_event_texts": None,
+            "text_event_source_ids": None,
+            "text_event_time_deltas": None,
+            "text_event_quality_feats": None,
+            "text_event_mask": None,
+        }
+        if len(data) >= 18:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+                defaults["text_evidence_vec"],
+                defaults["text_event_texts"],
+                defaults["text_event_source_ids"],
+                defaults["text_event_time_deltas"],
+                defaults["text_event_quality_feats"],
+                defaults["text_event_mask"],
+            ) = data
+        elif len(data) == 13:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+                defaults["text_evidence_vec"],
+            ) = data
+        elif len(data) == 12:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+            ) = data
+        elif len(data) == 11:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["trend_prior_num"],
+            ) = data
+            defaults["trend_prior_text"] = defaults["trend_prior_num"]
+        elif len(data) == 10:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+            ) = data
+        else:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+            ) = data
+        return observed_data, observed_mask, observed_tp, gt_mask, defaults
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
         size = self.num_sample_features
@@ -1162,45 +1393,338 @@ class CSDI_Forecasting(CSDI_base):
             return value
         return torch.full((batch_size,), float(value), device=device)
 
-    def _update_reliability_debug(self, reliability_gate, evidence_vec=None):
-        if reliability_gate is None:
+    def _update_reliability_debug(self, use_gate, strength_gate=None, evidence_vec=None):
+        if use_gate is None and strength_gate is None:
             self.latest_reliability_stats = {}
             return
-        values = reliability_gate.detach().reshape(-1).float().cpu()
-        if values.numel() == 0:
+        use_values = None if use_gate is None else use_gate.detach().reshape(-1).float().cpu()
+        strength_values = None if strength_gate is None else strength_gate.detach().reshape(-1).float().cpu()
+        if (use_values is None or use_values.numel() == 0) and (strength_values is None or strength_values.numel() == 0):
             self.latest_reliability_stats = {}
             return
-        stats = {
-            "mean": float(values.mean().item()),
-            "std": float(values.std(unbiased=False).item()),
-            "p10": float(torch.quantile(values, 0.1).item()),
-            "p50": float(torch.quantile(values, 0.5).item()),
-            "p90": float(torch.quantile(values, 0.9).item()),
-        }
+        stats = {}
+        if use_values is not None and use_values.numel() > 0:
+            stats["use_gate"] = {
+                "mean": float(use_values.mean().item()),
+                "std": float(use_values.std(unbiased=False).item()),
+                "p10": float(torch.quantile(use_values, 0.1).item()),
+                "p50": float(torch.quantile(use_values, 0.5).item()),
+                "p90": float(torch.quantile(use_values, 0.9).item()),
+            }
+            if use_gate.dim() > 1:
+                thirds = torch.chunk(use_gate.detach().float().cpu(), 3, dim=1)
+                labels = ("near", "mid", "far")
+                for label, chunk in zip(labels, thirds):
+                    stats["use_gate"][label] = float(chunk.mean().item())
+        if strength_values is not None and strength_values.numel() > 0:
+            stats["strength_gate"] = {
+                "mean": float(strength_values.mean().item()),
+                "std": float(strength_values.std(unbiased=False).item()),
+                "p10": float(torch.quantile(strength_values, 0.1).item()),
+                "p50": float(torch.quantile(strength_values, 0.5).item()),
+                "p90": float(torch.quantile(strength_values, 0.9).item()),
+            }
+            if strength_gate.dim() > 1:
+                thirds = torch.chunk(strength_gate.detach().float().cpu(), 3, dim=1)
+                labels = ("near", "mid", "far")
+                for label, chunk in zip(labels, thirds):
+                    stats["strength_gate"][label] = float(chunk.mean().item())
         if evidence_vec is not None:
             evidence_mean = evidence_vec.detach().float().mean(dim=0).cpu().tolist()
             stats["evidence_mean"] = [float(v) for v in evidence_mean]
         self.latest_reliability_stats = stats
 
-    def _compute_sample_reliability(self, text_evidence_vec, text_mask=None):
-        if text_evidence_vec is None or not self.with_texts:
-            reliability = text_mask
-            self._update_reliability_debug(reliability, None)
-            return reliability
-        evidence = text_evidence_vec.float()
-        reliability = torch.sigmoid(self.reliability_head(evidence)).reshape(-1)
-        reliability = self.reliability_min + (1.0 - self.reliability_min) * reliability
+    def _get_gate_warmup_scale(self, gate_name):
+        epoch = max(int(self.current_epoch), 0)
+        if gate_name == "use":
+            full_epoch = max(int(self.use_gate_warmup_epochs), 0)
+            if full_epoch <= 0:
+                return 1.0
+            return float(min(max(epoch, 0), full_epoch)) / float(full_epoch)
+        delay_epoch = max(int(self.use_gate_warmup_epochs), 0)
+        full_epoch = max(int(self.strength_gate_warmup_epochs), delay_epoch)
+        if epoch <= delay_epoch:
+            return 0.0
+        if full_epoch <= delay_epoch:
+            return 1.0
+        return float(min(epoch - delay_epoch, full_epoch - delay_epoch)) / float(full_epoch - delay_epoch)
+
+    def _get_gate_loss_scale(self, gate_name):
+        return self._get_gate_warmup_scale(gate_name)
+
+    def _ensure_horizon_gate(self, gate, batch_size=None):
+        if gate is None:
+            return None
+        if gate.dim() == 1:
+            return gate.unsqueeze(1).expand(-1, self.pred_len)
+        if gate.dim() == 2:
+            return gate
+        if gate.dim() > 2:
+            return gate.reshape(gate.shape[0], -1)[:, : self.pred_len]
+        if batch_size is not None:
+            return gate.reshape(batch_size, self.pred_len)
+        return gate
+
+    def _collapse_horizon_gate(self, gate):
+        if gate is None:
+            return None
+        if gate.dim() <= 1:
+            return gate.reshape(-1)
+        return gate.mean(dim=1)
+
+    def _resize_horizon_gate(self, gate, target_len):
+        if gate is None:
+            return None
+        if gate.dim() <= 1:
+            return gate.reshape(-1, 1).float().expand(-1, target_len)
+        if gate.shape[1] == target_len:
+            return gate.float()
+        gate = gate.float().unsqueeze(1)
+        resized = F.interpolate(gate, size=target_len, mode="linear", align_corners=False)
+        return resized.squeeze(1)
+
+    def _build_future_seq_weight(self, weight, total_len):
+        if weight is None:
+            return None
+        if weight.dim() == 1:
+            return weight[:, None, None]
+        seq_weight = torch.ones((weight.shape[0], total_len), device=weight.device, dtype=weight.dtype)
+        future_len = min(self.pred_len, total_len - self.lookback_len)
+        if future_len > 0:
+            seq_weight[:, self.lookback_len:self.lookback_len + future_len] = weight[:, :future_len]
+        return seq_weight.unsqueeze(1)
+
+    def _compute_horizon_quality_prior(self, text_event_quality_feats, text_event_time_deltas, text_event_mask, fallback_quality):
+        fallback = fallback_quality.reshape(-1, 1).float().clamp(0.0, 1.0).expand(-1, self.pred_len)
+        if text_event_quality_feats is None or text_event_time_deltas is None or text_event_mask is None:
+            return fallback
+        quality_feats = text_event_quality_feats.float().clamp(min=0.0, max=1.0)
+        event_mask = text_event_mask.float().clamp(min=0.0, max=1.0)
+        event_strength = quality_feats.mean(dim=-1) * event_mask
+        horizon_index = torch.arange(self.pred_len, device=quality_feats.device, dtype=quality_feats.dtype).view(1, 1, -1)
+        event_time = text_event_time_deltas.float().unsqueeze(-1)
+        relevance = torch.exp(-torch.abs(event_time - horizon_index) / max(self.text_recency_tau_days, 1e-6))
+        weighted = event_strength.unsqueeze(-1) * relevance
+        denom = event_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        horizon_prior = weighted.sum(dim=1) / denom
+        return torch.maximum(horizon_prior.clamp(0.0, 1.0), fallback)
+
+    def _build_horizon_trend_priors(self, trend_prior_num, trend_prior_text, semantic_state, text_mask=None):
+        if trend_prior_num is None and trend_prior_text is None:
+            return None, None
+        if trend_prior_num is None:
+            trend_prior_num = trend_prior_text
+        if trend_prior_text is None:
+            trend_prior_text = trend_prior_num
+        num_prior = trend_prior_num.float().unsqueeze(1).expand(-1, self.pred_len, -1)
+        text_prior = trend_prior_text.float().unsqueeze(1).expand(-1, self.pred_len, -1)
+        if semantic_state is not None and hasattr(self, "semantic_to_trend"):
+            semantic_delta = self.semantic_to_trend(semantic_state.float()).reshape(-1, self.pred_len, 3)
+            semantic_delta = torch.tanh(semantic_delta)
+            semantic_delta[:, :, 0] = semantic_delta[:, :, 0]
+            semantic_delta[:, :, 1:] = 0.5 * semantic_delta[:, :, 1:]
+            text_prior = text_prior + self.semantic_trend_scale * semantic_delta
+            text_prior[:, :, 1:] = text_prior[:, :, 1:].clamp(min=0.0)
+        diff = torch.abs(text_prior - num_prior).sum(dim=-1)
+        align = torch.exp(-self.text_numeric_align_gamma * diff).clamp(0.0, 1.0)
         if text_mask is not None:
-            reliability = reliability * text_mask.reshape(-1).float().clamp(0.0, 1.0)
-        self._update_reliability_debug(reliability, evidence)
-        return reliability
+            align = align * self._ensure_horizon_gate(text_mask).float().clamp(0.0, 1.0)
+        fused = align.unsqueeze(-1) * text_prior + (1.0 - align).unsqueeze(-1) * num_prior
+        return fused, align
+
+    def _reshape_text_event_batch(self, event_texts, batch_size):
+        if event_texts is None:
+            return None
+        if isinstance(event_texts, (list, tuple)):
+            if len(event_texts) == 0:
+                return [[] for _ in range(batch_size)]
+            if isinstance(event_texts[0], str):
+                return [[str(item)] for item in event_texts]
+            transposed = list(zip(*event_texts))
+            return [[str(item) for item in row] for row in transposed]
+        return None
+
+    def _encode_event_texts(self, text_event_texts, text_event_mask):
+        if not self.with_texts or text_event_texts is None or text_event_mask is None:
+            return None
+        batch_size = len(text_event_texts)
+        if batch_size <= 0:
+            return None
+        event_count = len(text_event_texts[0]) if len(text_event_texts[0]) > 0 else 0
+        if event_count <= 0:
+            return None
+        flat_texts = []
+        for row in text_event_texts:
+            if len(row) != event_count:
+                row = list(row) + ["NA"] * max(event_count - len(row), 0)
+                row = row[:event_count]
+            flat_texts.extend(row)
+        token_input = self.tokenizer(
+            flat_texts,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt',
+        ).to(self.device)
+        encoded = self.text_encoder(**token_input).last_hidden_state
+        pooled = encoded.mean(dim=1).reshape(batch_size, event_count, -1)
+        if text_event_mask is not None:
+            pooled = pooled * text_event_mask.unsqueeze(-1).float()
+        return pooled
+
+    def _compute_event_quality_scores(self, text_event_quality_feats, text_event_mask):
+        if text_event_quality_feats is None or text_event_mask is None:
+            return None
+        feats = text_event_quality_feats.float().clamp(min=1e-4, max=1.0)
+        log_score = torch.log(feats).mean(dim=-1)
+        log_score = log_score + torch.log(text_event_mask.float().clamp(min=1e-4))
+        masked_log_score = log_score.masked_fill(text_event_mask <= 0, float("-inf"))
+        all_invalid = (text_event_mask.sum(dim=1) <= 0)
+        if all_invalid.any():
+            masked_log_score = masked_log_score.clone()
+            masked_log_score[all_invalid] = 0.0
+        scores = torch.softmax(self.event_quality_beta * masked_log_score, dim=1)
+        scores = scores * text_event_mask.float()
+        denom = scores.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        return scores / denom
+
+    def _summarize_event_quality(self, text_event_quality_feats, event_scores, text_event_mask, base_evidence=None):
+        if text_event_quality_feats is None or event_scores is None or text_event_mask is None:
+            return base_evidence
+        feats = text_event_quality_feats.float()
+        mask = text_event_mask.float()
+        weights = event_scores * mask
+        denom = weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        weighted = (weights.unsqueeze(-1) * feats).sum(dim=1) / denom
+        density = (mask.sum(dim=1) / float(mask.shape[1])).clamp(0.0, 1.0)
+        mean_score = (weights * feats.mean(dim=-1)).sum(dim=1) / denom.squeeze(1)
+        regime = torch.zeros_like(mean_score)
+        event_strength = weighted[:, 5]
+        if base_evidence is not None and base_evidence.shape[1] >= 7:
+            regime = base_evidence[:, 5].float().clamp(0.0, 1.0)
+            event_strength = 0.5 * event_strength + 0.5 * base_evidence[:, 6].float().clamp(0.0, 1.0)
+        return torch.stack(
+            [
+                mean_score.clamp(0.0, 1.0),
+                density,
+                weighted[:, 1].clamp(0.0, 1.0),
+                weighted[:, 3].clamp(0.0, 1.0),
+                weighted[:, 4].clamp(0.0, 1.0),
+                regime,
+                event_strength.clamp(0.0, 1.0),
+            ],
+            dim=1,
+        )
+
+    def _build_event_semantic_state(self, text_event_texts, text_event_source_ids, text_event_quality_feats, text_event_mask, base_evidence=None):
+        if (
+            not self.with_texts
+            or text_event_texts is None
+            or text_event_source_ids is None
+            or text_event_quality_feats is None
+            or text_event_mask is None
+        ):
+            return None, base_evidence
+        event_pooled = self._encode_event_texts(text_event_texts, text_event_mask)
+        if event_pooled is None:
+            return None, base_evidence
+        source_emb = self.event_source_embed(text_event_source_ids.long().clamp(min=0, max=2))
+        event_features = torch.cat(
+            [
+                event_pooled.float(),
+                source_emb.float(),
+                text_event_quality_feats.float(),
+            ],
+            dim=-1,
+        )
+        event_semantics = self.event_semantic_proj(event_features)
+        event_scores = self._compute_event_quality_scores(text_event_quality_feats, text_event_mask)
+        if event_scores is None:
+            return None, base_evidence
+        semantic_state = (event_scores.unsqueeze(-1) * event_semantics).sum(dim=1)
+        event_summary = self._summarize_event_quality(
+            text_event_quality_feats,
+            event_scores,
+            text_event_mask,
+            base_evidence=base_evidence,
+        )
+        return semantic_state, event_summary
+
+    def _compute_text_gates(self, text_evidence_vec, text_mask=None, text_pooled=None, trend_prior_num=None, trend_prior_text=None, event_semantic_state=None, event_quality_summary=None, text_event_quality_feats=None, text_event_time_deltas=None, text_event_mask=None):
+        if (text_evidence_vec is None and event_quality_summary is None) or not self.with_texts:
+            use_gate = text_mask
+            strength_gate = text_mask
+            self._update_reliability_debug(use_gate, strength_gate, None)
+            return use_gate, strength_gate, None
+        base_evidence = None if text_evidence_vec is None else text_evidence_vec.float()
+        if event_quality_summary is not None and base_evidence is not None:
+            evidence = 0.4 * base_evidence + 0.6 * event_quality_summary.float()
+        elif event_quality_summary is not None:
+            evidence = event_quality_summary.float()
+        else:
+            evidence = base_evidence
+        if text_mask is not None:
+            text_mask = text_mask.reshape(-1).float().clamp(0.0, 1.0)
+        base_quality = evidence[:, 0].clamp(0.0, 1.0)
+        if text_mask is not None:
+            base_quality = base_quality * text_mask
+        horizon_quality_prior = self._compute_horizon_quality_prior(
+            text_event_quality_feats,
+            text_event_time_deltas,
+            text_event_mask,
+            base_quality,
+        )
+        if text_mask is not None:
+            horizon_quality_prior = horizon_quality_prior * text_mask.unsqueeze(1)
+
+        semantic_state = event_semantic_state
+        if semantic_state is None and text_pooled is not None:
+            semantic_state = self.semantic_proj(text_pooled.float())
+
+        raw_use_gate = torch.sigmoid(self.use_gate_head(evidence))
+        raw_use_gate = self.reliability_min + (1.0 - self.reliability_min) * raw_use_gate
+        use_scale = self._get_gate_warmup_scale("use")
+        use_gate = (1.0 - use_scale) * horizon_quality_prior + use_scale * raw_use_gate
+        if text_mask is not None:
+            use_gate = use_gate * text_mask.unsqueeze(1)
+
+        if trend_prior_num is None:
+            trend_prior_num = torch.zeros((evidence.shape[0], 3), device=evidence.device)
+        if trend_prior_text is None:
+            trend_prior_text = trend_prior_num
+        if semantic_state is None:
+            semantic_state = torch.zeros((evidence.shape[0], self.semantic_dim), device=evidence.device)
+
+        strength_features = torch.cat(
+            [
+                evidence,
+                semantic_state,
+                trend_prior_num.float(),
+                trend_prior_text.float(),
+            ],
+            dim=1,
+        )
+        raw_strength_gate = torch.sigmoid(self.strength_gate_head(strength_features))
+        raw_strength_gate = self.reliability_min + (1.0 - self.reliability_min) * raw_strength_gate
+        strength_scale = self._get_gate_warmup_scale("strength")
+        strength_gate = (1.0 - strength_scale) * horizon_quality_prior + strength_scale * raw_strength_gate
+        strength_gate = strength_gate * use_gate
+        if text_mask is not None:
+            strength_gate = strength_gate * text_mask.unsqueeze(1)
+
+        self._update_reliability_debug(use_gate, strength_gate, evidence)
+        return use_gate, strength_gate, semantic_state
 
     def get_trend_guidance_weight(self, trend_prior, step_ratio, guide_w, text_mask=None):
         base_weight = self._to_samplewise_weight(guide_w, trend_prior.shape[0], trend_prior.device)
-        strength = trend_prior[:, 1].clamp(min=0.0)
+        if trend_prior.dim() == 3:
+            strength = trend_prior[:, :, 1].clamp(min=0.0)
+            volatility = trend_prior[:, :, 2].clamp(min=0.0) * self.trend_volatility_scale
+            base_weight = base_weight.unsqueeze(1).expand(-1, trend_prior.shape[1])
+        else:
+            strength = trend_prior[:, 1].clamp(min=0.0)
+            volatility = trend_prior[:, 2].clamp(min=0.0) * self.trend_volatility_scale
         strength = 1.0 + self.trend_strength_scale * (strength - 1.0)
         strength = strength.clamp(min=0.0)
-        volatility = trend_prior[:, 2].clamp(min=0.0) * self.trend_volatility_scale
         vol_penalty = 1.0 / (1.0 + volatility)
         weight = base_weight * step_ratio * strength * vol_penalty
         if text_mask is not None:
@@ -1225,6 +1749,10 @@ class CSDI_Forecasting(CSDI_base):
         diff = torch.abs(trend_prior_text - trend_prior_num).sum(dim=1)
         align = torch.exp(-self.text_numeric_align_gamma * diff).clamp(0.0, 1.0)
         if text_mask is not None:
+            if text_mask.dim() > 1:
+                align = align.unsqueeze(1) * text_mask.float().clamp(0.0, 1.0)
+                fused = align.unsqueeze(-1) * trend_prior_text.unsqueeze(1) + (1.0 - align).unsqueeze(-1) * trend_prior_num.unsqueeze(1)
+                return fused, align
             align = align * text_mask.reshape(-1).float().clamp(0.0, 1.0)
         fused = align.unsqueeze(1) * trend_prior_text + (1.0 - align).unsqueeze(1) * trend_prior_num
         return fused, align
@@ -1243,7 +1771,8 @@ class CSDI_Forecasting(CSDI_base):
     def _build_text_context(self, encoded_text, text_scale):
         if encoded_text is None or text_scale is None:
             return None
-        context = encoded_text * text_scale.unsqueeze(1).unsqueeze(1)
+        token_scale = self._resize_horizon_gate(text_scale, encoded_text.shape[1]).clamp(min=0.0, max=1.0)
+        context = encoded_text * token_scale.unsqueeze(-1)
         return context.permute(0, 2, 1)
 
     def _summarize_numeric_context(self, observed_data, cond_mask):
@@ -1318,7 +1847,10 @@ class CSDI_Forecasting(CSDI_base):
             trend_prior_text = trend_prior_num
         if trend_align is None:
             trend_align = torch.ones((pooled_ret.shape[0],), device=self.device)
-        align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
+        if trend_align.dim() > 1:
+            align = trend_align.mean(dim=1, keepdim=True).float().clamp(0.0, 1.0)
+        else:
+            align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
         q_ret = quality_ret.reshape(-1, 1).float().clamp(0.0, 1.0)
         q_cot = quality_cot.reshape(-1, 1).float().clamp(0.0, 1.0)
         aug_features = torch.cat(
@@ -1335,13 +1867,13 @@ class CSDI_Forecasting(CSDI_base):
         )
         aug_base_gate = torch.sigmoid(self.text_aug_gate_head(aug_features)).reshape(-1)
         aug_available = torch.maximum(q_ret.reshape(-1), q_cot.reshape(-1))
-        raw_gate = raw_gate.reshape(-1).float().clamp(0.0, 1.0)
-        aug_gate = self.text_aug_max_ratio * raw_gate * aug_base_gate * aug_available
+        token_gate = self._resize_horizon_gate(raw_gate, raw_token_len).clamp(min=0.0, max=1.0)
+        aug_gate = self.text_aug_max_ratio * token_gate * aug_base_gate.unsqueeze(1) * aug_available.unsqueeze(1)
         if torch.all(aug_gate <= 0):
             return context_raw, aug_gate
         aug_residual = self.text_aug_adapter(aug_features)
         aug_residual = aug_residual.unsqueeze(2).expand(-1, self.text_hidden_dim, raw_token_len)
-        context_aug = context_raw + aug_gate.reshape(-1, 1, 1) * aug_residual
+        context_aug = context_raw + aug_gate.unsqueeze(1) * aug_residual
         return context_aug, aug_gate
 
     def get_text_info(self, text, text_mask):
@@ -1379,86 +1911,19 @@ class CSDI_Forecasting(CSDI_base):
 
     def forward(self, batch, is_train=1):
         data = self.process_data(batch)
-        if len(data) == 13:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior_num,
-                trend_prior_text,
-                text_evidence_vec,
-            ) = data
-        elif len(data) == 12:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior_num,
-                trend_prior_text,
-            ) = data
-            text_evidence_vec = None
-        elif len(data) == 11:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior_num,
-            ) = data
-            trend_prior_text = trend_prior_num
-            text_evidence_vec = None
-        elif len(data) == 10:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-            ) = data
-            trend_prior_num = None
-            trend_prior_text = None
-            text_evidence_vec = None
-        else:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-            ) = data
-            feature_id = None
-            timesteps = None
-            texts = None
-            text_mask = None
-            trend_prior_num = None
-            trend_prior_text = None
-            text_evidence_vec = None
+        observed_data, observed_mask, observed_tp, gt_mask, unpacked = self._unpack_forecasting_batch(data)
+        feature_id = unpacked["feature_id"]
+        timesteps = unpacked["timesteps"]
+        texts = unpacked["texts"]
+        text_mask = unpacked["text_mask"]
+        trend_prior_num = unpacked["trend_prior_num"]
+        trend_prior_text = unpacked["trend_prior_text"]
+        text_evidence_vec = unpacked["text_evidence_vec"]
+        text_event_texts = unpacked["text_event_texts"]
+        text_event_source_ids = unpacked["text_event_source_ids"]
+        text_event_time_deltas = unpacked["text_event_time_deltas"]
+        text_event_quality_feats = unpacked["text_event_quality_feats"]
+        text_event_mask = unpacked["text_event_mask"]
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -1487,25 +1952,48 @@ class CSDI_Forecasting(CSDI_base):
 
         if self.with_texts:
             encoded_text, text_pooled, token_input = self._encode_text_source(texts)
+            event_semantic_state, event_quality_summary = self._build_event_semantic_state(
+                text_event_texts,
+                text_event_source_ids,
+                text_event_quality_feats,
+                text_event_mask,
+                base_evidence=text_evidence_vec,
+            )
         else:
             encoded_text = None
             text_pooled = None
-        reliability_gate = self._compute_sample_reliability(text_evidence_vec, text_mask)
-        trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, reliability_gate)
-        benefit_gate = reliability_gate
-        raw_gate = reliability_gate
-        context_raw = self._build_text_context(encoded_text, raw_gate) if encoded_text is not None else None
+            event_semantic_state = None
+            event_quality_summary = text_evidence_vec
+        use_gate, strength_gate, semantic_state = self._compute_text_gates(
+            text_evidence_vec,
+            text_mask=text_mask,
+            text_pooled=text_pooled,
+            trend_prior_num=trend_prior_num,
+            trend_prior_text=trend_prior_text,
+            event_semantic_state=event_semantic_state,
+            event_quality_summary=event_quality_summary,
+            text_event_quality_feats=text_event_quality_feats,
+            text_event_time_deltas=text_event_time_deltas,
+            text_event_mask=text_event_mask,
+        )
+        trend_prior_eff, trend_align = self._build_horizon_trend_priors(
+            trend_prior_num,
+            trend_prior_text,
+            semantic_state,
+            text_mask=use_gate,
+        )
+        context_raw = self._build_text_context(encoded_text, strength_gate) if encoded_text is not None else None
         raw_token_len = encoded_text.shape[1] if encoded_text is not None else None
         context, aug_gate = self._build_augmented_context(
             batch,
             context_raw,
-            raw_gate,
+            strength_gate,
             trend_prior_num,
             trend_prior_text,
             trend_align,
             raw_token_len,
         )
-        semantic_text_mask = raw_gate
+        semantic_text_mask = strength_gate
         effective_text_mask = semantic_text_mask * trend_align if (semantic_text_mask is not None and trend_align is not None) else semantic_text_mask
         trend_prior_for_multires = trend_prior_num
         if self.multi_res_trend_source in {"text_fused", "fused", "text"} and trend_prior_eff is not None:
@@ -1525,94 +2013,27 @@ class CSDI_Forecasting(CSDI_base):
             context=context,
             trend_prior=trend_prior_for_multires,
             text_mask=effective_text_mask,
-            benefit_gate=benefit_gate,
+            use_gate=use_gate,
             context_raw=context_raw,
             aug_gate=aug_gate,
-            reliability_gate=reliability_gate,
+            strength_gate=strength_gate,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
         data = self.process_data(batch)
-        if len(data) == 13:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior_num,
-                trend_prior_text,
-                text_evidence_vec,
-            ) = data
-        elif len(data) == 12:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior_num,
-                trend_prior_text,
-            ) = data
-            text_evidence_vec = None
-        elif len(data) == 11:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-                trend_prior_num,
-            ) = data
-            trend_prior_text = trend_prior_num
-            text_evidence_vec = None
-        elif len(data) == 10:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-                feature_id,
-                timesteps,
-                texts,
-                text_mask,
-            ) = data
-            trend_prior_num = None
-            trend_prior_text = None
-            text_evidence_vec = None
-        else:
-            (
-                observed_data,
-                observed_mask,
-                observed_tp,
-                gt_mask,
-                _,
-                _,
-            ) = data
-            feature_id = None
-            timesteps = None
-            texts = None
-            text_mask = None
-            trend_prior_num = None
-            trend_prior_text = None
-            text_evidence_vec = None
+        observed_data, observed_mask, observed_tp, gt_mask, unpacked = self._unpack_forecasting_batch(data)
+        feature_id = unpacked["feature_id"]
+        timesteps = unpacked["timesteps"]
+        texts = unpacked["texts"]
+        text_mask = unpacked["text_mask"]
+        trend_prior_num = unpacked["trend_prior_num"]
+        trend_prior_text = unpacked["trend_prior_text"]
+        text_evidence_vec = unpacked["text_evidence_vec"]
+        text_event_texts = unpacked["text_event_texts"]
+        text_event_source_ids = unpacked["text_event_source_ids"]
+        text_event_time_deltas = unpacked["text_event_time_deltas"]
+        text_event_quality_feats = unpacked["text_event_quality_feats"]
+        text_event_mask = unpacked["text_event_mask"]
 
         with torch.no_grad():
             cond_mask = gt_mask
@@ -1630,32 +2051,77 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 size_emb = None
 
-            reliability_gate = self._compute_sample_reliability(text_evidence_vec, text_mask)
-            trend_prior_eff, trend_align = self.fuse_trend_priors(trend_prior_num, trend_prior_text, reliability_gate)
             if self.with_texts:
                 encoded_text, text_pooled, token_input = self._encode_text_source(texts)
-                benefit_gate = reliability_gate
-                raw_gate = reliability_gate
-                context_raw = self._build_text_context(encoded_text, raw_gate)
+                event_semantic_state, event_quality_summary = self._build_event_semantic_state(
+                    text_event_texts,
+                    text_event_source_ids,
+                    text_event_quality_feats,
+                    text_event_mask,
+                    base_evidence=text_evidence_vec,
+                )
+                use_gate, strength_gate, semantic_state = self._compute_text_gates(
+                    text_evidence_vec,
+                    text_mask=text_mask,
+                    text_pooled=text_pooled,
+                    trend_prior_num=trend_prior_num,
+                    trend_prior_text=trend_prior_text,
+                    event_semantic_state=event_semantic_state,
+                    event_quality_summary=event_quality_summary,
+                    text_event_quality_feats=text_event_quality_feats,
+                    text_event_time_deltas=text_event_time_deltas,
+                    text_event_mask=text_event_mask,
+                )
+                trend_prior_eff, trend_align = self._build_horizon_trend_priors(
+                    trend_prior_num,
+                    trend_prior_text,
+                    semantic_state,
+                    text_mask=use_gate,
+                )
+                context_raw = self._build_text_context(encoded_text, strength_gate)
                 raw_token_len = encoded_text.shape[1]
                 context, aug_gate = self._build_augmented_context(
                     batch,
                     context_raw,
-                    raw_gate,
+                    strength_gate,
                     trend_prior_num,
                     trend_prior_text,
                     trend_align,
                     raw_token_len,
                 )
-                semantic_text_mask = raw_gate
+                semantic_text_mask = strength_gate
                 if self.save_token:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
+                event_semantic_state, event_quality_summary = self._build_event_semantic_state(
+                    text_event_texts,
+                    text_event_source_ids,
+                    text_event_quality_feats,
+                    text_event_mask,
+                    base_evidence=text_evidence_vec,
+                )
+                use_gate, strength_gate, semantic_state = self._compute_text_gates(
+                    text_evidence_vec,
+                    text_mask=text_mask,
+                    text_pooled=None,
+                    trend_prior_num=trend_prior_num,
+                    trend_prior_text=trend_prior_text,
+                    event_semantic_state=event_semantic_state,
+                    event_quality_summary=event_quality_summary,
+                    text_event_quality_feats=text_event_quality_feats,
+                    text_event_time_deltas=text_event_time_deltas,
+                    text_event_mask=text_event_mask,
+                )
+                trend_prior_eff, trend_align = self._build_horizon_trend_priors(
+                    trend_prior_num,
+                    trend_prior_text,
+                    semantic_state,
+                    text_mask=use_gate,
+                )
                 context = None
-                benefit_gate = None
                 aug_gate = None
                 context_raw = None
-                semantic_text_mask = reliability_gate
+                semantic_text_mask = strength_gate
             text_mask_f = text_mask.float() if text_mask is not None else None
             if semantic_text_mask is not None:
                 text_mask_f = semantic_text_mask.float()

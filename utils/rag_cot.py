@@ -1,4 +1,6 @@
 import json
+import hashlib
+import os
 import re
 import sys
 import warnings
@@ -22,6 +24,7 @@ class RAGCoTConfig:
     temperature: float = 0.7
     cot_model: Optional[str] = None
     cache_size: int = 1024
+    cache_dir: Optional[str] = None
     local_files_only: bool = True
     device: Optional[str] = None
     trust_remote_code: bool = False
@@ -69,6 +72,9 @@ class RAGCoTPipeline:
         self.retriever = self._fit_retriever(self.search_df)
         self.generator = self._init_generator(self.config)
         self.cache: OrderedDict[str, Dict[str, str]] = OrderedDict()
+        self.cache_dir = self.config.cache_dir
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
 
     def _resolve_stage2_topk(self, stage2_topk: int) -> int:
         if stage2_topk and stage2_topk > 0:
@@ -168,6 +174,85 @@ class RAGCoTPipeline:
             for i in top_idx
             if sims[i] > 0 and len(self.search_df.iloc[i].fact.strip()) > 0
         ]
+
+    def _cache_signature(self) -> Dict[str, object]:
+        return {
+            "domain": self.domain,
+            "lookback_len": self.lookback_len,
+            "pred_len": self.pred_len,
+            "use_retrieval": bool(self.config.use_retrieval),
+            "top_k": int(self.config.top_k),
+            "cot_model": self.config.cot_model,
+            "max_new_tokens": int(self.config.max_new_tokens),
+            "temperature": float(self.config.temperature),
+            "structured_output": bool(self.config.structured_output),
+            "include_cot_in_text": bool(self.config.include_cot_in_text),
+            "use_two_stage_rag": bool(self.config.use_two_stage_rag),
+            "rag_stage1_topk": int(self.config.rag_stage1_topk),
+            "rag_stage2_topk": int(self.config.rag_stage2_topk),
+            "two_stage_gate": bool(self.config.two_stage_gate),
+            "trend_slope_eps": float(self.config.trend_slope_eps),
+        }
+
+    def _make_cache_key(self, numeric_history: Sequence[float], start_date, end_date, base_text: str) -> str:
+        numeric_arr = np.asarray(numeric_history, dtype=np.float32)
+        numeric_digest = hashlib.sha1(numeric_arr.tobytes()).hexdigest()
+        payload = {
+            "signature": self._cache_signature(),
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "base_text_digest": hashlib.sha1(str(base_text).encode("utf-8")).hexdigest(),
+            "numeric_shape": list(numeric_arr.shape),
+            "numeric_digest": numeric_digest,
+        }
+        raw_key = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
+
+    def _disk_cache_path(self, cache_key: str) -> Optional[str]:
+        if not self.cache_dir:
+            return None
+        safe_domain = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.domain)
+        return os.path.join(self.cache_dir, f"{safe_domain}_{cache_key}.json")
+
+    def _json_safe_package(self, packaged: Dict[str, object]) -> Dict[str, object]:
+        def normalize(value):
+            if isinstance(value, pd.Timestamp):
+                return value.isoformat()
+            if isinstance(value, np.datetime64):
+                return pd.Timestamp(value).isoformat()
+            if isinstance(value, dict):
+                return {str(k): normalize(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [normalize(v) for v in value]
+            return value
+
+        return normalize(packaged)
+
+    def _load_disk_cache(self, cache_key: str) -> Optional[Dict[str, object]]:
+        path = self._disk_cache_path(cache_key)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if isinstance(cached, dict):
+                return cached
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Ignoring broken RAG/CoT disk cache '{path}' ({exc}).")
+        return None
+
+    def _store_cache(self, cache_key: str, packaged: Dict[str, object]) -> Dict[str, object]:
+        self.cache[cache_key] = packaged
+        if len(self.cache) > self.config.cache_size:
+            self.cache.popitem(last=False)
+        path = self._disk_cache_path(cache_key)
+        if path:
+            safe_packaged = self._json_safe_package(packaged)
+            tmp_path = f"{path}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(safe_packaged, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        return packaged
 
     def _retrieve_records(self, query_text: str, top_k: Optional[int] = None) -> List[Dict[str, object]]:
         k = self.config.top_k if top_k is None else int(top_k)
@@ -503,16 +588,19 @@ class RAGCoTPipeline:
         end_date,
         base_text: str,
     ) -> Dict[str, str]:
-        cache_key = f"{start_date}-{end_date}"
+        cache_key = self._make_cache_key(numeric_history, start_date, end_date, base_text)
         if cache_key in self.cache:
             return self.cache[cache_key]
+        disk_cached = self._load_disk_cache(cache_key)
+        if disk_cached is not None:
+            self.cache[cache_key] = disk_cached
+            if len(self.cache) > self.config.cache_size:
+                self.cache.popitem(last=False)
+            return disk_cached
 
         if not self.use_two_stage_rag:
             packaged = self._build_one_shot_guidance(numeric_history, base_text)
-            self.cache[cache_key] = packaged
-            if len(self.cache) > self.config.cache_size:
-                self.cache.popitem(last=False)
-            return packaged
+            return self._store_cache(cache_key, packaged)
 
         numeric_summary = self._summarize_numeric(numeric_history)
         numeric_stats = self._compute_numeric_stats(numeric_history)
@@ -520,19 +608,13 @@ class RAGCoTPipeline:
 
         if self.two_stage_gate and self._is_empty_text(base_text) and abs(numeric_stats["slope"]) < self.trend_slope_eps:
             packaged = self._build_one_shot_guidance(numeric_history, base_text)
-            self.cache[cache_key] = packaged
-            if len(self.cache) > self.config.cache_size:
-                self.cache.popitem(last=False)
-            return packaged
+            return self._store_cache(cache_key, packaged)
 
         retrieved_stage1_records = self._retrieve_records(query, top_k=self.rag_stage1_topk)
         retrieved_stage1 = [record["fact"] for record in retrieved_stage1_records]
         if not retrieved_stage1:
             packaged = self._build_one_shot_guidance(numeric_history, base_text)
-            self.cache[cache_key] = packaged
-            if len(self.cache) > self.config.cache_size:
-                self.cache.popitem(last=False)
-            return packaged
+            return self._store_cache(cache_key, packaged)
 
         trend_prompt = self._format_trend_prompt(numeric_summary, retrieved_stage1)
         trend_hypothesis = self._generate_trend_hypothesis(
@@ -574,7 +656,4 @@ class RAGCoTPipeline:
             "retrieved_records": final_records,
             "composed_text": composed_text,
         }
-        self.cache[cache_key] = packaged
-        if len(self.cache) > self.config.cache_size:
-            self.cache.popitem(last=False)
-        return packaged
+        return self._store_cache(cache_key, packaged)

@@ -18,6 +18,7 @@ bert-base-uncased/
 # Training artifacts
 save/
 logs/
+.rag_cot_cache/
 
 # Weights/checkpoints
 *.pt

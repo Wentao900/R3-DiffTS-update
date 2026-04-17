@@ -41,6 +41,7 @@ parser.add_argument('--cot_model', type=str, default=None, help='local causal LM
 parser.add_argument('--cot_max_new_tokens', type=int, default=96, help='max new tokens for CoT generator')
 parser.add_argument('--cot_temperature', type=float, default=0.7, help='sampling temperature for CoT generator')
 parser.add_argument('--cot_cache_size', type=int, default=1024, help='cache size for generated CoT strings')
+parser.add_argument('--cot_cache_dir', type=str, default=None, help='disk cache directory for generated RAG/CoT guidance')
 parser.add_argument('--cot_device', type=str, default=None, help='device for CoT generator, e.g., cuda:0 or cpu')
 parser.add_argument('--cot_load_in_8bit', action='store_true', help='load CoT model in 8-bit (requires bitsandbytes)')
 parser.add_argument('--cot_load_in_4bit', action='store_true', help='load CoT model in 4-bit (requires bitsandbytes)')
@@ -299,6 +300,7 @@ args.cot_model = config["model"].get("cot_model", args.cot_model)
 args.cot_max_new_tokens = config["model"].get("cot_max_new_tokens", args.cot_max_new_tokens)
 args.cot_temperature = config["model"].get("cot_temperature", args.cot_temperature)
 args.cot_cache_size = config["model"].get("cot_cache_size", args.cot_cache_size)
+args.cot_cache_dir = config["model"].get("cot_cache_dir", args.cot_cache_dir)
 args.cot_device = config["model"].get("cot_device", args.cot_device)
 args.cot_load_in_8bit = config["model"].get("cot_load_in_8bit", args.cot_load_in_8bit)
 args.cot_load_in_4bit = config["model"].get("cot_load_in_4bit", args.cot_load_in_4bit)
@@ -349,6 +351,7 @@ config["model"]["cot_model"] = args.cot_model
 config["model"]["cot_max_new_tokens"] = args.cot_max_new_tokens
 config["model"]["cot_temperature"] = args.cot_temperature
 config["model"]["cot_cache_size"] = args.cot_cache_size
+config["model"]["cot_cache_dir"] = args.cot_cache_dir
 config["model"]["cot_device"] = args.cot_device
 config["model"]["cot_load_in_8bit"] = args.cot_load_in_8bit
 config["model"]["cot_load_in_4bit"] = args.cot_load_in_4bit
@@ -394,6 +397,7 @@ args.text_trend_raw_weight = float(config["model"].get("text_trend_raw_weight", 
 args.text_trend_ret_weight = float(config["model"].get("text_trend_ret_weight", 0.35))
 args.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
 args.max_text_events = int(dataset_cfg.get("max_text_events", 12))
+args.num_workers = int(dataset_cfg.get("num_workers", args.num_workers))
 
 args.batch_size = config["train"]["batch_size"]
 

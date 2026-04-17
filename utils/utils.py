@@ -28,6 +28,8 @@ def train(
     )
 
     best_valid_loss = 1e10
+    max_train_batches = min(len(train_loader), int(config["itr_per_epoch"]))
+    print(f"[train] batches per epoch: {max_train_batches} (loader={len(train_loader)}, itr_per_epoch={config['itr_per_epoch']})")
     for epoch_no in range(config["epochs"]):
         avg_loss = 0
         model.current_epoch = epoch_no

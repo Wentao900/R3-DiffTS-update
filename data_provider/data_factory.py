@@ -29,6 +29,7 @@ def data_provider(args, flag):
         extra_kwargs['cot_max_new_tokens'] = args.cot_max_new_tokens
         extra_kwargs['cot_temperature'] = args.cot_temperature
         extra_kwargs['cot_cache_size'] = args.cot_cache_size
+        extra_kwargs['cot_cache_dir'] = getattr(args, "cot_cache_dir", None)
         extra_kwargs['cot_device'] = args.cot_device
         extra_kwargs['cot_load_in_8bit'] = getattr(args, "cot_load_in_8bit", False)
         extra_kwargs['cot_load_in_4bit'] = getattr(args, "cot_load_in_4bit", False)

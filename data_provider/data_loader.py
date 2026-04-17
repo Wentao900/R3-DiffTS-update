@@ -56,7 +56,7 @@ class Dataset_Custom(Dataset):
                  max_text_tokens=256, text_drop_prob=0.0,
                  use_rag_cot=False, rag_topk=3, cot_model=None,
                  cot_max_new_tokens=96, cot_temperature=0.7,
-                 cot_cache_size=1024, cot_device=None, rag_use_retrieval=True,
+                 cot_cache_size=1024, cot_cache_dir=None, cot_device=None, rag_use_retrieval=True,
                  cot_load_in_8bit=False, cot_load_in_4bit=False, trend_cfg=False,
                  use_two_stage_rag=False, rag_stage1_topk=-1, rag_stage2_topk=-1,
                  two_stage_gate=True, trend_slope_eps=1e-3,
@@ -104,6 +104,7 @@ class Dataset_Custom(Dataset):
         self.cot_max_new_tokens = cot_max_new_tokens
         self.cot_temperature = cot_temperature
         self.cot_cache_size = cot_cache_size
+        self.cot_cache_dir = cot_cache_dir
         self.cot_device = cot_device
         self.cot_load_in_8bit = cot_load_in_8bit
         self.cot_load_in_4bit = cot_load_in_4bit
@@ -170,6 +171,7 @@ class Dataset_Custom(Dataset):
                 temperature=self.cot_temperature,
                 cot_model=self.cot_model,
                 cache_size=self.cot_cache_size,
+                cache_dir=self.cot_cache_dir,
                 device=self.cot_device,
                 use_retrieval=self.rag_use_retrieval,
                 trust_remote_code=True if self.cot_model and ("qwen" in self.cot_model.lower()) else False,

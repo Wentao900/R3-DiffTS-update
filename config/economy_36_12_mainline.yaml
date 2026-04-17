@@ -63,6 +63,7 @@ model:
   cot_model: ./gpt2-medium
   cot_temperature: 0.2
   cot_max_new_tokens: 64
+  cot_cache_dir: .rag_cot_cache/economy_36_12
   is_unconditional: 0
   timeemb: 128
   featureemb: 16
@@ -126,3 +127,4 @@ dataset:
   text_recency_tau_days: 14.0
   text_coverage_kappa: 3.0
   max_text_events: 8
+  num_workers: 0

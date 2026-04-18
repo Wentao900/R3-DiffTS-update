@@ -454,7 +454,7 @@ guide_sweep_metrics = []
 if config["diffusion"]["cfg"]:
     best_mse = 10e10
     best_metrics = None
-    guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+    guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
     for guide_w in guide_list:
         metrics = evaluate(
             model,

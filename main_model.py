@@ -156,10 +156,13 @@ class CSDI_base(nn.Module):
         self.text_use_margin = float(train_cfg.get("text_use_margin", 0.02))
         self.text_strength_weight = float(train_cfg.get("text_strength_weight", train_cfg.get("text_uplift_weight", train_cfg.get("text_notext_fallback_weight", 0.0))))
         self.text_strength_tau = float(train_cfg.get("text_strength_tau", train_cfg.get("text_uplift_tau", 0.1)))
+        self.text_context_benefit_weight = float(train_cfg.get("text_context_benefit_weight", 0.05))
+        self.text_context_benefit_tau = float(train_cfg.get("text_context_benefit_tau", self.text_strength_tau))
         self.detach_text_baselines = bool(train_cfg.get("detach_text_baselines", True))
         self.text_uplift_weight = self.text_strength_weight
         self.text_uplift_tau = self.text_strength_tau
         self.latest_reliability_stats = {}
+        self.latest_text_benefit_stats = {}
 
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
@@ -444,6 +447,7 @@ class CSDI_base(nn.Module):
             "difficulty_ema": difficulty,
             "horizon_groups": [self._get_horizon_group(horizon) for horizon in active_horizons],
             "reliability": dict(self.latest_reliability_stats),
+            "text_benefit": dict(self.latest_text_benefit_stats),
         }
 
     def time_embedding(self, pos, d_model=128):
@@ -506,18 +510,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate, context_gate=context_gate
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, set_t=-1
     ):
 
         B, K, L = observed_data.shape
@@ -577,6 +581,7 @@ class CSDI_base(nn.Module):
                 or (self.text_aug_benefit_weight > 0 and aug_gate is not None)
                 or (self.text_aug_reg_weight > 0 and aug_gate is not None)
                 or (self.text_strength_weight > 0 and strength_gate is not None)
+                or (self.text_context_benefit_weight > 0 and context_gate is not None)
             )
         )
         if needs_text_baseline:
@@ -686,6 +691,16 @@ class CSDI_base(nn.Module):
                     strength_gate,
                 )
                 auxiliary_loss = auxiliary_loss + strength_loss_weight * strength_loss
+            context_benefit_weight = self.text_context_benefit_weight * self._get_gate_loss_scale("strength")
+            if context_benefit_weight > 0 and context_gate is not None:
+                context_benefit_loss = self._calc_context_benefit_loss(
+                    predicted,
+                    predicted_no_text,
+                    observed_data,
+                    target_mask,
+                    context_gate,
+                )
+                auxiliary_loss = auxiliary_loss + context_benefit_weight * context_benefit_loss
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -790,6 +805,38 @@ class CSDI_base(nn.Module):
             return torch.zeros((), device=predicted.device)
         gate = gate[valid].clamp(min=1e-4, max=1.0 - 1e-4)
         return F.binary_cross_entropy(gate, target[valid])
+
+    def _calc_context_benefit_loss(self, predicted, predicted_no_text, observed_data, target_mask, context_gate):
+        gate = self._ensure_horizon_gate(context_gate)
+        if gate is None:
+            return torch.zeros((), device=predicted.device)
+        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
+        base_loss = self._calc_per_horizon_forecast_loss(predicted_no_text, observed_data, target_mask)
+        tau = max(float(self.text_context_benefit_tau), 1e-6)
+        target = torch.sigmoid((base_loss.detach() - text_loss.detach()) / tau)
+        valid = target_mask[:, :, self.lookback_len:self.lookback_len + self.pred_len].sum(dim=1) > 0
+        valid = valid & (gate > 0)
+        if not valid.any():
+            return torch.zeros((), device=predicted.device)
+        gate = gate[valid].float().clamp(min=1e-4, max=1.0 - 1e-4)
+        target_valid = target[valid].float().clamp(min=0.0, max=1.0)
+        loss = F.binary_cross_entropy(gate, target_valid)
+        self._update_text_benefit_debug(gate.detach(), target_valid.detach(), text_loss.detach(), base_loss.detach())
+        return loss
+
+    def _update_text_benefit_debug(self, gate, target, text_loss, base_loss):
+        if gate.numel() == 0 or target.numel() == 0:
+            return
+        gain = (base_loss - text_loss).reshape(-1).float()
+        target_values = target.reshape(-1).float()
+        gate_values = gate.reshape(-1).float()
+        self.latest_text_benefit_stats = {
+            "gate_mean": float(gate_values.mean().detach().cpu().item()),
+            "target_mean": float(target_values.mean().detach().cpu().item()),
+            "target_p90": float(torch.quantile(target_values.detach().cpu(), 0.9).item()),
+            "gain_mean": float(gain.mean().detach().cpu().item()),
+            "gain_positive_rate": float((gain > 0).float().mean().detach().cpu().item()),
+        }
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -1599,7 +1646,103 @@ class CSDI_Forecasting(CSDI_base):
             return event_evidence
         return base_evidence
 
-    def _compute_context_gate(self, strength_gate, evidence_vec=None):
+    def _expand_evidence_to_horizon(self, evidence_vec, batch_size=None, device=None):
+        if evidence_vec is None:
+            return None
+        evidence = evidence_vec.float().clamp(min=0.0, max=1.0)
+        if evidence.dim() == 1:
+            evidence = evidence.reshape(-1, 1)
+        if evidence.dim() == 2:
+            return evidence.unsqueeze(1).expand(-1, self.pred_len, -1)
+        if evidence.dim() == 3:
+            if evidence.shape[1] == self.pred_len:
+                return evidence
+            evidence = evidence.permute(0, 2, 1)
+            resized = F.interpolate(evidence, size=self.pred_len, mode="linear", align_corners=False)
+            return resized.permute(0, 2, 1).clamp(min=0.0, max=1.0)
+        if batch_size is None:
+            batch_size = evidence.shape[0]
+        if device is None:
+            device = evidence.device
+        return torch.zeros((batch_size, self.pred_len, 7), device=device, dtype=evidence.dtype)
+
+    def _build_horizon_evidence(self, base_evidence, text_event_quality_feats=None, text_event_time_deltas=None, text_event_mask=None):
+        fallback = self._expand_evidence_to_horizon(base_evidence)
+        if fallback is None:
+            return None
+        if text_event_quality_feats is None or text_event_time_deltas is None or text_event_mask is None:
+            return fallback
+        feats = text_event_quality_feats.float().clamp(min=1e-4, max=1.0)
+        mask = text_event_mask.float().clamp(min=0.0, max=1.0)
+        if feats.shape[-1] < 6 or not torch.any(mask > 0):
+            return fallback
+        horizon_index = torch.arange(self.pred_len, device=feats.device, dtype=feats.dtype).view(1, 1, -1)
+        event_time = text_event_time_deltas.float().unsqueeze(-1)
+        relevance = torch.exp(-torch.abs(event_time - horizon_index) / max(self.text_recency_tau_days, 1e-6))
+        source = feats[:, :, 0:1]
+        freshness = feats[:, :, 1:2]
+        informativeness = feats[:, :, 2:3]
+        novelty = feats[:, :, 3:4]
+        agreement = feats[:, :, 4:5]
+        event_score = feats[:, :, 5:6]
+        log_quality = (
+            torch.log(source)
+            + torch.log(freshness)
+            + torch.log(informativeness)
+            + torch.log(agreement)
+            + torch.log(event_score)
+        ) / 5.0
+        quality = torch.exp(log_quality).clamp(min=0.0, max=1.0)
+        relevance_4d = relevance.unsqueeze(-1)
+        event_mask_4d = mask.unsqueeze(-1).unsqueeze(-1)
+        quality_4d = quality.unsqueeze(2)
+        weight = quality_4d * relevance_4d * event_mask_4d
+        denom = weight.sum(dim=1).clamp(min=1e-6)
+        density = (relevance * mask.unsqueeze(-1)).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + self.text_coverage_kappa)
+        regime = fallback[:, :, 5:6]
+        event_evidence = torch.cat(
+            [
+                (weight * quality_4d).sum(dim=1) / denom,
+                density.unsqueeze(-1).clamp(min=0.0, max=1.0),
+                (weight * freshness.unsqueeze(2)).sum(dim=1) / denom,
+                (weight * novelty.unsqueeze(2)).sum(dim=1) / denom,
+                (weight * agreement.unsqueeze(2)).sum(dim=1) / denom,
+                regime,
+                (weight * event_score.unsqueeze(2)).sum(dim=1) / denom,
+            ],
+            dim=-1,
+        ).clamp(min=0.0, max=1.0)
+        valid = (mask.sum(dim=1) > 0).float().view(-1, 1, 1)
+        return torch.where(valid > 0, 0.4 * fallback + 0.6 * event_evidence, fallback).clamp(min=0.0, max=1.0)
+
+    def _compute_numeric_uncertainty(self, observed_data, cond_mask):
+        lookback_data = observed_data[:, :, :self.lookback_len].float()
+        lookback_mask = cond_mask[:, :, :self.lookback_len].float().clamp(min=0.0, max=1.0)
+        denom = lookback_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        mean = (lookback_data * lookback_mask).sum(dim=(1, 2)) / denom
+        centered = (lookback_data - mean.view(-1, 1, 1)) * lookback_mask
+        std = torch.sqrt((centered ** 2).sum(dim=(1, 2)) / denom + 1e-6)
+        if self.lookback_len > 1:
+            diff = lookback_data[:, :, 1:] - lookback_data[:, :, :-1]
+            diff_mask = lookback_mask[:, :, 1:] * lookback_mask[:, :, :-1]
+            diff_denom = diff_mask.sum(dim=(1, 2)).clamp(min=1.0)
+            volatility = (diff.abs() * diff_mask).sum(dim=(1, 2)) / diff_denom
+            volatility = volatility / (std + 1e-6)
+        else:
+            volatility = torch.zeros_like(std)
+        mid = max(self.lookback_len // 2, 1)
+        early_mask = lookback_mask[:, :, :mid]
+        late_mask = lookback_mask[:, :, mid:]
+        early_denom = early_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        late_denom = late_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        early_mean = (lookback_data[:, :, :mid] * early_mask).sum(dim=(1, 2)) / early_denom
+        late_mean = (lookback_data[:, :, mid:] * late_mask).sum(dim=(1, 2)) / late_denom
+        regime = torch.abs(late_mean - early_mean) / (std + 1e-6)
+        base_uncertainty = torch.sigmoid(0.6 * volatility + 0.8 * regime - 1.0).view(-1, 1)
+        horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=observed_data.device, dtype=observed_data.dtype).view(1, -1)
+        return (0.7 * base_uncertainty + 0.3 * horizon_pos).clamp(min=0.0, max=1.0)
+
+    def _compute_context_gate(self, strength_gate, evidence_vec=None, numeric_uncertainty=None, trend_align=None):
         if strength_gate is None:
             return None
         gate = self._ensure_horizon_gate(strength_gate.float(), self.pred_len).clamp(min=0.0, max=1.0)
@@ -1607,18 +1750,27 @@ class CSDI_Forecasting(CSDI_base):
             ratio = torch.full_like(gate, min(max(float(self.text_context_ratio_min), 0.0), 1.0))
             dynamic_max = torch.full_like(gate, min(max(float(self.text_context_max_base), 0.0), 1.0))
         else:
-            evidence = evidence_vec.float().clamp(min=0.0, max=1.0)
-            if evidence.dim() == 1:
-                evidence = evidence.reshape(-1, 1)
-            quality = evidence[:, 0:1]
-            density = evidence[:, 1:2] if evidence.shape[1] > 1 else quality
-            freshness = evidence[:, 2:3] if evidence.shape[1] > 2 else quality
-            novelty = evidence[:, 3:4] if evidence.shape[1] > 3 else quality
-            agreement = evidence[:, 4:5] if evidence.shape[1] > 4 else quality
-            regime = evidence[:, 5:6] if evidence.shape[1] > 5 else quality
-            event_score = evidence[:, 6:7] if evidence.shape[1] > 6 else quality
+            evidence = self._expand_evidence_to_horizon(evidence_vec).clamp(min=0.0, max=1.0)
+            quality = evidence[:, :, 0]
+            density = evidence[:, :, 1] if evidence.shape[-1] > 1 else quality
+            freshness = evidence[:, :, 2] if evidence.shape[-1] > 2 else quality
+            novelty = evidence[:, :, 3] if evidence.shape[-1] > 3 else quality
+            agreement = evidence[:, :, 4] if evidence.shape[-1] > 4 else quality
+            regime = evidence[:, :, 5] if evidence.shape[-1] > 5 else quality
+            event_score = evidence[:, :, 6] if evidence.shape[-1] > 6 else quality
             temporal_support = (0.5 * density + 0.5 * freshness).clamp(min=0.0, max=1.0)
             semantic_support = (0.5 * agreement + 0.5 * event_score).clamp(min=0.0, max=1.0)
+            if numeric_uncertainty is not None:
+                uncertainty = self._ensure_horizon_gate(numeric_uncertainty.float(), self.pred_len).clamp(min=0.0, max=1.0)
+                event_exception = (event_score * regime * uncertainty).clamp(min=0.0, max=1.0)
+            else:
+                uncertainty = torch.zeros_like(gate)
+                event_exception = torch.zeros_like(gate)
+            if trend_align is not None:
+                align = self._ensure_horizon_gate(trend_align.float(), self.pred_len).clamp(min=0.0, max=1.0)
+                alignment_support = torch.maximum(align, event_exception)
+            else:
+                alignment_support = 0.5 + 0.5 * event_exception
             risk_adjusted = (
                 quality
                 * (0.35 + 0.65 * temporal_support)
@@ -1626,15 +1778,16 @@ class CSDI_Forecasting(CSDI_base):
                 * (0.6 + 0.4 * novelty)
                 * (0.5 + 0.5 * event_score)
                 * (0.7 + 0.3 * regime)
+                * (0.5 + 0.5 * uncertainty)
+                * (0.4 + 0.6 * alignment_support)
             ).clamp(min=0.0, max=1.0)
             ratio_min = min(max(float(self.text_context_ratio_min), 0.0), 1.0)
             ratio_max = min(max(float(self.text_context_ratio_max), ratio_min), 1.0)
             ratio = ratio_min + (ratio_max - ratio_min) * risk_adjusted
             dynamic_max = max(float(self.text_context_max_base), 0.0) + max(float(self.text_context_max_boost), 0.0) * (
-                quality * temporal_support * semantic_support
+                quality * temporal_support * semantic_support * (0.5 + 0.5 * alignment_support)
             )
-            ratio = ratio.expand(-1, self.pred_len)
-            dynamic_max = dynamic_max.expand(-1, self.pred_len).clamp(min=0.0, max=1.0)
+            dynamic_max = dynamic_max.clamp(min=0.0, max=1.0)
         if self.text_context_horizon_bias != 0.0:
             horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=gate.device, dtype=gate.dtype).view(1, -1)
             horizon_bias = (1.0 + self.text_context_horizon_bias * (0.5 - horizon_pos)).clamp(min=0.0)
@@ -2212,7 +2365,20 @@ class CSDI_Forecasting(CSDI_base):
             text_mask=use_gate,
         )
         context_evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
-        context_gate = self._compute_context_gate(strength_gate, context_evidence)
+        horizon_evidence = self._build_horizon_evidence(
+            context_evidence,
+            text_event_quality_feats,
+            text_event_time_deltas,
+            text_event_mask,
+        )
+        numeric_uncertainty = self._compute_numeric_uncertainty(observed_data, cond_mask)
+        context_gate = self._compute_context_gate(strength_gate, horizon_evidence, numeric_uncertainty, trend_align)
+        trend_prior_eff, trend_align = self._build_horizon_trend_priors(
+            trend_prior_num,
+            trend_prior_text,
+            semantic_state,
+            text_mask=context_gate,
+        )
         guide_gate = self._compute_guide_gate(strength_gate, context_evidence, trend_align)
         self._update_reliability_debug(use_gate, strength_gate, text_evidence_vec, context_gate=context_gate, guide_gate=guide_gate)
         context_raw = self._build_text_context(encoded_text, context_gate) if encoded_text is not None else None
@@ -2250,6 +2416,7 @@ class CSDI_Forecasting(CSDI_base):
             context_raw=context_raw,
             aug_gate=aug_gate,
             strength_gate=strength_gate,
+            context_gate=context_gate,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -2312,7 +2479,20 @@ class CSDI_Forecasting(CSDI_base):
                     text_mask=use_gate,
                 )
                 context_evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
-                context_gate = self._compute_context_gate(strength_gate, context_evidence)
+                horizon_evidence = self._build_horizon_evidence(
+                    context_evidence,
+                    text_event_quality_feats,
+                    text_event_time_deltas,
+                    text_event_mask,
+                )
+                numeric_uncertainty = self._compute_numeric_uncertainty(observed_data, cond_mask)
+                context_gate = self._compute_context_gate(strength_gate, horizon_evidence, numeric_uncertainty, trend_align)
+                trend_prior_eff, trend_align = self._build_horizon_trend_priors(
+                    trend_prior_num,
+                    trend_prior_text,
+                    semantic_state,
+                    text_mask=context_gate,
+                )
                 guide_gate = self._compute_guide_gate(strength_gate, context_evidence, trend_align)
                 self._update_reliability_debug(use_gate, strength_gate, text_evidence_vec, context_gate=context_gate, guide_gate=guide_gate)
                 context_raw = self._build_text_context(encoded_text, context_gate)
@@ -2359,7 +2539,20 @@ class CSDI_Forecasting(CSDI_base):
                 aug_gate = None
                 context_raw = None
                 context_evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
-                context_gate = self._compute_context_gate(strength_gate, context_evidence)
+                horizon_evidence = self._build_horizon_evidence(
+                    context_evidence,
+                    text_event_quality_feats,
+                    text_event_time_deltas,
+                    text_event_mask,
+                )
+                numeric_uncertainty = self._compute_numeric_uncertainty(observed_data, cond_mask)
+                context_gate = self._compute_context_gate(strength_gate, horizon_evidence, numeric_uncertainty, trend_align)
+                trend_prior_eff, trend_align = self._build_horizon_trend_priors(
+                    trend_prior_num,
+                    trend_prior_text,
+                    semantic_state,
+                    text_mask=context_gate,
+                )
                 guide_gate = self._compute_guide_gate(strength_gate, context_evidence, trend_align)
                 self._update_reliability_debug(use_gate, strength_gate, text_evidence_vec, context_gate=context_gate, guide_gate=guide_gate)
                 semantic_text_mask = guide_gate

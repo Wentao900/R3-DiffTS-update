@@ -40,6 +40,8 @@ train:
   text_notext_fallback_weight: 0.0
   text_strength_weight: 0.03
   text_strength_tau: 0.1
+  text_context_benefit_weight: 0.05
+  text_context_benefit_tau: 0.1
 
 diffusion:
   layers: 6

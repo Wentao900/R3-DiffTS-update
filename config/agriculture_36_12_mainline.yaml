@@ -53,7 +53,7 @@ diffusion:
   is_linear: False
   noise_esti: False
   cfg: True
-  c_mask_prob: 0.15
+  c_mask_prob: 0.1
   ddim: False
   sample_steps: 20
   sample_method: "quad"
@@ -128,13 +128,6 @@ model:
   text_guide_step_low: 0.2
   text_guide_step_high: 0.8
   text_guide_step_k: 12.0
-  hu_cfg: true
-  hu_holdout_ratio: 0.15
-  hu_holdout_min_len: 2
-  hu_util_weight: 0.1
-  hu_util_margin: 0.0
-  hu_util_warmup_epochs: 5
-  hu_debug: true
   use_gate_warmup_epochs: 10
   strength_gate_warmup_epochs: 16
 

@@ -150,13 +150,6 @@ class CSDI_base(nn.Module):
         self.text_guide_step_low = float(config["model"].get("text_guide_step_low", 0.2))
         self.text_guide_step_high = float(config["model"].get("text_guide_step_high", 0.8))
         self.text_guide_step_k = float(config["model"].get("text_guide_step_k", 12.0))
-        self.hu_cfg = bool(config["model"].get("hu_cfg", False))
-        self.hu_holdout_ratio = float(config["model"].get("hu_holdout_ratio", 0.15))
-        self.hu_holdout_min_len = int(config["model"].get("hu_holdout_min_len", 2))
-        self.hu_util_weight = float(config["model"].get("hu_util_weight", 0.1))
-        self.hu_util_margin = float(config["model"].get("hu_util_margin", 0.0))
-        self.hu_util_warmup_epochs = int(config["model"].get("hu_util_warmup_epochs", 5))
-        self.hu_debug = bool(config["model"].get("hu_debug", True))
         self.use_gate_warmup_epochs = int(config["model"].get("use_gate_warmup_epochs", max(1, int(train_cfg.get("lr_warmup_epochs", 0)))))
         self.strength_gate_warmup_epochs = int(config["model"].get("strength_gate_warmup_epochs", max(self.use_gate_warmup_epochs + 1, int(0.2 * max(int(train_cfg.get("epochs", 1)), 1)))))
         self.text_use_weight = float(train_cfg.get("text_use_weight", train_cfg.get("text_benefit_weight", 0.0)))
@@ -167,7 +160,6 @@ class CSDI_base(nn.Module):
         self.text_uplift_weight = self.text_strength_weight
         self.text_uplift_tau = self.text_strength_tau
         self.latest_reliability_stats = {}
-        self.latest_hu_debug_stats = {}
 
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
@@ -452,7 +444,6 @@ class CSDI_base(nn.Module):
             "difficulty_ema": difficulty,
             "horizon_groups": [self._get_horizon_group(horizon) for horizon in active_horizons],
             "reliability": dict(self.latest_reliability_stats),
-            "hu_cfg": dict(self.latest_hu_debug_stats),
         }
 
     def time_embedding(self, pos, d_model=128):
@@ -515,18 +506,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, hu_holdout_mask=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate, hu_holdout_mask=hu_holdout_mask
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, hu_holdout_mask=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, set_t=-1
     ):
 
         B, K, L = observed_data.shape
@@ -575,7 +566,6 @@ class CSDI_base(nn.Module):
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
             auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
-        hu_util_scale = self._get_hu_util_scale() if (self.training and is_train == 1 and self.hu_cfg) else 0.0
         needs_text_baseline = (
             (not self.noise_esti)
             and self.training
@@ -587,7 +577,6 @@ class CSDI_base(nn.Module):
                 or (self.text_aug_benefit_weight > 0 and aug_gate is not None)
                 or (self.text_aug_reg_weight > 0 and aug_gate is not None)
                 or (self.text_strength_weight > 0 and strength_gate is not None)
-                or (hu_util_scale > 0 and hu_holdout_mask is not None)
             )
         )
         if needs_text_baseline:
@@ -697,16 +686,6 @@ class CSDI_base(nn.Module):
                     strength_gate,
                 )
                 auxiliary_loss = auxiliary_loss + strength_loss_weight * strength_loss
-            if hu_util_scale > 0 and hu_holdout_mask is not None:
-                hu_loss = self._calc_hu_utility_loss(
-                    predicted,
-                    predicted_no_text,
-                    observed_data,
-                    hu_holdout_mask,
-                    target_mask=target_mask,
-                    cfg_mask=cfg_mask,
-                )
-                auxiliary_loss = auxiliary_loss + self.hu_util_weight * hu_util_scale * hu_loss
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -732,93 +711,6 @@ class CSDI_base(nn.Module):
             predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
             return predicted
         return self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
-
-    def _build_hu_holdout_mask(self, cond_mask):
-        if not self.hu_cfg or self.hu_holdout_ratio <= 0 or self.lookback_len <= 1:
-            return None
-        B, K, L = cond_mask.shape
-        hold_len = int(round(float(self.lookback_len) * float(self.hu_holdout_ratio)))
-        hold_len = min(max(hold_len, int(self.hu_holdout_min_len)), max(self.lookback_len - 1, 1))
-        if hold_len <= 0:
-            return None
-        max_start = max(self.lookback_len - hold_len, 0)
-        holdout = torch.zeros_like(cond_mask)
-        for batch_idx in range(B):
-            start = int(torch.randint(0, max_start + 1, (1,), device=cond_mask.device).item()) if max_start > 0 else 0
-            end = min(start + hold_len, self.lookback_len)
-            holdout[batch_idx, :, start:end] = cond_mask[batch_idx, :, start:end]
-        if not torch.any(holdout > 0):
-            return None
-        return holdout
-
-    def _get_hu_util_scale(self):
-        if self.hu_util_weight <= 0:
-            return 0.0
-        if self.hu_util_warmup_epochs <= 0:
-            return 1.0
-        epoch = max(int(self.current_epoch), 0)
-        if epoch < self.hu_util_warmup_epochs:
-            return 0.0
-        return 1.0
-
-    def _update_hu_debug_stats(self, stats):
-        if not self.hu_debug:
-            return
-        clean_stats = {}
-        for key, value in stats.items():
-            if torch.is_tensor(value):
-                value = float(value.detach().float().cpu().item())
-            clean_stats[key] = float(value)
-        self.latest_hu_debug_stats = clean_stats
-
-    def _calc_hu_utility_loss(self, predicted, predicted_no_text, observed_data, hu_holdout_mask, target_mask=None, cfg_mask=None):
-        if hu_holdout_mask is None:
-            return torch.zeros((), device=predicted.device)
-        holdout_mask = hu_holdout_mask.float().clamp(min=0.0, max=1.0)
-        if not torch.any(holdout_mask > 0):
-            return torch.zeros((), device=predicted.device)
-        cond_error = ((predicted - observed_data) ** 2 * holdout_mask).sum(dim=(1, 2))
-        base_error = ((predicted_no_text.detach() - observed_data) ** 2 * holdout_mask).sum(dim=(1, 2))
-        holdout_count = holdout_mask.sum(dim=(1, 2))
-        denom = holdout_count.clamp(min=1.0)
-        cond_error = cond_error / denom
-        base_error = base_error / denom
-        valid = holdout_count > 0
-        if cfg_mask is not None:
-            valid = valid & (cfg_mask.detach().reshape(-1) > 0.5)
-        if not valid.any():
-            return torch.zeros((), device=predicted.device)
-
-        margin = max(float(self.hu_util_margin), 0.0)
-        util_loss = F.relu(cond_error[valid] - base_error[valid] + margin).mean()
-
-        if self.hu_debug:
-            holdout_delta = (predicted - predicted_no_text).detach().abs() * holdout_mask
-            holdout_delta_mean = holdout_delta.sum() / holdout_mask.sum().clamp(min=1.0)
-            future_slice = slice(self.lookback_len, min(self.lookback_len + self.pred_len, predicted.shape[-1]))
-            horizon_mask = torch.zeros_like(holdout_mask)
-            if target_mask is not None:
-                horizon_mask[:, :, future_slice] = target_mask[:, :, future_slice].float().clamp(min=0.0, max=1.0)
-            else:
-                horizon_mask[:, :, future_slice] = 1.0
-            horizon_delta = (predicted - predicted_no_text).detach().abs() * horizon_mask
-            horizon_delta_mean = horizon_delta.sum() / horizon_mask.sum().clamp(min=1.0)
-            gain = (base_error[valid] - cond_error[valid]).mean()
-            self._update_hu_debug_stats(
-                {
-                    "holdout_ratio": holdout_mask[:, :, :self.lookback_len].sum()
-                    / float(max(holdout_mask[:, :, :self.lookback_len].numel(), 1)),
-                    "util_cond_error": cond_error[valid].mean(),
-                    "util_uncond_error": base_error[valid].mean(),
-                    "util_gain": gain,
-                    "util_loss": util_loss,
-                    "delta_holdout_mean": holdout_delta_mean,
-                    "delta_horizon_mean": horizon_delta_mean,
-                    "delta_holdout_horizon_ratio": holdout_delta_mean / horizon_delta_mean.clamp(min=1e-6),
-                    "valid_fraction": valid.float().mean(),
-                }
-            )
-        return util_loss
 
     def _calc_text_consistency_loss(self, predicted, predicted_no_text, target_mask, text_mask):
         diff = (predicted - predicted_no_text) * target_mask
@@ -2275,12 +2167,6 @@ class CSDI_Forecasting(CSDI_base):
                 observed_mask, gt_mask
             )
 
-        hu_holdout_mask = None
-        if is_train == 1 and self.hu_cfg:
-            hu_holdout_mask = self._build_hu_holdout_mask(cond_mask)
-            if hu_holdout_mask is not None:
-                cond_mask = cond_mask * (1.0 - hu_holdout_mask)
-
         side_info = self.get_side_info(observed_tp, cond_mask, feature_id, timesteps, texts)
 
         if self.timestep_emb_cat:
@@ -2364,7 +2250,6 @@ class CSDI_Forecasting(CSDI_base):
             context_raw=context_raw,
             aug_gate=aug_gate,
             strength_gate=strength_gate,
-            hu_holdout_mask=hu_holdout_mask,
         )
 
     def evaluate(self, batch, n_samples, guide_w):

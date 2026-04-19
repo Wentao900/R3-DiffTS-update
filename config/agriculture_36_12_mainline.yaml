@@ -42,6 +42,8 @@ train:
   text_strength_tau: 0.1
   text_context_benefit_weight: 0.05
   text_context_benefit_tau: 0.1
+  text_positive_benefit_margin: 0.01
+  text_positive_benefit_tau: 0.05
 
 diffusion:
   layers: 6

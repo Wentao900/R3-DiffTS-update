@@ -91,13 +91,26 @@ train / val / test workflow.
     aug_segment_scale_std: 0.1
   ```
 
-## Economy mainline config
-- Latest single-domain mainline config: `config/economy_36_12_mainline.yaml`
-- Default target:
-  - domain: `Economy`
-  - full latest mainline on: adaptive horizons, progressive curriculum, EMA difficulty,
-    per-horizon Huber delta, gradient clipping, LR warmup, lookback augmentation
-  - `adaptive_noise_scale`: kept off by default
+## Mainline configs
+The latest mainline profile covers every dataset domain in the benchmark:
+- `config/traffic_36_12_mainline.yaml`
+- `config/socialgood_36_12_mainline.yaml`
+- `config/health_96_12_mainline.yaml`
+- `config/environment_336_48_mainline.yaml`
+- `config/energy_96_12_mainline.yaml`
+- `config/economy_36_12_mainline.yaml`
+- `config/climate_96_12_mainline.yaml`
+- `config/agriculture_36_12_mainline.yaml`
+
+The mainline profile enables adaptive horizons, progressive curriculum, EMA difficulty,
+per-horizon Huber delta, gradient clipping, LR warmup, lookback augmentation, two-stage
+RAG/CoT, quality gating, and text benefit supervision. Dataset-specific train scale and
+diffusion hyperparameters are kept from the original per-dataset configs.
+
+Run the full mainline suite:
+```bash
+bash scripts/run_all_datasets_mainline.sh
+```
 
 ## Two-stage RAG (minimal change enhancement)
 - Switch: `--use_two_stage_rag` (off by default to preserve one-shot behavior).
@@ -123,7 +136,7 @@ CoT is promoted from a text condition to a diffusion-path modulation signal.
 - Save priors: `--save_trend_prior` outputs `trend_priors.npy` and `trend_text_marks.npy`
 
 ## Guide weight sweep
-- `--guide_w -1` triggers the built-in sweep list (includes `4.5`).
+- `--guide_w -1` triggers the built-in sweep list.
 - To override, pass a fixed `--guide_w` or run your own loop.
 
 ## Debug
@@ -134,12 +147,9 @@ Use `debug_two_stage_rag.py` to inspect Q1/E0/z0/Q2/E1 and the composed text pre
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
   --data_path Traffic/Traffic.csv \
-  --config traffic_36_12.yaml \
+  --config traffic_36_12_mainline.yaml \
   --seq_len 36 --pred_len 12 --text_len 36 --freq m \
-  --use_rag_cot --use_two_stage_rag \
-  --trend_cfg --trend_cfg_power 1.0 \
-  --trend_strength_scale 0.35 --trend_volatility_scale 1.0 --trend_time_floor 0.30 \
-  --guide_w -1
+  --guide_w 1.0
 ```
 
 ## Scripts

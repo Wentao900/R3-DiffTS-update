@@ -19,8 +19,19 @@ bert-base-uncased/
 save/
 logs/
 .rag_cot_cache/
+config/_tmp*.yaml
+config/_planb_quick_tmp*.yaml
+config/_four_cfg_tmp.yaml
 
 # Weights/checkpoints
 *.pt
 *.pth
 *.bin
+
+# Local notes / papers
+.msc
+*.pdf
+plan*.md
+*PPT大纲*.md
+Codex *.md
+Evidence Consistency Score*.md

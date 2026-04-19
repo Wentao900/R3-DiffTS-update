@@ -2,9 +2,9 @@
 
 train:
   epochs: 150
-  batch_size: 32
+  batch_size: 64
   lr: 0.0025
-  itr_per_epoch: 1.0e+8
+  itr_per_epoch: 100000000.0
   multi_res_horizons: null
   multi_res_use_stat_horizons: true
   multi_res_acf_drop_threshold: 0.5
@@ -14,7 +14,11 @@ train:
   multi_res_loss_weight: 0.1
   multi_res_use_huber: true
   multi_res_huber_delta: 1.0
-  multi_res_huber_deltas: [0.5, 0.8, 1.0, 1.5]
+  multi_res_huber_deltas:
+  - 0.5
+  - 0.8
+  - 1.0
+  - 1.5
   multi_res_huber_delta_mode: functional
   multi_res_huber_delta_scale: 0.5
   multi_res_dynamic: true
@@ -44,45 +48,43 @@ train:
   text_context_benefit_tau: 0.1
   text_positive_benefit_margin: 0.01
   text_positive_benefit_tau: 0.05
-
 diffusion:
-  layers: 6
+  layers: 4
   channels: 64
   nheads: 8
   diffusion_embedding_dim: 128
   beta_start: 0.0001
   beta_end: 0.6
   num_steps: 300
-  schedule: "quad"
-  is_linear: False
-  noise_esti: False
-  cfg: True
-  c_mask_prob: 0.05
-  ddim: True
-  sample_steps: 20
-  sample_method: "quad"
-  pre_norm: False
-
+  schedule: quad
+  is_linear: false
+  noise_esti: false
+  cfg: true
+  c_mask_prob: 0.2
+  ddim: true
+  sample_steps: 90
+  sample_method: quad
+  pre_norm: false
 model:
   cot_model: ./gpt2-medium
   cot_temperature: 0.2
   cot_max_new_tokens: 64
-  cot_cache_dir: .rag_cot_cache/economy_36_12
+  cot_cache_dir: .rag_cot_cache/energy_96_12
   is_unconditional: 0
   timeemb: 128
   featureemb: 16
   guide_w_default: 1.0
-  target_strategy: "test"
+  target_strategy: test
   num_sample_features: 64
   rag_stage1_topk: 3
   rag_stage2_topk: 1
   rag_topk: 1
-  timestep_branch: False
-  timestep_emb_cat: True
-  with_texts: True
-  relative_size_emb_cat: False
-  decomp: True
-  llm: "bert"
+  timestep_branch: false
+  timestep_emb_cat: true
+  with_texts: true
+  relative_size_emb_cat: false
+  decomp: false
+  llm: bert
   llm_layers: 0
   text_benefit_hidden_dim: 128
   text_aug_hidden_dim: 128
@@ -91,7 +93,10 @@ model:
   text_quality_gate: true
   text_quality_min_scale: 0.0
   text_quality_coverage_mix: 0.5
-  text_quality_weights: [0.5, 0.3, 0.2]
+  text_quality_weights:
+  - 0.5
+  - 0.3
+  - 0.2
   text_trust_ret: 0.75
   text_trust_cot: 0.5
   text_quality_drop_threshold: 0.3
@@ -134,10 +139,8 @@ model:
   text_guide_step_k: 12.0
   use_gate_warmup_epochs: 10
   strength_gate_warmup_epochs: 16
-
 dataset:
   aug_noise_std: 0.01
-  # Kept for backward compatibility; this triggers local segment scaling, not strict time warping.
   aug_time_warp_prob: 0.3
   aug_segment_scale_std: 0.1
   text_recency_tau_days: 14.0

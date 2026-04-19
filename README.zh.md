@@ -109,15 +109,26 @@ bash ./run.sh
     aug_segment_scale_std: 0.1
   ```
 
-## Economy 单域主线配置
-- 最新单域主线配置：`config/economy_36_12_mainline.yaml`
-- 默认目标：
-  - 域：`Economy`
-  - 主线全开：自适应 horizons、Progressive Curriculum、EMA Difficulty、Per-Horizon Huber Delta、Gradient Clipping、LR Warmup、Lookback Augmentation
-  - `adaptive_noise_scale`：默认关闭
+## 主线配置
+最新 mainline profile 已覆盖 benchmark 中的全部数据集域：
+- `config/traffic_36_12_mainline.yaml`
+- `config/socialgood_36_12_mainline.yaml`
+- `config/health_96_12_mainline.yaml`
+- `config/environment_336_48_mainline.yaml`
+- `config/energy_96_12_mainline.yaml`
+- `config/economy_36_12_mainline.yaml`
+- `config/climate_96_12_mainline.yaml`
+- `config/agriculture_36_12_mainline.yaml`
+
+主线配置开启自适应 horizons、Progressive Curriculum、EMA Difficulty、Per-Horizon Huber Delta、Gradient Clipping、LR Warmup、Lookback Augmentation、Two-stage RAG/CoT、质量门控和文本收益监督；各数据集原有的训练规模与 diffusion 数值超参保持不变。
+
+运行全数据集主线：
+```bash
+bash scripts/run_all_datasets_mainline.sh
+```
 
 ## Guide weight 扫描
-- `--guide_w -1` 会使用内置列表自动扫描（包含 `4.5`）。
+- `--guide_w -1` 会使用内置列表自动扫描。
 - 如需固定某个值，直接传 `--guide_w`。
 
 ## 调试
@@ -128,12 +139,9 @@ bash ./run.sh
 python -u exe_forecasting.py \
   --root_path ../Time-MMD-main \
   --data_path Traffic/Traffic.csv \
-  --config traffic_36_12.yaml \
+  --config traffic_36_12_mainline.yaml \
   --seq_len 36 --pred_len 12 --text_len 36 --freq m \
-  --use_rag_cot --use_two_stage_rag \
-  --trend_cfg --trend_cfg_power 1.0 \
-  --trend_strength_scale 0.35 --trend_volatility_scale 1.0 --trend_time_floor 0.30 \
-  --guide_w -1
+  --guide_w 1.0
 ```
 
 ## Scripts

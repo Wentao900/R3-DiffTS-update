@@ -3,11 +3,32 @@ set -euo pipefail
 
 ROOT_PATH=${ROOT_PATH:-../Time-MMD-main}
 GUIDE_W=${GUIDE_W:-1.0}
+NSAMPLE=${NSAMPLE:-15}
+SAMPLE_STEPS=${SAMPLE_STEPS:-}
+DEVICE=${DEVICE:-cuda:0}
+VALID_INTERVAL=${VALID_INTERVAL:-1}
+DRY_RUN=${DRY_RUN:-0}
 
 COMMON_ARGS=(
   --root_path "${ROOT_PATH}"
   --guide_w "${GUIDE_W}"
+  --nsample "${NSAMPLE}"
+  --device "${DEVICE}"
+  --valid_interval "${VALID_INTERVAL}"
 )
+
+if [[ -n "${SAMPLE_STEPS}" ]]; then
+  COMMON_ARGS+=(--sample_steps_override "${SAMPLE_STEPS}")
+fi
+
+run_cmd() {
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '%q ' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
 
 run_case() {
   local data_path="$1"
@@ -33,7 +54,7 @@ run_case() {
   if [[ -n "${seed}" ]]; then
     cmd+=(--seed "${seed}")
   fi
-  "${cmd[@]}"
+  run_cmd "${cmd[@]}"
 }
 
 run_case "Traffic/Traffic.csv" "traffic_36_12_mainline.yaml" 36 12 m 36

@@ -48,6 +48,9 @@ train:
   text_context_benefit_tau: 0.1
   text_positive_benefit_margin: 0.01
   text_positive_benefit_tau: 0.05
+  text_utility_weight: 0.03
+  aux_residual_mag_weight: 0.001
+  aux_residual_smooth_weight: 0.01
 diffusion:
   layers: 6
   channels: 128
@@ -118,6 +121,11 @@ model:
   reliability_hidden_dim: 32
   guide_reliability_power: 1.0
   semantic_dim: 6
+  aux_basis_dim: 6
+  use_text_residual: true
+  use_calendar_residual: true
+  text_residual_scale: 0.05
+  calendar_residual_scale: 0.1
   text_max_length: 160
   event_text_max_length: 64
   text_encode_batch_size: 4

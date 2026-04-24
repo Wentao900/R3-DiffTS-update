@@ -171,7 +171,17 @@ class CSDI_base(nn.Module):
             train_cfg.get("text_utility_tau", max(self.text_strength_tau, 1e-6))
         )
         self.text_sparse_weight = float(train_cfg.get("text_sparse_weight", 0.0))
-        self.text_residual_scale = float(config["model"].get("text_residual_scale", 1.0))
+        self.aux_basis_dim = max(int(config["model"].get("aux_basis_dim", 6)), 1)
+        self.use_text_residual = bool(config["model"].get("use_text_residual", True))
+        self.use_calendar_residual = bool(config["model"].get("use_calendar_residual", True))
+        self.text_residual_scale = float(config["model"].get("text_residual_scale", 0.05))
+        self.calendar_residual_scale = float(config["model"].get("calendar_residual_scale", 0.1))
+        self.aux_residual_mag_weight = float(
+            train_cfg.get("aux_residual_mag_weight", train_cfg.get("text_residual_mag_weight", 0.0))
+        )
+        self.aux_residual_smooth_weight = float(
+            train_cfg.get("aux_residual_smooth_weight", train_cfg.get("text_residual_smooth_weight", 0.0))
+        )
         self.latest_reliability_stats = {}
         self.latest_text_benefit_stats = {}
 
@@ -211,6 +221,11 @@ class CSDI_base(nn.Module):
         self.multi_res_huber_deltas = self._resolve_multi_res_huber_deltas(
             self.multi_res_horizons, self.multi_res_huber_deltas_cfg
         )
+        self.register_buffer(
+            "aux_residual_basis",
+            self._build_residual_basis(self.pred_len, self.aux_basis_dim),
+            persistent=False,
+        )
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -245,6 +260,25 @@ class CSDI_base(nn.Module):
                                                    nn.LayerNorm(self.diff_channels),
                                                    nn.ReLU(),)
 
+        self.calendar_feature_dim = 8
+        calendar_hidden_dim = int(config["model"].get("calendar_residual_hidden_dim", config["model"].get("text_residual_hidden_dim", 128)))
+        self.calendar_utility_head = nn.Sequential(
+            nn.Linear(self.calendar_feature_dim, calendar_hidden_dim),
+            nn.LayerNorm(calendar_hidden_dim),
+            nn.GELU(),
+            nn.Linear(calendar_hidden_dim, self.pred_len),
+        )
+        self.calendar_residual_head = nn.Sequential(
+            nn.Linear(self.calendar_feature_dim, calendar_hidden_dim),
+            nn.LayerNorm(calendar_hidden_dim),
+            nn.GELU(),
+            nn.Linear(calendar_hidden_dim, self.aux_basis_dim),
+        )
+        nn.init.zeros_(self.calendar_utility_head[-1].weight)
+        nn.init.constant_(self.calendar_utility_head[-1].bias, -2.0)
+        nn.init.zeros_(self.calendar_residual_head[-1].weight)
+        nn.init.zeros_(self.calendar_residual_head[-1].bias)
+
         if self.with_texts:
             self.text_encoder, self.tokenizer = get_llm(self.llm, config["model"]["llm_layers"])
             for param in self.text_encoder.parameters():
@@ -266,7 +300,7 @@ class CSDI_base(nn.Module):
                 nn.ReLU(),
                 nn.Linear(benefit_hidden_dim, 1),
             )
-            self.text_aux_feature_dim = 17
+            self.text_aux_feature_dim = 13
             utility_hidden_dim = int(config["model"].get("text_utility_hidden_dim", benefit_hidden_dim))
             residual_hidden_dim = int(config["model"].get("text_residual_hidden_dim", benefit_hidden_dim))
             self.text_utility_head = nn.Sequential(
@@ -279,8 +313,12 @@ class CSDI_base(nn.Module):
                 nn.Linear(text_hidden_dim + self.semantic_dim + self.text_aux_feature_dim, residual_hidden_dim),
                 nn.LayerNorm(residual_hidden_dim),
                 nn.GELU(),
-                nn.Linear(residual_hidden_dim, self.pred_len),
+                nn.Linear(residual_hidden_dim, self.aux_basis_dim),
             )
+            nn.init.zeros_(self.text_utility_head[-1].weight)
+            nn.init.constant_(self.text_utility_head[-1].bias, -2.0)
+            nn.init.zeros_(self.text_residual_head[-1].weight)
+            nn.init.zeros_(self.text_residual_head[-1].bias)
             gate_hidden_dim = int(config["model"].get("reliability_hidden_dim", 32))
             evidence_dim = 7
             self.event_source_embed = nn.Embedding(3, event_source_embed_dim)
@@ -366,6 +404,29 @@ class CSDI_base(nn.Module):
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
+
+    def _build_residual_basis(self, pred_len, basis_dim):
+        pred_len = max(int(pred_len), 1)
+        basis_dim = max(int(basis_dim), 1)
+        pos = torch.linspace(0.0, 1.0, pred_len, dtype=torch.float32)
+        centered = 2.0 * pos - 1.0
+        components = [
+            torch.ones_like(pos),
+            centered,
+            centered.pow(2) - centered.pow(2).mean(),
+            torch.sin(math.pi * pos),
+            torch.exp(-0.5 * ((pos - 0.25) / 0.18).pow(2)),
+            torch.exp(-0.5 * ((pos - 0.75) / 0.18).pow(2)),
+        ]
+        freq = 2
+        while len(components) < basis_dim:
+            components.append(torch.sin(freq * math.pi * pos))
+            if len(components) < basis_dim:
+                components.append(torch.cos(freq * math.pi * pos))
+            freq += 1
+        basis = torch.stack(components[:basis_dim], dim=1)
+        basis = basis / basis.pow(2).mean(dim=0, keepdim=True).sqrt().clamp(min=1e-6)
+        return basis
 
     def _sanitize_multi_res_horizons(self, horizons):
         if isinstance(horizons, int):
@@ -536,18 +597,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, text_utility=None, text_residual=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate, context_gate=context_gate, text_utility=text_utility, text_residual=text_residual
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate, context_gate=context_gate, text_utility=text_utility, text_residual=text_residual, calendar_utility=calendar_utility, calendar_residual=calendar_residual
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, text_utility=None, text_residual=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None, set_t=-1
     ):
 
         B, K, L = observed_data.shape
@@ -585,7 +646,13 @@ class CSDI_base(nn.Module):
             predicted_from_timestep = self.timestep_pred(timesteps)
             predicted_base = 0.9 * predicted_base + 0.1 * predicted_from_timestep
 
-        predicted = self._apply_text_residual(predicted_base, text_utility, text_residual)
+        predicted = self._apply_aux_residual(
+            predicted_base,
+            text_utility=text_utility,
+            text_residual=text_residual,
+            calendar_utility=calendar_utility,
+            calendar_residual=calendar_residual,
+        )
 
         target_mask = observed_mask - cond_mask
         if self.noise_esti:
@@ -598,19 +665,49 @@ class CSDI_base(nn.Module):
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
             auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
-        if (not self.noise_esti) and self.training and text_utility is not None:
-            if self.text_utility_weight > 0:
-                utility_loss = self._calc_text_utility_loss(
-                    predicted,
+        if (not self.noise_esti) and self.training:
+            if self.text_utility_weight > 0 and text_utility is not None and text_residual is not None:
+                utility_loss = self._calc_aux_utility_loss(
                     predicted_base,
                     observed_data,
                     target_mask,
                     text_utility,
+                    text_residual,
+                    update_debug=True,
                 )
                 auxiliary_loss = auxiliary_loss + self.text_utility_weight * utility_loss
+            if self.text_utility_weight > 0 and calendar_utility is not None and calendar_residual is not None:
+                calendar_utility_loss = self._calc_aux_utility_loss(
+                    predicted_base,
+                    observed_data,
+                    target_mask,
+                    calendar_utility,
+                    calendar_residual,
+                    update_debug=False,
+                )
+                auxiliary_loss = auxiliary_loss + self.text_utility_weight * calendar_utility_loss
             if self.text_sparse_weight > 0:
-                sparse_loss = self._ensure_horizon_gate(text_utility).float().mean()
-                auxiliary_loss = auxiliary_loss + self.text_sparse_weight * sparse_loss
+                sparse_terms = []
+                if text_utility is not None:
+                    sparse_terms.append(self._ensure_horizon_gate(text_utility).float().mean())
+                if calendar_utility is not None:
+                    sparse_terms.append(self._ensure_horizon_gate(calendar_utility).float().mean())
+                if sparse_terms:
+                    auxiliary_loss = auxiliary_loss + self.text_sparse_weight * torch.stack(sparse_terms).mean()
+            if self.aux_residual_mag_weight > 0 or self.aux_residual_smooth_weight > 0:
+                mag_terms = []
+                smooth_terms = []
+                for utility, residual_value in (
+                    (text_utility, text_residual),
+                    (calendar_utility, calendar_residual),
+                ):
+                    mag_loss, smooth_loss = self._calc_aux_residual_reg(utility, residual_value, observed_data.device)
+                    mag_terms.append(mag_loss)
+                    smooth_terms.append(smooth_loss)
+                if self.aux_residual_mag_weight > 0:
+                    auxiliary_loss = auxiliary_loss + self.aux_residual_mag_weight * torch.stack(mag_terms).mean()
+                if self.aux_residual_smooth_weight > 0:
+                    auxiliary_loss = auxiliary_loss + self.aux_residual_smooth_weight * torch.stack(smooth_terms).mean()
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -943,7 +1040,7 @@ class CSDI_base(nn.Module):
         right = 1.0 / (1.0 + math.exp(-k * (high - tau)))
         return left * right
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, text_utility=None, text_residual=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None):
         B, K, L = observed_data.shape
         guide_w_tensor = self._to_samplewise_weight(guide_w, B, observed_data.device)
         if text_mask is not None:
@@ -1099,7 +1196,13 @@ class CSDI_base(nn.Module):
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 imputed_samples[:, i] = 0.9 * imputed_samples[:, i] + 0.1 * predicted_from_timestep.detach()
-            imputed_samples[:, i] = self._apply_text_residual(imputed_samples[:, i], text_utility, text_residual).detach()
+            imputed_samples[:, i] = self._apply_aux_residual(
+                imputed_samples[:, i],
+                text_utility=text_utility,
+                text_residual=text_residual,
+                calendar_utility=calendar_utility,
+                calendar_residual=calendar_residual,
+            ).detach()
             if not self.noise_esti:
                 imputed_samples[:, i] = imputed_samples[:, i] * stdev + means
         if self.save_attn:
@@ -2054,12 +2157,9 @@ class CSDI_Forecasting(CSDI_base):
         last = lookback[:, :, -1].mean(dim=1)
         return torch.stack([mean, std, first, last], dim=1)
 
-    def _build_text_aux_features(self, observed_data, cond_mask, text_mask, domain_text_coverage=None, event_quality_summary=None, timesteps=None):
+    def _build_text_aux_features(self, observed_data, cond_mask, text_mask, domain_text_coverage=None, event_quality_summary=None):
         batch_size = observed_data.shape[0]
         numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
-        time_summary = self._summarize_timestep_context(timesteps)
-        if time_summary is None:
-            time_summary = torch.zeros((batch_size, 4), device=observed_data.device, dtype=observed_data.dtype)
         if event_quality_summary is None:
             event_quality_summary = torch.zeros((batch_size, 7), device=observed_data.device, dtype=observed_data.dtype)
         else:
@@ -2075,7 +2175,6 @@ class CSDI_Forecasting(CSDI_base):
         return torch.cat(
             [
                 numeric_summary,
-                time_summary,
                 event_quality_summary,
                 text_quality,
                 coverage,
@@ -2083,8 +2182,31 @@ class CSDI_Forecasting(CSDI_base):
             dim=1,
         )
 
-    def _compute_text_adjustment(self, observed_data, cond_mask, text_pooled, text_mask, domain_text_coverage=None, event_quality_summary=None, event_semantic_state=None, timesteps=None):
-        if (not self.with_texts) or text_pooled is None:
+    def _build_calendar_features(self, observed_data, cond_mask, timesteps):
+        batch_size = observed_data.shape[0]
+        numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
+        time_summary = self._summarize_timestep_context(timesteps)
+        if time_summary is None:
+            time_summary = torch.zeros((batch_size, 4), device=observed_data.device, dtype=observed_data.dtype)
+        return torch.cat([numeric_summary, time_summary], dim=1)
+
+    def _basis_to_residual(self, coeffs, scale):
+        coeffs = coeffs.float()
+        basis = self.aux_residual_basis.to(device=coeffs.device, dtype=coeffs.dtype)
+        residual = torch.matmul(coeffs, basis[:, : coeffs.shape[-1]].transpose(0, 1))
+        return float(scale) * torch.tanh(residual)
+
+    def _compute_calendar_adjustment(self, observed_data, cond_mask, timesteps):
+        if (not self.use_calendar_residual) or timesteps is None:
+            return None, None
+        calendar_features = self._build_calendar_features(observed_data, cond_mask, timesteps)
+        calendar_utility = torch.sigmoid(self.calendar_utility_head(calendar_features))
+        calendar_coeffs = self.calendar_residual_head(calendar_features)
+        calendar_residual = self._basis_to_residual(calendar_coeffs, self.calendar_residual_scale)
+        return calendar_utility.clamp(0.0, 1.0), calendar_residual
+
+    def _compute_text_adjustment(self, observed_data, cond_mask, text_pooled, text_mask, domain_text_coverage=None, event_quality_summary=None, event_semantic_state=None):
+        if (not self.use_text_residual) or (not self.with_texts) or text_pooled is None:
             return None, None
         aux_features = self._build_text_aux_features(
             observed_data,
@@ -2092,7 +2214,6 @@ class CSDI_Forecasting(CSDI_base):
             text_mask,
             domain_text_coverage=domain_text_coverage,
             event_quality_summary=event_quality_summary,
-            timesteps=timesteps,
         )
         utility_input = torch.cat([text_pooled.float(), aux_features], dim=1)
         text_utility = torch.sigmoid(self.text_utility_head(utility_input))
@@ -2105,10 +2226,16 @@ class CSDI_Forecasting(CSDI_base):
                 dtype=text_pooled.dtype,
             )
         residual_input = torch.cat([text_pooled.float(), event_semantic_state.float(), aux_features], dim=1)
-        text_residual = self.text_residual_scale * torch.tanh(self.text_residual_head(residual_input))
+        text_coeffs = self.text_residual_head(residual_input)
+        text_residual = self._basis_to_residual(text_coeffs, self.text_residual_scale)
         if text_mask is not None:
             text_residual = text_residual * text_mask.reshape(-1, 1).float().clamp(0.0, 1.0)
         return text_utility.clamp(0.0, 1.0), text_residual
+
+    def _apply_aux_residual(self, predicted_base, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None):
+        predicted = self._apply_text_residual(predicted_base, calendar_utility, calendar_residual)
+        predicted = self._apply_text_residual(predicted, text_utility, text_residual)
+        return predicted
 
     def _apply_text_residual(self, predicted_base, text_utility, text_residual):
         if predicted_base is None or text_utility is None or text_residual is None:
@@ -2129,21 +2256,50 @@ class CSDI_Forecasting(CSDI_base):
         predicted[:, :, future_slice] = predicted[:, :, future_slice] + correction
         return predicted
 
-    def _calc_text_utility_loss(self, predicted, predicted_base, observed_data, target_mask, text_utility):
-        gate = self._ensure_horizon_gate(text_utility)
-        if gate is None:
-            return torch.zeros((), device=predicted.device)
-        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
-        base_loss = self._calc_per_horizon_forecast_loss(predicted_base, observed_data, target_mask)
+    def _calc_aux_utility_loss(self, predicted_base, observed_data, target_mask, utility, residual, update_debug=False):
+        gate = self._ensure_horizon_gate(utility)
+        if gate is None or residual is None:
+            return torch.zeros((), device=predicted_base.device)
+        with torch.no_grad():
+            candidate_gate = torch.ones_like(gate)
+            candidate = self._apply_text_residual(predicted_base.detach(), candidate_gate, residual.detach())
+            candidate_loss = self._calc_per_horizon_forecast_loss(candidate, observed_data, target_mask)
+            base_loss = self._calc_per_horizon_forecast_loss(predicted_base.detach(), observed_data, target_mask)
         tau = max(float(self.text_utility_tau), 1e-6)
-        target = torch.sigmoid((base_loss.detach() - text_loss.detach()) / tau)
+        gain = base_loss - candidate_loss
+        positive = (gain > max(float(self.text_use_margin), 0.0)).float()
+        target = torch.sigmoid(gain / tau) * positive
         valid = target_mask[:, :, self.lookback_len:self.lookback_len + self.pred_len].sum(dim=1) > 0
         if not valid.any():
-            return torch.zeros((), device=predicted.device)
+            return torch.zeros((), device=predicted_base.device)
         gate = gate[valid].float().clamp(min=1e-4, max=1.0 - 1e-4)
         target = target[valid].float().clamp(min=0.0, max=1.0)
-        self._update_text_benefit_debug(gate.detach(), target.detach(), text_loss.detach(), base_loss.detach())
+        if update_debug:
+            self._update_text_benefit_debug(gate.detach(), target.detach(), candidate_loss.detach(), base_loss.detach())
         return F.binary_cross_entropy(gate, target)
+
+    def _calc_aux_residual_reg(self, utility, residual, device):
+        if utility is None or residual is None:
+            zero = torch.zeros((), device=device)
+            return zero, zero
+        future_len = min(self.pred_len, residual.shape[-1])
+        if future_len <= 0:
+            zero = torch.zeros((), device=device)
+            return zero, zero
+        gate = self._ensure_horizon_gate(utility.float()).clamp(min=0.0, max=1.0)[:, :future_len]
+        if residual.dim() == 2:
+            residual_seq = residual[:, :future_len].unsqueeze(1)
+        elif residual.dim() == 3:
+            residual_seq = residual[:, :, :future_len]
+        else:
+            residual_seq = residual.reshape(residual.shape[0], 1, -1)[:, :, :future_len]
+        applied = gate.unsqueeze(1) * residual_seq
+        mag_loss = applied.pow(2).mean()
+        if future_len <= 1:
+            smooth_loss = torch.zeros((), device=device)
+        else:
+            smooth_loss = (applied[:, :, 1:] - applied[:, :, :-1]).pow(2).mean()
+        return mag_loss, smooth_loss
 
     def _compute_text_benefit_gate(self, observed_data, cond_mask, text_pooled, text_mask, trend_align, domain_coverage=None):
         if text_pooled is None or text_mask is None:
@@ -2298,6 +2454,12 @@ class CSDI_Forecasting(CSDI_base):
         else:
             size_emb = None
 
+        calendar_utility, calendar_residual = self._compute_calendar_adjustment(
+            observed_data,
+            cond_mask,
+            timesteps,
+        )
+
         if self.with_texts:
             _, text_pooled, _ = self._encode_text_source(texts)
             event_semantic_state, event_quality_summary = self._build_event_semantic_state(
@@ -2315,7 +2477,6 @@ class CSDI_Forecasting(CSDI_base):
                 domain_text_coverage=domain_text_coverage,
                 event_quality_summary=event_quality_summary,
                 event_semantic_state=event_semantic_state,
-                timesteps=timesteps,
             )
         else:
             text_utility = None
@@ -2339,6 +2500,8 @@ class CSDI_Forecasting(CSDI_base):
             text_mask=text_mask,
             text_utility=text_utility,
             text_residual=text_residual,
+            calendar_utility=calendar_utility,
+            calendar_residual=calendar_residual,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -2372,6 +2535,12 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 size_emb = None
 
+            calendar_utility, calendar_residual = self._compute_calendar_adjustment(
+                observed_data,
+                cond_mask,
+                timesteps,
+            )
+
             if self.with_texts:
                 _, text_pooled, token_input = self._encode_text_source(texts)
                 event_semantic_state, event_quality_summary = self._build_event_semantic_state(
@@ -2389,7 +2558,6 @@ class CSDI_Forecasting(CSDI_base):
                     domain_text_coverage=domain_text_coverage,
                     event_quality_summary=event_quality_summary,
                     event_semantic_state=event_semantic_state,
-                    timesteps=timesteps,
                 )
                 if self.save_token:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
@@ -2397,9 +2565,9 @@ class CSDI_Forecasting(CSDI_base):
                 text_utility = None
                 text_residual = None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, trend_prior=trend_prior_num, text_mask=text_mask, text_utility=text_utility, text_residual=text_residual)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, trend_prior=trend_prior_num, text_mask=text_mask, text_utility=text_utility, text_residual=text_residual, calendar_utility=calendar_utility, calendar_residual=calendar_residual)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, trend_prior=trend_prior_num, text_mask=text_mask, text_utility=text_utility, text_residual=text_residual)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, trend_prior=trend_prior_num, text_mask=text_mask, text_utility=text_utility, text_residual=text_residual, calendar_utility=calendar_utility, calendar_residual=calendar_residual)
 
         if self.save_attn:
             if self.save_token:

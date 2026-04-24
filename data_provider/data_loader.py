@@ -878,23 +878,12 @@ class Dataset_Custom(Dataset):
                 else:
                     composed_text, txt_mark, cot_text, rag_retrieved = cached
                     retrieved_records = []
-        if txt_mark <= 0 and len(self._normalize_text(raw_text)) == 0:
-            txt_mark = 0
-        quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
-        if quality_pkg["quality_total"] <= 0:
-            txt_mark = 0
+        txt_mark = 1 if any(
+            len(self._normalize_text(text_value)) > 0
+            for text_value in (raw_text, rag_retrieved, cot_text, composed_text)
+        ) else 0
 
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
-        trend_prior_text, source_trend_priors = self._build_text_trend_components(raw_text, rag_retrieved, cot_text, quality_pkg, seq_x)
-        text_evidence_vec = self._build_window_evidence(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            source_trend_priors,
-            text_meta,
-            seq_x,
-        )
         text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
             raw_events=text_meta.get("raw_events", []),
             retrieved_records=retrieved_records,
@@ -927,21 +916,10 @@ class Dataset_Custom(Dataset):
             'text_event_quality_feats': text_event_quality_feats,
             'text_event_mask': text_event_mask,
             'text_mark': txt_mark,
-            'text_quality': np.asarray(quality_pkg['quality_total'], dtype=np.float32),
-            'text_quality_raw': np.asarray(quality_pkg['quality_raw'], dtype=np.float32),
-            'text_quality_ret': np.asarray(quality_pkg['quality_ret'], dtype=np.float32),
-            'text_quality_cot': np.asarray(quality_pkg['quality_cot'], dtype=np.float32),
-            'text_quality_total': np.asarray(quality_pkg['quality_total'], dtype=np.float32),
-            'text_gate_raw': np.asarray(quality_pkg['gate_raw'], dtype=np.float32),
-            'text_gate_ret': np.asarray(quality_pkg['gate_ret'], dtype=np.float32),
-            'text_gate_cot': np.asarray(quality_pkg['gate_cot'], dtype=np.float32),
-            'text_level': np.asarray(quality_pkg['level'], dtype=np.int64),
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior_num,
             'trend_prior_num': trend_prior_num,
-            'trend_prior_text': trend_prior_text,
-            'text_evidence_vec': text_evidence_vec,
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
 

@@ -174,6 +174,17 @@ class CSDI_base(nn.Module):
         )
         self.register_buffer("pattern_q_b_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("pattern_q_b_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("pattern_segment_q_b_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("pattern_segment_q_b_count", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("diag_segment_alpha_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("diag_segment_alpha_sq_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("diag_segment_alpha_count", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("diag_segment_baseline_mse_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("diag_segment_baseline_mse_count", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("text_gain_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("text_gain_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_text_gain_batch_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_text_gain_batch_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_w_auto_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_w_auto_sq_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_w_auto_count", torch.zeros((), dtype=torch.float32))
@@ -189,6 +200,10 @@ class CSDI_base(nn.Module):
         self.register_buffer("diag_main_loss_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_aux_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_multi_res_aux_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_pattern_budget_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_pattern_budget_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_mr_budget_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_mr_budget_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_loss_count", torch.zeros((), dtype=torch.float32))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
@@ -412,6 +427,27 @@ class CSDI_base(nn.Module):
             return "mid"
         return "long"
 
+    def _segment_slices(self, horizons=None):
+        horizons = list(self.multi_res_horizons if horizons is None else horizons)
+        if not horizons and self.pred_len > 0:
+            horizons = [int(self.pred_len)]
+        segments = []
+        prev_h = 0
+        for horizon in horizons:
+            h = int(horizon)
+            if h <= prev_h:
+                continue
+            start = int(self.lookback_len + prev_h)
+            end = int(self.lookback_len + h)
+            segments.append((h, start, end))
+            prev_h = h
+        return segments
+
+    def _segment_running_mean(self, sum_buffer, count_buffer):
+        count = count_buffer.detach().clamp(min=1.0)
+        mean = sum_buffer.detach() / count
+        return torch.where(count_buffer.detach() > 0, mean, torch.zeros_like(mean)).to(self.device)
+
     def get_multi_res_debug_state(self):
         active_horizons = self._get_active_multi_res_horizons()
         indices = [self.multi_res_horizon_to_index[h] for h in active_horizons if h in self.multi_res_horizon_to_index]
@@ -427,12 +463,28 @@ class CSDI_base(nn.Module):
         alpha_mean = float(self.diag_alpha_b_sum.detach().cpu().item() / max(alpha_count, 1.0))
         alpha_var = float(self.diag_alpha_b_sq_sum.detach().cpu().item() / max(alpha_count, 1.0) - alpha_mean ** 2)
         text_count = float(self.diag_text_quality_count.detach().cpu().item())
+        text_gain_count = float(self.text_gain_count.detach().cpu().item())
+        text_gain_batch_count = float(self.diag_text_gain_batch_count.detach().cpu().item())
         agree_count = float(self.diag_router_agreement_count.detach().cpu().item())
         baseline_count = float(self.diag_pattern_baseline_mse_count.detach().cpu().item())
         loss_count = float(self.diag_loss_count.detach().cpu().item())
+        pattern_budget_count = float(self.diag_pattern_budget_count.detach().cpu().item())
+        mr_budget_count = float(self.diag_mr_budget_count.detach().cpu().item())
         main_loss_mean = float(self.diag_main_loss_sum.detach().cpu().item() / max(loss_count, 1.0))
         pattern_aux_mean = float(self.diag_pattern_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         multi_res_aux_mean = float(self.diag_multi_res_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
+        segment_q_b = self._segment_running_mean(self.pattern_segment_q_b_sum, self.pattern_segment_q_b_count).detach().cpu().tolist()
+        segment_alpha_count = self.diag_segment_alpha_count.detach().cpu().clamp(min=1.0)
+        segment_alpha_mean_tensor = self.diag_segment_alpha_sum.detach().cpu() / segment_alpha_count
+        segment_alpha_var = self.diag_segment_alpha_sq_sum.detach().cpu() / segment_alpha_count - segment_alpha_mean_tensor ** 2
+        segment_alpha_mean = torch.where(self.diag_segment_alpha_count.detach().cpu() > 0, segment_alpha_mean_tensor, torch.zeros_like(segment_alpha_mean_tensor))
+        segment_alpha_std = torch.where(self.diag_segment_alpha_count.detach().cpu() > 0, segment_alpha_var.clamp(min=0.0).sqrt(), torch.zeros_like(segment_alpha_var))
+        segment_mse_count = self.diag_segment_baseline_mse_count.detach().cpu().clamp(min=1.0)
+        segment_mse_mean = torch.where(
+            self.diag_segment_baseline_mse_count.detach().cpu() > 0,
+            self.diag_segment_baseline_mse_sum.detach().cpu() / segment_mse_count,
+            torch.zeros_like(segment_mse_count),
+        )
         return {
             "guide_mode": self.guide_mode,
             "final_method": self.final_method,
@@ -447,13 +499,22 @@ class CSDI_base(nn.Module):
             "difficulty_inverse": self.multi_res_difficulty_inverse,
             "pattern_q_b_running_mean": q_b_mean,
             "pattern_q_b_running_count": q_b_count,
+            "segment_q_b_running_mean": segment_q_b,
             "w_auto_mean": w_mean,
             "w_auto_std": float(max(w_var, 0.0) ** 0.5),
             "text_quality_mean": float(self.diag_text_quality_sum.detach().cpu().item() / max(text_count, 1.0)),
+            "text_gain_running_mean": float(self.text_gain_sum.detach().cpu().item() / max(text_gain_count, 1.0)),
+            "text_gain_running_count": text_gain_count,
+            "text_gain_batch_mean": float(self.diag_text_gain_batch_sum.detach().cpu().item() / max(text_gain_batch_count, 1.0)),
             "router_agreement_mean": float(self.diag_router_agreement_sum.detach().cpu().item() / max(agree_count, 1.0)),
             "alpha_b_mean": alpha_mean,
             "alpha_b_std": float(max(alpha_var, 0.0) ** 0.5),
+            "segment_alpha_b_mean": segment_alpha_mean.tolist(),
+            "segment_alpha_b_std": segment_alpha_std.tolist(),
             "pattern_baseline_mse": float(self.diag_pattern_baseline_mse_sum.detach().cpu().item() / max(baseline_count, 1.0)),
+            "segment_pattern_baseline_mse": segment_mse_mean.tolist(),
+            "pattern_budget": float(self.diag_pattern_budget_sum.detach().cpu().item() / max(pattern_budget_count, 1.0)),
+            "mr_budget": float(self.diag_mr_budget_sum.detach().cpu().item() / max(mr_budget_count, 1.0)),
             "loss_means": {
                 "main_loss": main_loss_mean,
                 "pattern_aux": pattern_aux_mean,
@@ -485,6 +546,15 @@ class CSDI_base(nn.Module):
         if float(self.pattern_q_b_count.detach().item()) <= 0:
             return torch.zeros((), device=self.device)
         return (self.pattern_q_b_sum / self.pattern_q_b_count.clamp(min=1.0)).to(self.device)
+
+    def _text_gain_running_mean(self, device=None, dtype=None):
+        device = self.device if device is None else device
+        if float(self.text_gain_count.detach().item()) <= 0:
+            return torch.ones((), device=device, dtype=dtype or torch.float32)
+        value = (self.text_gain_sum / self.text_gain_count.clamp(min=1.0)).to(device)
+        if dtype is not None:
+            value = value.to(dtype=dtype)
+        return value.clamp(min=0.0, max=1.0)
 
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
@@ -710,7 +780,43 @@ class CSDI_base(nn.Module):
         )
         return q_t.clamp(min=0.0, max=1.0)
 
-    def _compute_auto_guidance(self, numeric_logits, text_logits, text_evidence_vec, text_mask, batch_size):
+    def _compute_text_gain(self, observed_data, cond_mask, pi_numeric, pi_text):
+        if not self.training:
+            return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
+        if observed_data is None or cond_mask is None:
+            return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
+        hist_len = min(max(int(self.lookback_len), 1), observed_data.shape[-1])
+        if hist_len <= 1:
+            return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
+        if self.multi_res_horizons:
+            cal_len = min(int(self.multi_res_horizons[0]), hist_len - 1)
+        else:
+            cal_len = min(max(int(self.pred_len), 1), hist_len - 1)
+        cal_len = max(int(cal_len), 1)
+        prefix_len = hist_len - cal_len
+        if prefix_len <= 0:
+            return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
+
+        prefix = observed_data[:, :, :prefix_len]
+        prefix_mask = cond_mask[:, :, :prefix_len].float()
+        cal_target = observed_data[:, :, prefix_len:hist_len]
+        cal_mask = cond_mask[:, :, prefix_len:hist_len].float()
+        if cal_mask.sum() <= 0:
+            return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
+
+        expert_cal = self._build_expert_futures_from_history(prefix, prefix_mask, cal_len)
+        numeric_cal = (pi_numeric.view(pi_numeric.shape[0], self.pattern_num_experts, 1, 1) * expert_cal).sum(dim=1)
+        text_cal = (pi_text.view(pi_text.shape[0], self.pattern_num_experts, 1, 1) * expert_cal).sum(dim=1)
+        denom = cal_mask.sum().clamp(min=1.0)
+        loss_num = (((numeric_cal - cal_target) * cal_mask) ** 2).sum() / denom
+        loss_text = (((text_cal - cal_target) * cal_mask) ** 2).sum() / denom
+        gain = ((loss_num - loss_text) / loss_num.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+        if self.training:
+            self._add_diag_scalar("text_gain_sum", "text_gain_count", gain)
+        self._add_diag_scalar("diag_text_gain_batch_sum", "diag_text_gain_batch_count", gain)
+        return gain.detach().to(device=pi_numeric.device, dtype=pi_numeric.dtype)
+
+    def _compute_auto_guidance(self, numeric_logits, text_logits, text_evidence_vec, text_mask, batch_size, observed_data=None, cond_mask=None):
         pi_num = F.softmax(numeric_logits, dim=-1).clamp(min=1e-6)
         pi_text = F.softmax(text_logits, dim=-1).clamp(min=1e-6)
         kl_nt = (pi_num * (pi_num.log() - pi_text.log())).sum(dim=1)
@@ -723,29 +829,24 @@ class CSDI_base(nn.Module):
             numeric_logits.device,
             numeric_logits.dtype,
         )
-        w_auto = (text_quality * router_agreement).clamp(min=0.0, max=1.0)
+        text_gain = self._compute_text_gain(observed_data, cond_mask, pi_num, pi_text)
+        w_auto = (text_quality * router_agreement * text_gain).clamp(min=0.0, max=1.0)
         self._add_diag_scalar("diag_w_auto_sum", "diag_w_auto_count", w_auto, count=None, sq_sum_name="diag_w_auto_sq_sum")
         self._add_diag_scalar("diag_text_quality_sum", "diag_text_quality_count", text_quality, count=None)
         self._add_diag_scalar("diag_router_agreement_sum", "diag_router_agreement_count", router_agreement, count=None)
-        return w_auto, text_quality, router_agreement, pi_num, pi_text
+        return w_auto, text_quality, router_agreement, pi_num, pi_text, text_gain
 
-    def _build_pattern_baselines(self, observed_data, cond_mask, stats):
-        B, K, L = observed_data.shape
-        baseline = torch.zeros_like(observed_data)
-        future_len = min(max(int(self.pred_len), 0), max(L - self.lookback_len, 0))
+    def _build_expert_futures_from_history(self, hist, hist_mask, future_len):
+        B, K, hist_len = hist.shape
         if future_len <= 0:
-            experts = torch.zeros((B, self.pattern_num_experts, K, 0), device=observed_data.device, dtype=observed_data.dtype)
-            return baseline, experts
-        hist_len = min(max(int(self.lookback_len), 1), L)
-        hist = observed_data[:, :, :hist_len]
-        hist_mask = cond_mask[:, :, :hist_len].float()
+            return torch.zeros((B, self.pattern_num_experts, K, 0), device=hist.device, dtype=hist.dtype)
         mean = self._masked_mean(hist, hist_mask, dim=2, keepdim=True)
         filled_hist = torch.where(hist_mask > 0, hist, mean.expand_as(hist))
         first = filled_hist[:, :, 0:1]
         last = filled_hist[:, :, -1:]
         prev = filled_hist[:, :, -2:-1] if hist_len > 1 else last
         slope = (last - first) / max(hist_len - 1, 1)
-        steps = torch.arange(1, future_len + 1, device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
+        steps = torch.arange(1, future_len + 1, device=hist.device, dtype=hist.dtype).view(1, 1, -1)
         trend_future = last + slope * steps
         state_future = last.expand(-1, -1, future_len)
         phi = torch.exp(-steps / max(float(future_len), 1.0))
@@ -757,7 +858,7 @@ class CSDI_base(nn.Module):
         for p in [2, 3, 4, 6, 7, 12, 24, 52, 96]:
             if hist_len <= p:
                 continue
-            idx = hist_len - p + (torch.arange(future_len, device=observed_data.device) % p)
+            idx = hist_len - p + (torch.arange(future_len, device=hist.device) % p)
             season_candidates.append(filled_hist[:, :, idx])
             series = filled_hist.mean(dim=1)
             time_mask = (hist_mask.sum(dim=1) > 0).float()
@@ -774,6 +875,19 @@ class CSDI_base(nn.Module):
             [trend_future, season_future, state_future, mean_future, event_future],
             dim=1,
         )
+        return expert_futures
+
+    def _build_pattern_baselines(self, observed_data, cond_mask, stats):
+        B, K, L = observed_data.shape
+        baseline = torch.zeros_like(observed_data)
+        future_len = min(max(int(self.pred_len), 0), max(L - self.lookback_len, 0))
+        if future_len <= 0:
+            experts = torch.zeros((B, self.pattern_num_experts, K, 0), device=observed_data.device, dtype=observed_data.dtype)
+            return baseline, experts
+        hist_len = min(max(int(self.lookback_len), 1), L)
+        hist = observed_data[:, :, :hist_len]
+        hist_mask = cond_mask[:, :, :hist_len].float()
+        expert_futures = self._build_expert_futures_from_history(hist, hist_mask, future_len)
         return baseline, expert_futures
 
     def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0):
@@ -787,12 +901,14 @@ class CSDI_base(nn.Module):
         numeric_logits = self.pattern_router(numeric_router_input) / temperature
         text_logits = self.pattern_router(text_router_input) / temperature
         if self.guide_mode == "auto":
-            scale, text_quality, router_agreement, pi_numeric, pi_text = self._compute_auto_guidance(
+            scale, text_quality, router_agreement, pi_numeric, pi_text, text_gain = self._compute_auto_guidance(
                 numeric_logits,
                 text_logits,
                 text_evidence_vec,
                 text_mask,
                 B,
+                observed_data=observed_data,
+                cond_mask=cond_mask,
             )
         else:
             scale = torch.full((B,), float(guidance_scale), device=observed_data.device, dtype=observed_data.dtype)
@@ -800,6 +916,7 @@ class CSDI_base(nn.Module):
             router_agreement = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
             pi_numeric = F.softmax(numeric_logits, dim=-1)
             pi_text = F.softmax(text_logits, dim=-1)
+            text_gain = torch.ones((), device=observed_data.device, dtype=observed_data.dtype)
         guided_logits = numeric_logits + scale.reshape(B, 1) * (text_logits - numeric_logits)
         pi = F.softmax(guided_logits, dim=-1)
         baseline, expert_futures = self._build_pattern_baselines(observed_data, cond_mask, stats)
@@ -829,6 +946,7 @@ class CSDI_base(nn.Module):
             "baseline_reliability": reliability,
             "text_quality": text_quality,
             "router_agreement": router_agreement,
+            "text_gain": text_gain,
             "guidance_scale": scale,
         }
 
@@ -838,35 +956,77 @@ class CSDI_base(nn.Module):
         if reliability is None:
             reliability = torch.ones((baseline.shape[0],), device=baseline.device, dtype=baseline.dtype)
         reliability = reliability.reshape(-1).clamp(min=0.0, max=1.0)
-        start = int(self.lookback_len)
-        end = min(int(self.lookback_len + self.pred_len), observed_data.shape[-1])
-        if end <= start:
-            alpha = torch.zeros_like(reliability)
-            pattern["alpha_b"] = alpha
+        segments = self._segment_slices()
+        if not segments:
+            alpha = torch.zeros((baseline.shape[0], 0), device=baseline.device, dtype=baseline.dtype)
+            pattern["alpha_b"] = torch.zeros_like(reliability)
+            pattern["alpha_b_segment"] = alpha
             return baseline * 0.0
 
-        future_baseline = baseline[:, :, start:end]
-
-        future_mask = target_mask[:, :, start:end].float()
-        future_target = observed_data[:, :, start:end]
-        if use_training_target and future_mask.sum() > 0:
-            denom = future_mask.sum().clamp(min=1.0)
-            baseline_mse = (((future_baseline - future_target) * future_mask) ** 2).sum() / denom
-            self._add_diag_scalar("diag_pattern_baseline_mse_sum", "diag_pattern_baseline_mse_count", baseline_mse)
-            target_mean = (future_target * future_mask).sum() / denom
-            target_var = (((future_target - target_mean) * future_mask) ** 2).sum() / denom.clamp(min=1.0)
-            q_b = (1.0 - baseline_mse / target_var.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
-            if self.training:
-                self._add_diag_scalar("pattern_q_b_sum", "pattern_q_b_count", q_b)
-        else:
-            q_b = self._pattern_q_b_running_mean().to(device=baseline.device, dtype=baseline.dtype).clamp(min=0.0, max=1.0)
-
-        alpha = (q_b.detach() * reliability).clamp(min=0.0, max=1.0)
-        pattern["alpha_b"] = alpha
-        pattern["pattern_q_b"] = q_b.detach()
-        self._add_diag_scalar("diag_alpha_b_sum", "diag_alpha_b_count", alpha, count=None, sq_sum_name="diag_alpha_b_sq_sum")
+        running_q = self._segment_running_mean(self.pattern_segment_q_b_sum, self.pattern_segment_q_b_count).to(
+            device=baseline.device,
+            dtype=baseline.dtype,
+        )
+        segment_reliability = self.multi_res_segment_reliability.detach().to(device=baseline.device, dtype=baseline.dtype).clamp(min=0.0, max=1.0)
         scaled = baseline.clone()
-        scaled[:, :, start:end] = future_baseline * alpha.reshape(-1, 1, 1)
+        segment_q_values = []
+        segment_alpha_values = []
+        segment_mse_values = []
+        max_segments = int(self.pattern_segment_q_b_sum.numel())
+        for segment_idx, (_, start, end) in enumerate(segments):
+            if segment_idx >= max_segments:
+                continue
+            end = min(end, observed_data.shape[-1])
+            if end <= start:
+                continue
+            future_baseline = baseline[:, :, start:end]
+            if use_training_target:
+                future_mask = target_mask[:, :, start:end].float()
+                future_target = observed_data[:, :, start:end]
+                if future_mask.sum() > 0:
+                    denom = future_mask.sum().clamp(min=1.0)
+                    baseline_mse = (((future_baseline - future_target) * future_mask) ** 2).sum() / denom
+                    target_mean = (future_target * future_mask).sum() / denom
+                    target_var = (((future_target - target_mean) * future_mask) ** 2).sum() / denom
+                    q_b = (1.0 - baseline_mse / target_var.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+                    segment_mse_values.append(baseline_mse.detach())
+                    self._add_diag_scalar("diag_pattern_baseline_mse_sum", "diag_pattern_baseline_mse_count", baseline_mse)
+                    with torch.no_grad():
+                        self.diag_segment_baseline_mse_sum[segment_idx].add_(baseline_mse.detach().float())
+                        self.diag_segment_baseline_mse_count[segment_idx].add_(1.0)
+                        if self.training:
+                            self.pattern_segment_q_b_sum[segment_idx].add_(q_b.detach().float())
+                            self.pattern_segment_q_b_count[segment_idx].add_(1.0)
+                            self.pattern_q_b_sum.add_(q_b.detach().float())
+                            self.pattern_q_b_count.add_(1.0)
+                else:
+                    q_b = running_q[segment_idx] if segment_idx < running_q.numel() else torch.zeros((), device=baseline.device, dtype=baseline.dtype)
+            else:
+                q_b = running_q[segment_idx] if segment_idx < running_q.numel() else torch.zeros((), device=baseline.device, dtype=baseline.dtype)
+            rel_s = segment_reliability[segment_idx] if segment_idx < segment_reliability.numel() else torch.ones((), device=baseline.device, dtype=baseline.dtype)
+            alpha_s = (q_b.detach() * reliability * rel_s).clamp(min=0.0, max=1.0)
+            scaled[:, :, start:end] = future_baseline * alpha_s.reshape(-1, 1, 1)
+            segment_q_values.append(q_b.detach().reshape(1))
+            segment_alpha_values.append(alpha_s)
+            with torch.no_grad():
+                self.diag_segment_alpha_sum[segment_idx].add_(alpha_s.detach().float().mean())
+                self.diag_segment_alpha_sq_sum[segment_idx].add_((alpha_s.detach().float() ** 2).mean())
+                self.diag_segment_alpha_count[segment_idx].add_(1.0)
+
+        if segment_alpha_values:
+            alpha_tensor = torch.stack(segment_alpha_values, dim=1)
+            alpha = alpha_tensor.mean(dim=1)
+            q_tensor = torch.cat(segment_q_values, dim=0)
+        else:
+            alpha_tensor = torch.zeros((baseline.shape[0], 0), device=baseline.device, dtype=baseline.dtype)
+            alpha = torch.zeros_like(reliability)
+            q_tensor = torch.zeros((0,), device=baseline.device, dtype=baseline.dtype)
+        pattern["alpha_b"] = alpha
+        pattern["alpha_b_segment"] = alpha_tensor
+        pattern["pattern_q_b"] = q_tensor.detach()
+        if segment_mse_values:
+            pattern["segment_pattern_baseline_mse"] = torch.stack(segment_mse_values).detach()
+        self._add_diag_scalar("diag_alpha_b_sum", "diag_alpha_b_count", alpha_tensor if alpha_tensor.numel() > 0 else alpha, count=None, sq_sum_name="diag_alpha_b_sq_sum")
         return scaled
 
     def _calc_pattern_aux_loss(self, pattern, observed_data, target_mask):
@@ -993,22 +1153,24 @@ class CSDI_base(nn.Module):
             predicted_series = predicted + pattern_baseline
             pattern_aux = self._calc_pattern_aux_loss(pattern, observed_data, target_mask)
             if self.final_method:
-                alpha_mean = pattern.get("alpha_b", torch.zeros((observed_data.shape[0],), device=observed_data.device)).mean().detach()
-                pattern_aux = alpha_mean * main_loss.detach() * pattern_aux / pattern_aux.detach().clamp(min=1e-6)
+                pattern_budget = self._pattern_aux_budget(pattern, observed_data.device, observed_data.dtype)
+                pattern_aux = pattern_budget * main_loss.detach() * pattern_aux / pattern_aux.detach().clamp(min=1e-6)
             auxiliary_loss = auxiliary_loss + pattern_aux
         else:
             pattern_aux = torch.zeros((), device=observed_data.device)
+            pattern_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted_series, target_mask, t=t, trend_prior=trend_prior)
             if self.final_method:
-                mr_scale = self._active_segment_reliability_mean().to(device=observed_data.device, dtype=observed_data.dtype)
-                multi_res_aux = mr_scale * main_loss.detach() * aux_loss / aux_loss.detach().clamp(min=1e-6)
+                mr_budget = self._multi_res_aux_budget(observed_data.device, observed_data.dtype)
+                multi_res_aux = mr_budget * main_loss.detach() * aux_loss / aux_loss.detach().clamp(min=1e-6)
                 auxiliary_loss = auxiliary_loss + multi_res_aux
             else:
                 multi_res_aux = self.multi_res_loss_weight * aux_loss
                 auxiliary_loss = auxiliary_loss + multi_res_aux
         else:
             multi_res_aux = torch.zeros((), device=observed_data.device)
+            mr_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
         aux_diag_scale = torch.ones((), device=observed_data.device)
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
@@ -1093,6 +1255,39 @@ class CSDI_base(nn.Module):
             return torch.ones((), device=self.device)
         return self._active_segment_reliabilities(horizons).mean().clamp(min=0.0, max=1.0)
 
+    def _pattern_aux_budget(self, pattern, device, dtype):
+        alpha_segments = None if pattern is None else pattern.get("alpha_b_segment")
+        if alpha_segments is not None and torch.is_tensor(alpha_segments) and alpha_segments.numel() > 0:
+            budget = alpha_segments.detach().mean()
+        elif pattern is not None and torch.is_tensor(pattern.get("alpha_b")):
+            budget = pattern["alpha_b"].detach().mean()
+        else:
+            budget = torch.zeros((), device=device, dtype=dtype)
+        budget = budget.to(device=device, dtype=dtype).clamp(min=0.0, max=1.0)
+        self._add_diag_scalar("diag_pattern_budget_sum", "diag_pattern_budget_count", budget)
+        return budget
+
+    def _multi_res_aux_budget(self, device, dtype):
+        horizons = self._get_active_multi_res_horizons()
+        if not horizons:
+            return torch.zeros((), device=device, dtype=dtype)
+        active_indices = [
+            self.multi_res_horizon_to_index[horizon]
+            for horizon in horizons
+            if horizon in self.multi_res_horizon_to_index
+        ]
+        if len(active_indices) != len(horizons):
+            return torch.ones((), device=device, dtype=dtype)
+        reliability = self._active_segment_reliabilities(horizons).to(device=device, dtype=dtype).clamp(min=0.0, max=1.0)
+        segment_q = self._segment_running_mean(self.pattern_segment_q_b_sum, self.pattern_segment_q_b_count)
+        segment_q = segment_q[active_indices].to(device=device, dtype=dtype).clamp(min=0.0, max=1.0)
+        reliability_mean = reliability.mean()
+        segment_gain_mean = segment_q.mean() if segment_q.numel() > 0 else torch.zeros((), device=device, dtype=dtype)
+        effective_segment_ratio = reliability_mean
+        budget = (reliability_mean * segment_gain_mean * effective_segment_ratio).clamp(min=0.0, max=1.0)
+        self._add_diag_scalar("diag_mr_budget_sum", "diag_mr_budget_count", budget)
+        return budget
+
     def _trend_segment_modulation(self, horizons, batch_size, trend_prior=None):
         if trend_prior is None:
             return torch.ones((batch_size, len(horizons)), device=self.device)
@@ -1111,7 +1306,11 @@ class CSDI_base(nn.Module):
         z_strength = (strength - strength.mean()) / strength.std(unbiased=False).clamp(min=1e-6)
         z_volatility = (volatility - volatility.mean()) / volatility.std(unbiased=False).clamp(min=1e-6)
         horizon_pos = torch.tensor(horizons, device=self.device, dtype=torch.float32) / max(float(self.pred_len), 1.0)
-        return F.softplus(1.0 + horizon_pos.unsqueeze(0) * (z_strength - z_volatility).unsqueeze(1)).clamp(min=1e-6)
+        raw = F.softplus(1.0 + horizon_pos.unsqueeze(0) * (z_strength - z_volatility).unsqueeze(1)).clamp(min=1e-6)
+        if self.final_method:
+            reliability = self._active_segment_reliabilities(horizons).unsqueeze(0).to(raw.device, raw.dtype)
+            raw = 1.0 + reliability * (raw - 1.0)
+        return raw.clamp(min=1e-6)
 
     def _get_multi_res_horizon_weights(self, horizons, batch_size, t=None, trend_prior=None):
         if len(horizons) <= 1:

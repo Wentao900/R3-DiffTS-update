@@ -22,6 +22,7 @@ logs/
 config/_tmp*.yaml
 config/_planb_quick_tmp*.yaml
 config/_four_cfg_tmp.yaml
+config/_final_method/
 
 # Weights/checkpoints
 *.pt

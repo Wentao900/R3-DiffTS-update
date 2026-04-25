@@ -121,6 +121,7 @@ class CSDI_base(nn.Module):
         self.multi_res_segment_loss = bool(train_cfg.get("multi_res_segment_loss", True))
         self.multi_res_reliability_weight = float(train_cfg.get("multi_res_reliability_weight", 1.0))
         self.multi_res_difficulty_inverse = bool(train_cfg.get("multi_res_difficulty_inverse", True))
+        self.multi_res_difficulty_gamma_configured = "multi_res_difficulty_gamma" in train_cfg
         self.multi_res_difficulty_gamma = float(train_cfg.get("multi_res_difficulty_gamma", 0.5))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
         self.current_epoch = 0
@@ -135,6 +136,8 @@ class CSDI_base(nn.Module):
         self.pattern_baseline_detach = bool(train_cfg.get("pattern_baseline_detach", False))
         self.pattern_router_temperature = float(config["model"].get("pattern_router_temperature", 1.0))
         self.guide_w_default = float(config["model"].get("guide_w_default", 1.0))
+        self.guide_mode = str(config["model"].get("guide_mode", "manual")).lower()
+        self.final_method = bool(config["model"].get("final_method", self.guide_mode == "auto"))
         self.pattern_reliability = bool(config["model"].get("pattern_reliability", True))
         self.pattern_reliability_threshold = float(config["model"].get("pattern_reliability_threshold", 0.35))
         self.pattern_reliability_temperature = float(config["model"].get("pattern_reliability_temperature", 0.1))
@@ -159,9 +162,34 @@ class CSDI_base(nn.Module):
         if len(self.multi_res_horizon_reliabilities) > 0:
             reliability_tensor = torch.tensor(self.multi_res_horizon_reliabilities, dtype=torch.float32)
         self.register_buffer("multi_res_reliability", reliability_tensor)
+        segment_reliability_tensor = torch.ones(reliability_size, dtype=torch.float32)
+        segment_reliabilities = train_cfg.get("multi_res_segment_reliabilities", None)
+        resolved_segment_reliabilities = self._resolve_multi_res_horizon_reliabilities(segment_reliabilities)
+        if len(resolved_segment_reliabilities) == len(self.multi_res_horizons):
+            segment_reliability_tensor = torch.tensor(resolved_segment_reliabilities, dtype=torch.float32)
+        self.multi_res_segment_reliabilities = resolved_segment_reliabilities or list(self.multi_res_horizon_reliabilities)
+        self.register_buffer("multi_res_segment_reliability", segment_reliability_tensor)
         self.multi_res_huber_deltas = self._resolve_multi_res_huber_deltas(
             self.multi_res_horizons, self.multi_res_huber_deltas_cfg
         )
+        self.register_buffer("pattern_q_b_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("pattern_q_b_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_w_auto_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_w_auto_sq_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_w_auto_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_text_quality_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_text_quality_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_router_agreement_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_router_agreement_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_alpha_b_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_alpha_b_sq_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_alpha_b_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_pattern_baseline_mse_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_pattern_baseline_mse_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_main_loss_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_pattern_aux_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_multi_res_aux_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_loss_count", torch.zeros((), dtype=torch.float32))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -390,16 +418,73 @@ class CSDI_base(nn.Module):
         difficulty = []
         if indices:
             difficulty = self.multi_res_difficulty_ema[indices].detach().cpu().tolist()
+        q_b_count = float(self.pattern_q_b_count.detach().cpu().item())
+        q_b_mean = float(self.pattern_q_b_sum.detach().cpu().item() / max(q_b_count, 1.0))
+        w_count = float(self.diag_w_auto_count.detach().cpu().item())
+        w_mean = float(self.diag_w_auto_sum.detach().cpu().item() / max(w_count, 1.0))
+        w_var = float(self.diag_w_auto_sq_sum.detach().cpu().item() / max(w_count, 1.0) - w_mean ** 2)
+        alpha_count = float(self.diag_alpha_b_count.detach().cpu().item())
+        alpha_mean = float(self.diag_alpha_b_sum.detach().cpu().item() / max(alpha_count, 1.0))
+        alpha_var = float(self.diag_alpha_b_sq_sum.detach().cpu().item() / max(alpha_count, 1.0) - alpha_mean ** 2)
+        text_count = float(self.diag_text_quality_count.detach().cpu().item())
+        agree_count = float(self.diag_router_agreement_count.detach().cpu().item())
+        baseline_count = float(self.diag_pattern_baseline_mse_count.detach().cpu().item())
+        loss_count = float(self.diag_loss_count.detach().cpu().item())
+        main_loss_mean = float(self.diag_main_loss_sum.detach().cpu().item() / max(loss_count, 1.0))
+        pattern_aux_mean = float(self.diag_pattern_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
+        multi_res_aux_mean = float(self.diag_multi_res_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         return {
+            "guide_mode": self.guide_mode,
+            "final_method": self.final_method,
             "final_horizons": list(self.multi_res_horizons),
             "active_horizons": list(active_horizons),
             "huber_deltas": list(self.multi_res_huber_deltas),
             "horizon_reliabilities": list(self.multi_res_horizon_reliabilities),
+            "segment_reliabilities": list(self.multi_res_segment_reliabilities),
             "difficulty_ema": difficulty,
             "horizon_groups": [self._get_horizon_group(horizon) for horizon in active_horizons],
             "segment_loss": self.multi_res_segment_loss,
             "difficulty_inverse": self.multi_res_difficulty_inverse,
+            "pattern_q_b_running_mean": q_b_mean,
+            "pattern_q_b_running_count": q_b_count,
+            "w_auto_mean": w_mean,
+            "w_auto_std": float(max(w_var, 0.0) ** 0.5),
+            "text_quality_mean": float(self.diag_text_quality_sum.detach().cpu().item() / max(text_count, 1.0)),
+            "router_agreement_mean": float(self.diag_router_agreement_sum.detach().cpu().item() / max(agree_count, 1.0)),
+            "alpha_b_mean": alpha_mean,
+            "alpha_b_std": float(max(alpha_var, 0.0) ** 0.5),
+            "pattern_baseline_mse": float(self.diag_pattern_baseline_mse_sum.detach().cpu().item() / max(baseline_count, 1.0)),
+            "loss_means": {
+                "main_loss": main_loss_mean,
+                "pattern_aux": pattern_aux_mean,
+                "multi_res_aux": multi_res_aux_mean,
+            },
+            "loss_ratios": {
+                "pattern_aux_to_main": float(pattern_aux_mean / max(main_loss_mean, 1e-8)),
+                "multi_res_aux_to_main": float(multi_res_aux_mean / max(main_loss_mean, 1e-8)),
+            },
         }
+
+    def _add_diag_scalar(self, sum_name, count_name, value, count=1.0, sq_sum_name=None):
+        with torch.no_grad():
+            value = value.detach().float()
+            if value.numel() > 1:
+                mean_value = value.mean()
+                count_value = float(value.numel()) if count is None else float(count)
+                sq_value = (value ** 2).mean()
+            else:
+                mean_value = value.reshape(()).float()
+                count_value = float(count)
+                sq_value = mean_value ** 2
+            getattr(self, sum_name).add_(mean_value * count_value)
+            getattr(self, count_name).add_(count_value)
+            if sq_sum_name is not None:
+                getattr(self, sq_sum_name).add_(sq_value * count_value)
+
+    def _pattern_q_b_running_mean(self):
+        if float(self.pattern_q_b_count.detach().item()) <= 0:
+            return torch.zeros((), device=self.device)
+        return (self.pattern_q_b_sum / self.pattern_q_b_count.clamp(min=1.0)).to(self.device)
 
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
@@ -569,14 +654,19 @@ class CSDI_base(nn.Module):
         keep = torch.bernoulli(torch.full((text_pattern.shape[0], 1), keep_prob, device=text_pattern.device))
         return text_pattern * keep
 
-    def _compute_pattern_reliability(self, stats, text_pattern):
+    def _compute_pattern_reliability(self, stats, text_pattern=None):
         if not self.pattern_reliability:
             return torch.ones((stats.shape[0],), device=stats.device, dtype=stats.dtype)
         trend_r2 = stats[:, 1]
         season_strength = stats[:, 3]
         state_score = stats[:, 4]
         stability = 1.0 - stats[:, 7].clamp(min=0.0, max=1.0)
-        text_strength = text_pattern.max(dim=1).values if text_pattern.numel() > 0 else torch.zeros_like(trend_r2)
+        if self.final_method:
+            return (
+                torch.max(torch.stack([trend_r2, season_strength, state_score], dim=1), dim=1).values
+                * torch.sqrt(stability.clamp(min=0.0, max=1.0))
+            ).clamp(min=0.0, max=1.0)
+        text_strength = text_pattern.max(dim=1).values if text_pattern is not None and text_pattern.numel() > 0 else torch.zeros_like(trend_r2)
         score = (
             0.35 * season_strength
             + 0.25 * trend_r2
@@ -589,6 +679,55 @@ class CSDI_base(nn.Module):
         rho_min = min(max(float(self.pattern_reliability_min), 0.0), 1.0)
         rho_max = min(max(float(self.pattern_reliability_max), rho_min), 1.0)
         return (rho_min + (rho_max - rho_min) * rho).clamp(min=rho_min, max=rho_max)
+
+    def _compute_text_quality(self, text_evidence_vec, text_mask, batch_size, device, dtype):
+        if text_mask is None:
+            availability = torch.ones((batch_size,), device=device, dtype=dtype)
+        else:
+            availability = text_mask.float()
+            if availability.dim() > 1:
+                availability = availability.mean(dim=1)
+            availability = availability.reshape(-1).to(device=device, dtype=dtype).clamp(min=0.0, max=1.0)
+            if availability.numel() == 1:
+                availability = availability.repeat(batch_size)
+        if text_evidence_vec is None:
+            quality = availability
+            temporal_support = availability
+            source_agreement = availability
+        else:
+            evidence = text_evidence_vec.float()
+            if evidence.dim() == 1:
+                evidence = evidence.reshape(batch_size, -1)
+            if evidence.shape[1] < 5:
+                evidence = F.pad(evidence, (0, 5 - evidence.shape[1]))
+            evidence = evidence[:, :5].to(device=device, dtype=dtype).clamp(min=0.0, max=1.0)
+            quality = evidence[:, 0]
+            temporal_support = torch.max(evidence[:, 1], evidence[:, 2])
+            source_agreement = evidence[:, 4]
+        q_t = availability * torch.pow(
+            (quality * temporal_support * source_agreement).clamp(min=1e-8),
+            1.0 / 3.0,
+        )
+        return q_t.clamp(min=0.0, max=1.0)
+
+    def _compute_auto_guidance(self, numeric_logits, text_logits, text_evidence_vec, text_mask, batch_size):
+        pi_num = F.softmax(numeric_logits, dim=-1).clamp(min=1e-6)
+        pi_text = F.softmax(text_logits, dim=-1).clamp(min=1e-6)
+        kl_nt = (pi_num * (pi_num.log() - pi_text.log())).sum(dim=1)
+        kl_tn = (pi_text * (pi_text.log() - pi_num.log())).sum(dim=1)
+        router_agreement = torch.exp(-0.5 * (kl_nt + kl_tn)).clamp(min=0.0, max=1.0)
+        text_quality = self._compute_text_quality(
+            text_evidence_vec,
+            text_mask,
+            batch_size,
+            numeric_logits.device,
+            numeric_logits.dtype,
+        )
+        w_auto = (text_quality * router_agreement).clamp(min=0.0, max=1.0)
+        self._add_diag_scalar("diag_w_auto_sum", "diag_w_auto_count", w_auto, count=None, sq_sum_name="diag_w_auto_sq_sum")
+        self._add_diag_scalar("diag_text_quality_sum", "diag_text_quality_count", text_quality, count=None)
+        self._add_diag_scalar("diag_router_agreement_sum", "diag_router_agreement_count", router_agreement, count=None)
+        return w_auto, text_quality, router_agreement, pi_num, pi_text
 
     def _build_pattern_baselines(self, observed_data, cond_mask, stats):
         B, K, L = observed_data.shape
@@ -647,8 +786,21 @@ class CSDI_base(nn.Module):
         text_router_input = torch.cat([stats, text_pattern], dim=1)
         numeric_logits = self.pattern_router(numeric_router_input) / temperature
         text_logits = self.pattern_router(text_router_input) / temperature
-        scale = float(guidance_scale)
-        guided_logits = numeric_logits + scale * (text_logits - numeric_logits)
+        if self.guide_mode == "auto":
+            scale, text_quality, router_agreement, pi_numeric, pi_text = self._compute_auto_guidance(
+                numeric_logits,
+                text_logits,
+                text_evidence_vec,
+                text_mask,
+                B,
+            )
+        else:
+            scale = torch.full((B,), float(guidance_scale), device=observed_data.device, dtype=observed_data.dtype)
+            text_quality = self._compute_text_quality(text_evidence_vec, text_mask, B, observed_data.device, observed_data.dtype)
+            router_agreement = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
+            pi_numeric = F.softmax(numeric_logits, dim=-1)
+            pi_text = F.softmax(text_logits, dim=-1)
+        guided_logits = numeric_logits + scale.reshape(B, 1) * (text_logits - numeric_logits)
         pi = F.softmax(guided_logits, dim=-1)
         baseline, expert_futures = self._build_pattern_baselines(observed_data, cond_mask, stats)
         future_len = expert_futures.shape[-1]
@@ -668,15 +820,54 @@ class CSDI_base(nn.Module):
         return {
             "stats": stats,
             "text_pattern": text_pattern,
-            "pi_numeric": F.softmax(numeric_logits, dim=-1),
-            "pi_text": F.softmax(text_logits, dim=-1),
+            "pi_numeric": pi_numeric,
+            "pi_text": pi_text,
             "pi": pi,
             "pseudo": pseudo.detach(),
             "baseline": baseline,
             "expert_futures": expert_futures,
             "baseline_reliability": reliability,
+            "text_quality": text_quality,
+            "router_agreement": router_agreement,
             "guidance_scale": scale,
         }
+
+    def _compute_weak_pattern_baseline(self, pattern, observed_data, target_mask, use_training_target):
+        baseline = pattern["baseline"]
+        reliability = pattern.get("baseline_reliability")
+        if reliability is None:
+            reliability = torch.ones((baseline.shape[0],), device=baseline.device, dtype=baseline.dtype)
+        reliability = reliability.reshape(-1).clamp(min=0.0, max=1.0)
+        start = int(self.lookback_len)
+        end = min(int(self.lookback_len + self.pred_len), observed_data.shape[-1])
+        if end <= start:
+            alpha = torch.zeros_like(reliability)
+            pattern["alpha_b"] = alpha
+            return baseline * 0.0
+
+        future_baseline = baseline[:, :, start:end]
+
+        future_mask = target_mask[:, :, start:end].float()
+        future_target = observed_data[:, :, start:end]
+        if use_training_target and future_mask.sum() > 0:
+            denom = future_mask.sum().clamp(min=1.0)
+            baseline_mse = (((future_baseline - future_target) * future_mask) ** 2).sum() / denom
+            self._add_diag_scalar("diag_pattern_baseline_mse_sum", "diag_pattern_baseline_mse_count", baseline_mse)
+            target_mean = (future_target * future_mask).sum() / denom
+            target_var = (((future_target - target_mean) * future_mask) ** 2).sum() / denom.clamp(min=1.0)
+            q_b = (1.0 - baseline_mse / target_var.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+            if self.training:
+                self._add_diag_scalar("pattern_q_b_sum", "pattern_q_b_count", q_b)
+        else:
+            q_b = self._pattern_q_b_running_mean().to(device=baseline.device, dtype=baseline.dtype).clamp(min=0.0, max=1.0)
+
+        alpha = (q_b.detach() * reliability).clamp(min=0.0, max=1.0)
+        pattern["alpha_b"] = alpha
+        pattern["pattern_q_b"] = q_b.detach()
+        self._add_diag_scalar("diag_alpha_b_sum", "diag_alpha_b_count", alpha, count=None, sq_sum_name="diag_alpha_b_sq_sum")
+        scaled = baseline.clone()
+        scaled[:, :, start:end] = future_baseline * alpha.reshape(-1, 1, 1)
+        return scaled
 
     def _calc_pattern_aux_loss(self, pattern, observed_data, target_mask):
         aux = torch.zeros((), device=observed_data.device)
@@ -690,11 +881,10 @@ class CSDI_base(nn.Module):
         reliability = reliability.reshape(-1).clamp(min=0.0, max=1.0)
         if not self.pattern_aux_reliability:
             reliability = torch.ones_like(reliability)
-        if self.pattern_consistency_weight > 0:
-            consistency = (pseudo * (pseudo.log() - pi.log())).sum(dim=1)
-            consistency = (reliability * consistency).mean()
-            aux = aux + self.pattern_consistency_weight * consistency
-        if self.pattern_expert_weight > 0 and pattern["expert_futures"].numel() > 0:
+        consistency = (pseudo * (pseudo.log() - pi.log())).sum(dim=1)
+        consistency = (reliability * consistency).mean()
+        aux = aux + consistency
+        if pattern["expert_futures"].numel() > 0:
             future_len = pattern["expert_futures"].shape[-1]
             start = int(self.lookback_len)
             end = start + future_len
@@ -707,7 +897,14 @@ class CSDI_base(nn.Module):
             expert_loss = huber.sum(dim=(2, 3)) / denom
             weighted_expert_loss = (pattern["pi"] * expert_loss).sum(dim=1)
             weighted_expert_loss = (reliability * weighted_expert_loss).mean()
-            aux = aux + self.pattern_expert_weight * weighted_expert_loss
+            aux = aux + weighted_expert_loss
+        if not self.final_method:
+            legacy_aux = torch.zeros((), device=observed_data.device)
+            if self.pattern_consistency_weight > 0:
+                legacy_aux = legacy_aux + self.pattern_consistency_weight * consistency
+            if self.pattern_expert_weight > 0 and pattern["expert_futures"].numel() > 0:
+                legacy_aux = legacy_aux + self.pattern_expert_weight * weighted_expert_loss
+            return legacy_aux
         return aux
 
     def calc_loss_valid(
@@ -731,6 +928,7 @@ class CSDI_base(nn.Module):
             stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
             observed_data = (observed_data - means) / stdev
 
+        target_mask = observed_mask - cond_mask
         pattern = None
         pattern_baseline = None
         diffusion_target = observed_data
@@ -743,7 +941,15 @@ class CSDI_base(nn.Module):
                 text_evidence_vec=pattern_text_evidence_vec,
                 guidance_scale=1.0,
             )
-            pattern_baseline = pattern["baseline"]
+            if self.final_method:
+                pattern_baseline = self._compute_weak_pattern_baseline(
+                    pattern,
+                    observed_data,
+                    target_mask,
+                    use_training_target=(is_train == 1),
+                )
+            else:
+                pattern_baseline = pattern["baseline"]
             diffusion_target = observed_data - pattern_baseline
 
         if is_train != 1:
@@ -775,7 +981,6 @@ class CSDI_base(nn.Module):
             predicted_from_timestep = self.timestep_pred(timesteps)
             predicted = 0.9 * predicted + 0.1 * predicted_from_timestep
 
-        target_mask = observed_mask - cond_mask
         if self.noise_esti:
             residual = (noise - predicted) * target_mask 
         else:
@@ -786,13 +991,35 @@ class CSDI_base(nn.Module):
         predicted_series = predicted
         if pattern_baseline is not None:
             predicted_series = predicted + pattern_baseline
-            auxiliary_loss = auxiliary_loss + self._calc_pattern_aux_loss(pattern, observed_data, target_mask)
+            pattern_aux = self._calc_pattern_aux_loss(pattern, observed_data, target_mask)
+            if self.final_method:
+                alpha_mean = pattern.get("alpha_b", torch.zeros((observed_data.shape[0],), device=observed_data.device)).mean().detach()
+                pattern_aux = alpha_mean * main_loss.detach() * pattern_aux / pattern_aux.detach().clamp(min=1e-6)
+            auxiliary_loss = auxiliary_loss + pattern_aux
+        else:
+            pattern_aux = torch.zeros((), device=observed_data.device)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted_series, target_mask, t=t, trend_prior=trend_prior)
-            auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
+            if self.final_method:
+                mr_scale = self._active_segment_reliability_mean().to(device=observed_data.device, dtype=observed_data.dtype)
+                multi_res_aux = mr_scale * main_loss.detach() * aux_loss / aux_loss.detach().clamp(min=1e-6)
+                auxiliary_loss = auxiliary_loss + multi_res_aux
+            else:
+                multi_res_aux = self.multi_res_loss_weight * aux_loss
+                auxiliary_loss = auxiliary_loss + multi_res_aux
+        else:
+            multi_res_aux = torch.zeros((), device=observed_data.device)
+        aux_diag_scale = torch.ones((), device=observed_data.device)
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
-            auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
+            capped_auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
+            aux_diag_scale = capped_auxiliary_loss.detach() / auxiliary_loss.detach().clamp(min=1e-6)
+            auxiliary_loss = capped_auxiliary_loss
+        with torch.no_grad():
+            self.diag_main_loss_sum.add_(main_loss.detach().float())
+            self.diag_pattern_aux_sum.add_((pattern_aux.detach() * aux_diag_scale).float())
+            self.diag_multi_res_aux_sum.add_((multi_res_aux.detach() * aux_diag_scale).float())
+            self.diag_loss_count.add_(1.0)
         return main_loss + auxiliary_loss
 
     def _unwrap_diffmodel_output(self, output):
@@ -850,6 +1077,42 @@ class CSDI_base(nn.Module):
 
         return torch.stack(components, dim=0).mean(dim=0)
 
+    def _active_segment_reliabilities(self, horizons):
+        active_indices = [
+            self.multi_res_horizon_to_index[horizon]
+            for horizon in horizons
+            if horizon in self.multi_res_horizon_to_index
+        ]
+        if len(active_indices) != len(horizons) or self.multi_res_segment_reliability.numel() < len(self.multi_res_horizons):
+            return torch.ones((len(horizons),), device=self.device)
+        return self.multi_res_segment_reliability[active_indices].detach().clamp(min=0.0, max=1.0).to(self.device)
+
+    def _active_segment_reliability_mean(self):
+        horizons = self._get_active_multi_res_horizons()
+        if not horizons:
+            return torch.ones((), device=self.device)
+        return self._active_segment_reliabilities(horizons).mean().clamp(min=0.0, max=1.0)
+
+    def _trend_segment_modulation(self, horizons, batch_size, trend_prior=None):
+        if trend_prior is None:
+            return torch.ones((batch_size, len(horizons)), device=self.device)
+        if trend_prior.dim() == 3:
+            strength = trend_prior[:, :, 1].mean(dim=1)
+            volatility = trend_prior[:, :, 2].mean(dim=1)
+        else:
+            strength = trend_prior[:, 1]
+            volatility = trend_prior[:, 2]
+        strength = strength.reshape(-1).float().to(self.device)
+        volatility = volatility.reshape(-1).float().to(self.device)
+        if strength.numel() == 1:
+            strength = strength.repeat(batch_size)
+        if volatility.numel() == 1:
+            volatility = volatility.repeat(batch_size)
+        z_strength = (strength - strength.mean()) / strength.std(unbiased=False).clamp(min=1e-6)
+        z_volatility = (volatility - volatility.mean()) / volatility.std(unbiased=False).clamp(min=1e-6)
+        horizon_pos = torch.tensor(horizons, device=self.device, dtype=torch.float32) / max(float(self.pred_len), 1.0)
+        return F.softplus(1.0 + horizon_pos.unsqueeze(0) * (z_strength - z_volatility).unsqueeze(1)).clamp(min=1e-6)
+
     def _get_multi_res_horizon_weights(self, horizons, batch_size, t=None, trend_prior=None):
         if len(horizons) <= 1:
             return torch.ones((batch_size, len(horizons)), device=self.device)
@@ -874,6 +1137,22 @@ class CSDI_base(nn.Module):
         ]
         if len(active_indices) != len(horizons):
             return base_weights.clamp(min=1e-6)
+
+        if self.final_method:
+            segment_reliability = self._active_segment_reliabilities(horizons)
+            trend_modulation = self._trend_segment_modulation(horizons, batch_size, trend_prior=trend_prior)
+            difficulty = self.multi_res_difficulty_ema[active_indices].detach().clamp(min=1e-6)
+            if self.multi_res_difficulty_inverse:
+                if self.multi_res_difficulty_gamma_configured:
+                    gamma = torch.tensor(max(float(self.multi_res_difficulty_gamma), 0.0), device=self.device)
+                else:
+                    gamma = difficulty.std(unbiased=False) / (difficulty.mean() + difficulty.std(unbiased=False) + 1e-6)
+                difficulty_term = (difficulty.mean().clamp(min=1e-6) / difficulty).pow(gamma.clamp(min=0.0))
+            else:
+                difficulty_term = torch.ones_like(difficulty)
+            difficulty_term = segment_reliability + (1.0 - segment_reliability) * difficulty_term
+            weights = segment_reliability.unsqueeze(0) * trend_modulation * difficulty_term.unsqueeze(0)
+            return weights.clamp(min=1e-6)
 
         if self.multi_res_reliability_weight > 0 and self.multi_res_reliability.numel() >= len(self.multi_res_horizons):
             reliability = self.multi_res_reliability[active_indices].detach().clamp(min=0.0, max=1.0)
@@ -1039,7 +1318,15 @@ class CSDI_base(nn.Module):
                 text_evidence_vec=pattern_text_evidence_vec,
                 guidance_scale=pattern_guidance_scale,
             )
-            pattern_baseline = pattern["baseline"]
+            if self.final_method:
+                pattern_baseline = self._compute_weak_pattern_baseline(
+                    pattern,
+                    observed_data,
+                    torch.zeros_like(cond_mask),
+                    use_training_target=False,
+                )
+            else:
+                pattern_baseline = pattern["baseline"]
             diffusion_observed_data = observed_data - pattern_baseline
         
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)

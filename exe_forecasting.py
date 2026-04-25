@@ -169,12 +169,68 @@ def build_balanced_horizons(pred_len, candidates, max_count=5):
     return sorted(selected[:max_count])
 
 
-def compute_horizon_reliabilities(horizons, stats, threshold=0.2, temperature=0.05):
+def _sigmoid(value):
+    return 1.0 / (1.0 + math.exp(-float(value)))
+
+
+def compute_horizon_reliabilities(horizons, stats, threshold=0.2, temperature=0.05, reference_horizons=None):
     if not horizons:
         return []
     if not stats:
         return [1.0 for _ in horizons]
-    acf_values = stats.get("acf_values") or stats.get("acf_head") or []
+    robust_acf = stats.get("robust_acf_values") or []
+    signed_acf = stats.get("robust_signed_acf_values") or stats.get("acf_values") or stats.get("acf_head") or []
+    if robust_acf:
+        ref_horizons = reference_horizons or horizons
+        ref_values = [
+            float(robust_acf[int(h)])
+            for h in ref_horizons
+            if 0 <= int(h) < len(robust_acf)
+        ]
+        if not ref_values:
+            ref_values = [float(x) for x in robust_acf[1:] if np.isfinite(x)]
+        if not ref_values:
+            return [1.0 for _ in horizons]
+        tau = float(np.median(ref_values))
+        mad = float(np.median(np.abs(np.asarray(ref_values, dtype=np.float64) - tau)))
+        temp = max(mad, 1e-6)
+        phase_anchors = [int(x) for x in stats.get("phase_anchors", []) if 0 < int(x) < len(robust_acf)]
+        peak_lag = stats.get("peak_lag")
+        peak_value = stats.get("peak_value")
+        if peak_lag is not None and 0 <= int(peak_lag) < len(robust_acf):
+            peak_score = float(robust_acf[int(peak_lag)])
+        elif peak_value is not None:
+            peak_score = float(peak_value)
+        else:
+            peak_score = max(ref_values)
+        r_peak = _sigmoid((peak_score - tau) / temp)
+        sigma_points = sorted(set(phase_anchors + [int(h) for h in ref_horizons if int(h) > 0]))
+        if len(sigma_points) > 1:
+            sigma_p = float(np.median(np.diff(np.asarray(sigma_points, dtype=np.float64))))
+        else:
+            sigma_p = 1.0
+        sigma_p = max(sigma_p, 1e-6)
+        decay_lag = stats.get("decay_lag")
+        if decay_lag is None or int(decay_lag) <= 0:
+            decay_lag = max(1, min(len(robust_acf) - 1, max(int(max(ref_horizons or [1])), 1)))
+        short_end = max(1, min(int(decay_lag), len(robust_acf) - 1))
+        short_acf_strength = float(np.max(np.asarray(robust_acf[1:short_end + 1], dtype=np.float64))) if short_end >= 1 else 0.0
+        reliabilities = []
+        for horizon in horizons:
+            h = int(horizon)
+            score = float(robust_acf[h]) if 0 <= h < len(robust_acf) else 0.0
+            r_point = _sigmoid((score - tau) / temp)
+            if phase_anchors:
+                phase_score = max(math.exp(-((h - anchor) ** 2) / (2.0 * sigma_p ** 2)) for anchor in phase_anchors)
+                r_phase = r_peak * phase_score
+            else:
+                r_phase = 0.0
+            r_persist = short_acf_strength * math.exp(-float(max(h, 0)) / max(float(decay_lag), 1e-6))
+            rel = max(r_point, r_phase, r_persist)
+            reliabilities.append(float(min(max(rel, 0.0), 1.0)))
+        return reliabilities
+
+    acf_values = signed_acf or []
     peak_lag = stats.get("peak_lag")
     peak_value = stats.get("peak_value")
     reliabilities = []
@@ -189,9 +245,36 @@ def compute_horizon_reliabilities(horizons, stats, threshold=0.2, temperature=0.
         if score is None:
             score = 1.0 if not acf_values else 0.0
         score = max(score, 0.0)
-        rel = 1.0 / (1.0 + math.exp(-(score - float(threshold)) / temp))
+        rel = _sigmoid((score - float(threshold)) / temp)
         reliabilities.append(float(min(max(rel, 0.0), 1.0)))
     return reliabilities
+
+
+def compute_segment_reliabilities(horizons, stats):
+    if not horizons:
+        return []
+    max_horizon = max(int(h) for h in horizons)
+    lag_reliabilities = compute_horizon_reliabilities(
+        list(range(1, max_horizon + 1)),
+        stats,
+        reference_horizons=horizons,
+    )
+    rel_by_lag = {lag: lag_reliabilities[lag - 1] for lag in range(1, max_horizon + 1)}
+    segment_reliabilities = []
+    prev_h = 0
+    for horizon in horizons:
+        h = int(horizon)
+        values = [rel_by_lag[lag] for lag in range(prev_h + 1, h + 1) if lag in rel_by_lag]
+        if not values:
+            segment_reliabilities.append(1.0)
+        else:
+            values_arr = np.asarray(values, dtype=np.float64)
+            mean_value = float(values_arr.mean())
+            std_value = float(values_arr.std())
+            lam = std_value / (mean_value + std_value + 1e-8)
+            segment_reliabilities.append(float((1.0 - lam) * mean_value + lam * float(values_arr.max())))
+        prev_h = h
+    return segment_reliabilities
 
 
 def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
@@ -200,11 +283,13 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
         pred_len,
     )
     if explicit_horizons:
+        segment_reliabilities = [1.0 for _ in explicit_horizons]
         return {
             "horizons": explicit_horizons,
             "source": "explicit",
-            "stats": {"horizon_reliabilities": [1.0 for _ in explicit_horizons]},
+            "stats": {"horizon_reliabilities": [1.0 for _ in explicit_horizons], "segment_reliabilities": segment_reliabilities},
             "horizon_reliabilities": [1.0 for _ in explicit_horizons],
+            "segment_reliabilities": segment_reliabilities,
             "fallback_used": False,
         }
 
@@ -221,21 +306,25 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
     )
     if not bool(train_cfg.get("multi_res_use_stat_horizons", True)):
         reliabilities = [1.0 for _ in fallback_horizons]
+        segment_reliabilities = [1.0 for _ in fallback_horizons]
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {"anchor_horizons": anchor_horizons, "horizon_reliabilities": reliabilities},
+            "stats": {"anchor_horizons": anchor_horizons, "horizon_reliabilities": reliabilities, "segment_reliabilities": segment_reliabilities},
             "horizon_reliabilities": reliabilities,
+            "segment_reliabilities": segment_reliabilities,
             "fallback_used": True,
         }
 
     if train_dataset is None or not hasattr(train_dataset, "estimate_horizon_statistics"):
         reliabilities = [1.0 for _ in fallback_horizons]
+        segment_reliabilities = [1.0 for _ in fallback_horizons]
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {"reason": "training dataset does not expose ACF statistics", "horizon_reliabilities": reliabilities},
+            "stats": {"reason": "training dataset does not expose ACF statistics", "horizon_reliabilities": reliabilities, "segment_reliabilities": segment_reliabilities},
             "horizon_reliabilities": reliabilities,
+            "segment_reliabilities": segment_reliabilities,
             "fallback_used": True,
         }
 
@@ -267,21 +356,26 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
             threshold=train_cfg.get("multi_res_acf_reliability_threshold", 0.2),
             temperature=train_cfg.get("multi_res_acf_reliability_temperature", 0.05),
         )
+        segment_reliabilities = compute_segment_reliabilities(horizons, stats)
         stats["horizon_reliabilities"] = reliabilities
+        stats["segment_reliabilities"] = segment_reliabilities
         return {
             "horizons": horizons,
             "source": "train_acf",
             "stats": stats,
             "horizon_reliabilities": reliabilities,
+            "segment_reliabilities": segment_reliabilities,
             "fallback_used": False,
         }
     except Exception as exc:
         reliabilities = [1.0 for _ in fallback_horizons]
+        segment_reliabilities = [1.0 for _ in fallback_horizons]
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {"reason": str(exc), "horizon_reliabilities": reliabilities},
+            "stats": {"reason": str(exc), "horizon_reliabilities": reliabilities, "segment_reliabilities": segment_reliabilities},
             "horizon_reliabilities": reliabilities,
+            "segment_reliabilities": segment_reliabilities,
             "fallback_used": True,
         }
 
@@ -398,6 +492,8 @@ config["model"]["cot_load_in_8bit"] = args.cot_load_in_8bit
 config["model"]["cot_load_in_4bit"] = args.cot_load_in_4bit
 config["model"]["save_trend_prior"] = args.save_trend_prior
 config["model"]["pattern_residual_diffusion"] = bool(config["model"].get("pattern_residual_diffusion", True))
+config["model"]["guide_mode"] = str(config["model"].get("guide_mode", "manual")).lower()
+config["model"]["final_method"] = bool(config["model"].get("final_method", config["model"]["guide_mode"] == "auto"))
 config["model"]["pattern_text_evidence"] = bool(config["model"].get("pattern_text_evidence", True))
 config["model"]["pattern_hidden_dim"] = int(config["model"].get("pattern_hidden_dim", 64))
 config["model"]["pattern_router_temperature"] = float(config["model"].get("pattern_router_temperature", 1.0))
@@ -413,7 +509,8 @@ config["train"]["pattern_expert_weight"] = float(config["train"].get("pattern_ex
 config["train"]["multi_res_segment_loss"] = bool(config["train"].get("multi_res_segment_loss", True))
 config["train"]["multi_res_reliability_weight"] = float(config["train"].get("multi_res_reliability_weight", 1.0))
 config["train"]["multi_res_difficulty_inverse"] = bool(config["train"].get("multi_res_difficulty_inverse", True))
-config["train"]["multi_res_difficulty_gamma"] = float(config["train"].get("multi_res_difficulty_gamma", 0.5))
+if "multi_res_difficulty_gamma" in config["train"]:
+    config["train"]["multi_res_difficulty_gamma"] = float(config["train"]["multi_res_difficulty_gamma"])
 config["train"]["multi_res_acf_reliability_threshold"] = float(config["train"].get("multi_res_acf_reliability_threshold", 0.2))
 config["train"]["multi_res_acf_reliability_temperature"] = float(config["train"].get("multi_res_acf_reliability_temperature", 0.05))
 legacy_model_keys = [
@@ -549,9 +646,14 @@ config["train"]["multi_res_horizon_reliabilities"] = horizon_info.get(
     "horizon_reliabilities",
     horizon_info.get("stats", {}).get("horizon_reliabilities", []),
 )
+config["train"]["multi_res_segment_reliabilities"] = horizon_info.get(
+    "segment_reliabilities",
+    horizon_info.get("stats", {}).get("segment_reliabilities", []),
+)
 print("resolved multi_res_horizons:", horizon_info["horizons"])
 print("multi_res source:", horizon_info["source"])
 print("multi_res reliabilities:", config["train"]["multi_res_horizon_reliabilities"])
+print("multi_res segment reliabilities:", config["train"]["multi_res_segment_reliabilities"])
 print(json.dumps(config, indent=4))
 with open(foldername + "config_results.json", "w") as f:
     json.dump(config, f, indent=4)
@@ -580,7 +682,7 @@ else:
     model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth"))
 model.target_dim = target_dim
 guide_sweep_metrics = []
-if config["diffusion"]["cfg"]:
+if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
     best_mse = 10e10
     best_metrics = None
     if args.guide_w >= 0:
@@ -633,5 +735,6 @@ write_run_summary(
         "model_state": model.get_multi_res_debug_state(),
     },
     metrics=best_metrics,
-    guide_sweep=guide_sweep_metrics,
+    guide_sweep=None if config["model"].get("guide_mode") == "auto" else guide_sweep_metrics,
+    extra={"selected_metric": "MSE"},
 )

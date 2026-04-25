@@ -217,62 +217,105 @@ class Dataset_Custom(Dataset):
             max_lag = min(self.seq_len - 1, max(self.pred_len * 2, self.pred_len))
         max_lag = int(max(1, min(max_lag, self.seq_len - 1)))
 
-        acf_sum = np.zeros(max_lag + 1, dtype=np.float64)
+        feature_acf_sum = None
+        feature_acf_count = None
         valid_count = 0
         for index in self._sample_training_windows(num_samples):
             window = np.asarray(self.data_x[index:index + self.seq_len], dtype=np.float64)
-            if window.ndim == 2:
-                window = window.mean(axis=1)
-            window = window.reshape(-1)
-            if window.size <= 1:
+            if window.ndim == 1:
+                window = window.reshape(-1, 1)
+            if window.shape[0] <= 1:
                 continue
-            window = window - window.mean()
-            denom = float(np.dot(window, window))
-            if denom <= 1e-12:
-                continue
-            acf = np.ones(max_lag + 1, dtype=np.float64)
-            for lag in range(1, max_lag + 1):
-                acf[lag] = float(np.dot(window[:-lag], window[lag:]) / denom)
-            acf_sum += acf
-            valid_count += 1
+            if feature_acf_sum is None:
+                feature_acf_sum = np.zeros((window.shape[1], max_lag + 1), dtype=np.float64)
+                feature_acf_count = np.zeros((window.shape[1],), dtype=np.float64)
+            window_valid = False
+            for feature_idx in range(window.shape[1]):
+                series = window[:, feature_idx].reshape(-1)
+                if series.size <= 1 or not np.isfinite(series).all():
+                    continue
+                series = series - np.mean(series)
+                denom = float(np.dot(series, series))
+                if denom <= 1e-12:
+                    continue
+                acf = np.ones(max_lag + 1, dtype=np.float64)
+                for lag in range(1, max_lag + 1):
+                    acf[lag] = float(np.dot(series[:-lag], series[lag:]) / denom)
+                feature_acf_sum[feature_idx] += acf
+                feature_acf_count[feature_idx] += 1.0
+                window_valid = True
+            if window_valid:
+                valid_count += 1
 
-        if valid_count <= 0:
+        if valid_count <= 0 or feature_acf_sum is None:
             raise RuntimeError("failed to compute stable ACF statistics from training windows")
 
-        avg_acf = acf_sum / float(valid_count)
+        safe_count = np.maximum(feature_acf_count[:, None], 1.0)
+        per_feature_acf = feature_acf_sum / safe_count
+        valid_features = feature_acf_count > 0
+        if not np.any(valid_features):
+            raise RuntimeError("failed to compute stable feature-wise ACF statistics from training windows")
+        per_feature_acf = per_feature_acf[valid_features]
+        robust_signed_acf = np.median(per_feature_acf, axis=0)
+        robust_positive_acf = np.zeros(max_lag + 1, dtype=np.float64)
+        robust_positive_acf[0] = 1.0
+        robust_iqr = np.zeros(max_lag + 1, dtype=np.float64)
+        for lag in range(1, max_lag + 1):
+            positive = np.maximum(per_feature_acf[:, lag], 0.0)
+            median = float(np.median(positive))
+            q25 = float(np.quantile(positive, 0.25))
+            q75 = float(np.quantile(positive, 0.75))
+            iqr = max(q75 - q25, 0.0)
+            lam = iqr / (abs(median) + iqr + 1e-8)
+            robust_positive_acf[lag] = (1.0 - lam) * median + lam * q75
+            robust_iqr[lag] = iqr
+        avg_acf = robust_signed_acf
 
         drop_lag = None
         zero_lag = None
         peak_lag = None
         for lag in range(1, max_lag + 1):
-            if drop_lag is None and avg_acf[lag] <= float(drop_threshold):
+            if drop_lag is None and robust_positive_acf[lag] <= float(drop_threshold):
                 drop_lag = lag
-            if zero_lag is None and abs(avg_acf[lag]) <= float(zero_threshold):
+            if zero_lag is None and abs(robust_signed_acf[lag]) <= float(zero_threshold):
                 zero_lag = lag
 
         local_peaks = []
         for lag in range(2, max_lag):
-            if avg_acf[lag] >= avg_acf[lag - 1] and avg_acf[lag] >= avg_acf[lag + 1] and avg_acf[lag] > float(zero_threshold):
-                local_peaks.append((float(avg_acf[lag]), int(lag)))
+            if robust_positive_acf[lag] >= robust_positive_acf[lag - 1] and robust_positive_acf[lag] >= robust_positive_acf[lag + 1] and robust_positive_acf[lag] > float(zero_threshold):
+                local_peaks.append((float(robust_positive_acf[lag]), int(lag)))
         if local_peaks:
             local_peaks.sort(key=lambda item: (-item[0], item[1]))
             peak_lag = local_peaks[0][1]
         elif max_lag >= 2:
-            peak_slice = avg_acf[2:max_lag + 1]
+            peak_slice = robust_positive_acf[2:max_lag + 1]
             if peak_slice.size > 0 and float(np.max(peak_slice)) > float(zero_threshold):
                 peak_lag = int(np.argmax(peak_slice)) + 2
 
+        abs_signed = np.abs(robust_signed_acf)
+        phase_threshold = float(np.median(abs_signed[1:])) if max_lag >= 1 else 0.0
+        phase_anchors = []
+        for lag in range(2, max_lag):
+            if abs_signed[lag] >= abs_signed[lag - 1] and abs_signed[lag] >= abs_signed[lag + 1] and abs_signed[lag] > phase_threshold:
+                phase_anchors.append(int(lag))
+
         return {
             "sample_count": int(valid_count),
+            "feature_count": int(per_feature_acf.shape[0]),
             "max_lag": int(max_lag),
             "drop_threshold": float(drop_threshold),
             "zero_threshold": float(zero_threshold),
             "decay_lag": None if drop_lag is None else int(drop_lag),
             "zero_lag": None if zero_lag is None else int(zero_lag),
             "peak_lag": None if peak_lag is None else int(peak_lag),
-            "peak_value": None if peak_lag is None else float(avg_acf[peak_lag]),
+            "peak_value": None if peak_lag is None else float(robust_positive_acf[peak_lag]),
+            "phase_anchors": phase_anchors,
             "acf_head": [float(x) for x in avg_acf[: min(max_lag + 1, 16)]],
             "acf_values": [float(x) for x in avg_acf],
+            "per_feature_acf": [[float(x) for x in row] for row in per_feature_acf],
+            "robust_acf_values": [float(x) for x in robust_positive_acf],
+            "robust_signed_acf_values": [float(x) for x in robust_signed_acf],
+            "robust_acf_iqr": [float(x) for x in robust_iqr],
         }
 
     def _normalize_text(self, text):

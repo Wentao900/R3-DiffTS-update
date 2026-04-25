@@ -138,6 +138,19 @@ class CSDI_base(nn.Module):
         self.guide_w_default = float(config["model"].get("guide_w_default", 1.0))
         self.guide_mode = str(config["model"].get("guide_mode", "manual")).lower()
         self.final_method = bool(config["model"].get("final_method", self.guide_mode == "auto"))
+        self.final_method_v25 = bool(config["model"].get("final_method_v25", False))
+        self.frequency_aux_loss = bool(train_cfg.get("frequency_aux_loss", False))
+        self.frequency_aux_topk = max(int(train_cfg.get("frequency_aux_topk", 3)), 1)
+        self.diffusion_snr_weighting = str(train_cfg.get("diffusion_snr_weighting", "none")).lower()
+        self.diffusion_snr_gamma_cfg = train_cfg.get("diffusion_snr_gamma", None)
+        self.pattern_affine_calibration = bool(train_cfg.get("pattern_affine_calibration", False))
+        self.pattern_affine_min_count = float(train_cfg.get("pattern_affine_min_count", 1.0))
+        self.pattern_affine_slope_min = float(train_cfg.get("pattern_affine_slope_min", 0.0))
+        self.pattern_affine_slope_max = float(train_cfg.get("pattern_affine_slope_max", 2.0))
+        self.pattern_affine_intercept_max = float(train_cfg.get("pattern_affine_intercept_max", 2.0))
+        self.pattern_alpha_lower_confidence = bool(train_cfg.get("pattern_alpha_lower_confidence", False))
+        self.revin_multiscale = bool(train_cfg.get("revin_multiscale", False))
+        self.revin_multiscale_max_mix = float(train_cfg.get("revin_multiscale_max_mix", 0.5))
         self.pattern_reliability = bool(config["model"].get("pattern_reliability", True))
         self.pattern_reliability_threshold = float(config["model"].get("pattern_reliability_threshold", 0.35))
         self.pattern_reliability_temperature = float(config["model"].get("pattern_reliability_temperature", 0.1))
@@ -173,9 +186,14 @@ class CSDI_base(nn.Module):
             self.multi_res_horizons, self.multi_res_huber_deltas_cfg
         )
         self.register_buffer("pattern_q_b_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("pattern_q_b_sq_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("pattern_q_b_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("pattern_segment_q_b_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("pattern_segment_q_b_sq_sum", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("pattern_segment_q_b_count", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("pattern_segment_affine_a_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("pattern_segment_affine_c_sum", torch.zeros(reliability_size, dtype=torch.float32))
+        self.register_buffer("pattern_segment_affine_count", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("diag_segment_alpha_sum", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("diag_segment_alpha_sq_sum", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("diag_segment_alpha_count", torch.zeros(reliability_size, dtype=torch.float32))
@@ -200,10 +218,23 @@ class CSDI_base(nn.Module):
         self.register_buffer("diag_main_loss_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_aux_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_multi_res_aux_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_frequency_aux_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_budget_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_budget_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_mr_budget_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_mr_budget_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_freq_budget_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_freq_budget_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("spectral_reliability_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("spectral_reliability_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_spectral_reliability_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_spectral_reliability_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("revin_shift_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("revin_shift_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_revin_lambda_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_revin_lambda_count", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_snr_weight_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_snr_weight_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_loss_count", torch.zeros((), dtype=torch.float32))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
@@ -309,6 +340,26 @@ class CSDI_base(nn.Module):
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
+        self._configure_diffusion_snr_weights()
+
+    def _configure_diffusion_snr_weights(self):
+        snr = torch.tensor(self.alpha, dtype=torch.float32) / torch.tensor(1.0 - self.alpha, dtype=torch.float32).clamp(min=1e-8)
+        mode = str(self.diffusion_snr_weighting).lower()
+        if mode in {"", "none", "false", "off", "0"}:
+            weights = torch.ones_like(snr)
+            gamma = torch.zeros((), dtype=torch.float32)
+        else:
+            if self.diffusion_snr_gamma_cfg is None or str(self.diffusion_snr_gamma_cfg).lower() == "auto":
+                gamma_value = float(torch.median(snr).item())
+            else:
+                gamma_value = float(self.diffusion_snr_gamma_cfg)
+            gamma_value = max(gamma_value, 1e-6)
+            clipped = torch.minimum(snr, torch.full_like(snr, gamma_value))
+            weights = clipped / snr.clamp(min=1e-8)
+            weights = weights / weights.mean().clamp(min=1e-8)
+            gamma = torch.tensor(gamma_value, dtype=torch.float32)
+        self.register_buffer("diffusion_snr_loss_weight", weights.float().to(self.device), persistent=False)
+        self.register_buffer("diffusion_snr_gamma", gamma.float().to(self.device), persistent=False)
 
     def _sanitize_multi_res_horizons(self, horizons):
         if isinstance(horizons, int):
@@ -456,6 +507,7 @@ class CSDI_base(nn.Module):
             difficulty = self.multi_res_difficulty_ema[indices].detach().cpu().tolist()
         q_b_count = float(self.pattern_q_b_count.detach().cpu().item())
         q_b_mean = float(self.pattern_q_b_sum.detach().cpu().item() / max(q_b_count, 1.0))
+        q_b_var = float(self.pattern_q_b_sq_sum.detach().cpu().item() / max(q_b_count, 1.0) - q_b_mean ** 2)
         w_count = float(self.diag_w_auto_count.detach().cpu().item())
         w_mean = float(self.diag_w_auto_sum.detach().cpu().item() / max(w_count, 1.0))
         w_var = float(self.diag_w_auto_sq_sum.detach().cpu().item() / max(w_count, 1.0) - w_mean ** 2)
@@ -470,10 +522,32 @@ class CSDI_base(nn.Module):
         loss_count = float(self.diag_loss_count.detach().cpu().item())
         pattern_budget_count = float(self.diag_pattern_budget_count.detach().cpu().item())
         mr_budget_count = float(self.diag_mr_budget_count.detach().cpu().item())
+        freq_budget_count = float(self.diag_freq_budget_count.detach().cpu().item())
+        spectral_count = float(self.spectral_reliability_count.detach().cpu().item())
+        spectral_diag_count = float(self.diag_spectral_reliability_count.detach().cpu().item())
+        revin_shift_count = float(self.revin_shift_count.detach().cpu().item())
+        revin_lambda_count = float(self.diag_revin_lambda_count.detach().cpu().item())
+        snr_weight_count = float(self.diag_snr_weight_count.detach().cpu().item())
         main_loss_mean = float(self.diag_main_loss_sum.detach().cpu().item() / max(loss_count, 1.0))
         pattern_aux_mean = float(self.diag_pattern_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         multi_res_aux_mean = float(self.diag_multi_res_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
+        frequency_aux_mean = float(self.diag_frequency_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         segment_q_b = self._segment_running_mean(self.pattern_segment_q_b_sum, self.pattern_segment_q_b_count).detach().cpu().tolist()
+        segment_q_b_count = self.pattern_segment_q_b_count.detach().cpu().clamp(min=1.0)
+        segment_q_b_mean_tensor = self.pattern_segment_q_b_sum.detach().cpu() / segment_q_b_count
+        segment_q_b_var = self.pattern_segment_q_b_sq_sum.detach().cpu() / segment_q_b_count - segment_q_b_mean_tensor ** 2
+        segment_q_b_std = torch.where(self.pattern_segment_q_b_count.detach().cpu() > 0, segment_q_b_var.clamp(min=0.0).sqrt(), torch.zeros_like(segment_q_b_var))
+        affine_count = self.pattern_segment_affine_count.detach().cpu().clamp(min=1.0)
+        affine_a_mean = torch.where(
+            self.pattern_segment_affine_count.detach().cpu() > 0,
+            self.pattern_segment_affine_a_sum.detach().cpu() / affine_count,
+            torch.ones_like(affine_count),
+        )
+        affine_c_mean = torch.where(
+            self.pattern_segment_affine_count.detach().cpu() > 0,
+            self.pattern_segment_affine_c_sum.detach().cpu() / affine_count,
+            torch.zeros_like(affine_count),
+        )
         segment_alpha_count = self.diag_segment_alpha_count.detach().cpu().clamp(min=1.0)
         segment_alpha_mean_tensor = self.diag_segment_alpha_sum.detach().cpu() / segment_alpha_count
         segment_alpha_var = self.diag_segment_alpha_sq_sum.detach().cpu() / segment_alpha_count - segment_alpha_mean_tensor ** 2
@@ -488,6 +562,7 @@ class CSDI_base(nn.Module):
         return {
             "guide_mode": self.guide_mode,
             "final_method": self.final_method,
+            "final_method_v25": self.final_method_v25,
             "final_horizons": list(self.multi_res_horizons),
             "active_horizons": list(active_horizons),
             "huber_deltas": list(self.multi_res_huber_deltas),
@@ -498,8 +573,14 @@ class CSDI_base(nn.Module):
             "segment_loss": self.multi_res_segment_loss,
             "difficulty_inverse": self.multi_res_difficulty_inverse,
             "pattern_q_b_running_mean": q_b_mean,
+            "pattern_q_b_running_std": float(max(q_b_var, 0.0) ** 0.5),
             "pattern_q_b_running_count": q_b_count,
             "segment_q_b_running_mean": segment_q_b,
+            "segment_q_b_running_std": segment_q_b_std.tolist(),
+            "pattern_affine_calibration": self.pattern_affine_calibration,
+            "pattern_affine_a_mean": affine_a_mean.tolist(),
+            "pattern_affine_c_mean": affine_c_mean.tolist(),
+            "pattern_affine_count": self.pattern_segment_affine_count.detach().cpu().tolist(),
             "w_auto_mean": w_mean,
             "w_auto_std": float(max(w_var, 0.0) ** 0.5),
             "text_quality_mean": float(self.diag_text_quality_sum.detach().cpu().item() / max(text_count, 1.0)),
@@ -515,14 +596,28 @@ class CSDI_base(nn.Module):
             "segment_pattern_baseline_mse": segment_mse_mean.tolist(),
             "pattern_budget": float(self.diag_pattern_budget_sum.detach().cpu().item() / max(pattern_budget_count, 1.0)),
             "mr_budget": float(self.diag_mr_budget_sum.detach().cpu().item() / max(mr_budget_count, 1.0)),
+            "freq_budget": float(self.diag_freq_budget_sum.detach().cpu().item() / max(freq_budget_count, 1.0)),
+            "frequency_aux_loss": self.frequency_aux_loss,
+            "spectral_reliability_running_mean": float(self.spectral_reliability_sum.detach().cpu().item() / max(spectral_count, 1.0)),
+            "spectral_reliability_batch_mean": float(self.diag_spectral_reliability_sum.detach().cpu().item() / max(spectral_diag_count, 1.0)),
+            "diffusion_snr_weighting": self.diffusion_snr_weighting,
+            "diffusion_snr_gamma": float(self.diffusion_snr_gamma.detach().cpu().item()) if hasattr(self, "diffusion_snr_gamma") else 0.0,
+            "snr_weight_mean": float(self.diag_snr_weight_sum.detach().cpu().item() / max(snr_weight_count, 1.0)),
+            "snr_weight_schedule_min": float(self.diffusion_snr_loss_weight.detach().cpu().min().item()) if hasattr(self, "diffusion_snr_loss_weight") else 1.0,
+            "snr_weight_schedule_max": float(self.diffusion_snr_loss_weight.detach().cpu().max().item()) if hasattr(self, "diffusion_snr_loss_weight") else 1.0,
+            "revin_multiscale": self.revin_multiscale,
+            "revin_shift_running_mean": float(self.revin_shift_sum.detach().cpu().item() / max(revin_shift_count, 1.0)),
+            "revin_lambda_mean": float(self.diag_revin_lambda_sum.detach().cpu().item() / max(revin_lambda_count, 1.0)),
             "loss_means": {
                 "main_loss": main_loss_mean,
                 "pattern_aux": pattern_aux_mean,
                 "multi_res_aux": multi_res_aux_mean,
+                "frequency_aux": frequency_aux_mean,
             },
             "loss_ratios": {
                 "pattern_aux_to_main": float(pattern_aux_mean / max(main_loss_mean, 1e-8)),
                 "multi_res_aux_to_main": float(multi_res_aux_mean / max(main_loss_mean, 1e-8)),
+                "frequency_aux_to_main": float(frequency_aux_mean / max(main_loss_mean, 1e-8)),
             },
         }
 
@@ -618,6 +713,67 @@ class CSDI_base(nn.Module):
     def _masked_mean(self, values, mask, dim, keepdim=True):
         denom = mask.sum(dim=dim, keepdim=keepdim).clamp(min=1.0)
         return (values * mask).sum(dim=dim, keepdim=keepdim) / denom
+
+    def _masked_stats(self, values, mask, dim=2, fallback_mean=None, fallback_std=None):
+        count = mask.sum(dim=dim, keepdim=True)
+        mean = (values * mask).sum(dim=dim, keepdim=True) / count.clamp(min=1.0)
+        var = (((values - mean) * mask) ** 2).sum(dim=dim, keepdim=True) / count.clamp(min=1.0)
+        std = torch.sqrt(var + 1e-5)
+        valid = count > 0
+        if fallback_mean is not None:
+            mean = torch.where(valid, mean, fallback_mean)
+        if fallback_std is not None:
+            std = torch.where(valid, std, fallback_std)
+        return mean, std, valid
+
+    def _running_scalar_mean(self, sum_buffer, count_buffer, device, dtype, default=0.0):
+        if float(count_buffer.detach().item()) <= 0:
+            return torch.tensor(float(default), device=device, dtype=dtype)
+        return (sum_buffer / count_buffer.clamp(min=1.0)).to(device=device, dtype=dtype)
+
+    def _normalize_observed_data(self, observed_data, cond_mask):
+        cond_mask = cond_mask.float()
+        count = cond_mask.sum(dim=2, keepdim=True)
+        means = (observed_data * cond_mask).sum(dim=2, keepdim=True) / count.clamp(min=1.0)
+        stdev = torch.sqrt((((observed_data - means) ** 2) * cond_mask).sum(dim=2, keepdim=True) / (count - 1.0).clamp(min=1.0) + 1e-5)
+        if not (self.final_method_v25 and self.revin_multiscale):
+            return (observed_data - means) / stdev, means, stdev
+
+        hist_len = min(max(int(self.lookback_len), 1), observed_data.shape[-1])
+        if hist_len <= 1:
+            return (observed_data - means) / stdev, means, stdev
+
+        hist = observed_data[:, :, :hist_len]
+        hist_mask = cond_mask[:, :, :hist_len].float()
+        recent_len = max(1, hist_len // 2)
+        quarter_len = max(1, hist_len // 4)
+        recent = hist[:, :, hist_len - recent_len:hist_len]
+        recent_mask = hist_mask[:, :, hist_len - recent_len:hist_len]
+        quarter = hist[:, :, hist_len - quarter_len:hist_len]
+        quarter_mask = hist_mask[:, :, hist_len - quarter_len:hist_len]
+
+        recent_mean, recent_std, _ = self._masked_stats(recent, recent_mask, dim=2, fallback_mean=means, fallback_std=stdev)
+        quarter_mean, quarter_std, _ = self._masked_stats(quarter, quarter_mask, dim=2, fallback_mean=means, fallback_std=stdev)
+        local_mean = 0.5 * (recent_mean + quarter_mean)
+        local_std = 0.5 * (recent_std + quarter_std)
+        shift_score = ((local_mean - means).abs() / stdev.clamp(min=1e-5)).detach()
+        batch_shift = shift_score.mean()
+        tau = self._running_scalar_mean(
+            self.revin_shift_sum,
+            self.revin_shift_count,
+            observed_data.device,
+            observed_data.dtype,
+            default=float(batch_shift.detach().cpu().item()),
+        )
+        rel_shift = shift_score / (shift_score + tau.reshape(1, 1, 1).clamp(min=1e-6))
+        gate = torch.sigmoid((shift_score - tau.reshape(1, 1, 1)) / tau.reshape(1, 1, 1).abs().clamp(min=1e-3))
+        lam = (max(min(self.revin_multiscale_max_mix, 1.0), 0.0) * rel_shift * gate).clamp(min=0.0, max=1.0)
+        mixed_mean = (1.0 - lam) * means + lam * local_mean
+        mixed_std = ((1.0 - lam) * stdev + lam * local_std).clamp(min=1e-5)
+        if self.training:
+            self._add_diag_scalar("revin_shift_sum", "revin_shift_count", batch_shift)
+        self._add_diag_scalar("diag_revin_lambda_sum", "diag_revin_lambda_count", lam, count=None)
+        return (observed_data - mixed_mean) / mixed_std, mixed_mean, mixed_std
 
     def _safe_lag_corr(self, series, mask, lag):
         if lag <= 0 or series.shape[1] <= lag:
@@ -890,6 +1046,50 @@ class CSDI_base(nn.Module):
         expert_futures = self._build_expert_futures_from_history(hist, hist_mask, future_len)
         return baseline, expert_futures
 
+    def _segment_affine_running_values(self, segment_idx, device, dtype):
+        if (not self.pattern_affine_calibration) or segment_idx >= int(self.pattern_segment_affine_count.numel()):
+            return (
+                torch.ones((), device=device, dtype=dtype),
+                torch.zeros((), device=device, dtype=dtype),
+                torch.zeros((), device=device, dtype=dtype),
+            )
+        count = self.pattern_segment_affine_count[segment_idx].detach()
+        if float(count.cpu().item()) < max(float(self.pattern_affine_min_count), 1.0):
+            return (
+                torch.ones((), device=device, dtype=dtype),
+                torch.zeros((), device=device, dtype=dtype),
+                count.to(device=device, dtype=dtype),
+            )
+        a = (self.pattern_segment_affine_a_sum[segment_idx] / count.clamp(min=1.0)).detach().to(device=device, dtype=dtype)
+        c = (self.pattern_segment_affine_c_sum[segment_idx] / count.clamp(min=1.0)).detach().to(device=device, dtype=dtype)
+        return a, c, count.to(device=device, dtype=dtype)
+
+    def _update_segment_affine_calibration(self, segment_idx, future_baseline, future_target, future_mask):
+        if (not self.training) or (not self.pattern_affine_calibration):
+            return
+        if segment_idx >= int(self.pattern_segment_affine_count.numel()) or future_mask.sum() <= 0:
+            return
+        with torch.no_grad():
+            mask = future_mask.float()
+            denom = mask.sum().clamp(min=1.0)
+            x_mean = (future_baseline.detach() * mask).sum() / denom
+            y_mean = (future_target.detach() * mask).sum() / denom
+            x_center = (future_baseline.detach() - x_mean) * mask
+            y_center = (future_target.detach() - y_mean) * mask
+            var_x = (x_center ** 2).sum() / denom
+            cov_xy = (x_center * y_center).sum() / denom
+            slope = (cov_xy / var_x.clamp(min=1e-6)).clamp(
+                min=float(self.pattern_affine_slope_min),
+                max=float(self.pattern_affine_slope_max),
+            )
+            intercept = (y_mean - slope * x_mean).clamp(
+                min=-float(self.pattern_affine_intercept_max),
+                max=float(self.pattern_affine_intercept_max),
+            )
+            self.pattern_segment_affine_a_sum[segment_idx].add_(slope.float())
+            self.pattern_segment_affine_c_sum[segment_idx].add_(intercept.float())
+            self.pattern_segment_affine_count[segment_idx].add_(1.0)
+
     def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0):
         B, K, L = observed_data.shape
         stats = self._compute_pattern_stats(observed_data, cond_mask)
@@ -980,12 +1180,15 @@ class CSDI_base(nn.Module):
             if end <= start:
                 continue
             future_baseline = baseline[:, :, start:end]
+            affine_a, affine_c, _ = self._segment_affine_running_values(segment_idx, baseline.device, baseline.dtype)
+            future_baseline_calibrated = future_baseline * affine_a.reshape(1, 1, 1) + affine_c.reshape(1, 1, 1)
             if use_training_target:
                 future_mask = target_mask[:, :, start:end].float()
                 future_target = observed_data[:, :, start:end]
                 if future_mask.sum() > 0:
+                    self._update_segment_affine_calibration(segment_idx, future_baseline, future_target, future_mask)
                     denom = future_mask.sum().clamp(min=1.0)
-                    baseline_mse = (((future_baseline - future_target) * future_mask) ** 2).sum() / denom
+                    baseline_mse = (((future_baseline_calibrated - future_target) * future_mask) ** 2).sum() / denom
                     target_mean = (future_target * future_mask).sum() / denom
                     target_var = (((future_target - target_mean) * future_mask) ** 2).sum() / denom
                     q_b = (1.0 - baseline_mse / target_var.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
@@ -996,16 +1199,28 @@ class CSDI_base(nn.Module):
                         self.diag_segment_baseline_mse_count[segment_idx].add_(1.0)
                         if self.training:
                             self.pattern_segment_q_b_sum[segment_idx].add_(q_b.detach().float())
+                            self.pattern_segment_q_b_sq_sum[segment_idx].add_((q_b.detach().float() ** 2))
                             self.pattern_segment_q_b_count[segment_idx].add_(1.0)
                             self.pattern_q_b_sum.add_(q_b.detach().float())
+                            self.pattern_q_b_sq_sum.add_(q_b.detach().float() ** 2)
                             self.pattern_q_b_count.add_(1.0)
                 else:
                     q_b = running_q[segment_idx] if segment_idx < running_q.numel() else torch.zeros((), device=baseline.device, dtype=baseline.dtype)
             else:
                 q_b = running_q[segment_idx] if segment_idx < running_q.numel() else torch.zeros((), device=baseline.device, dtype=baseline.dtype)
+                if self.pattern_alpha_lower_confidence and segment_idx < int(self.pattern_segment_q_b_count.numel()):
+                    q_count = self.pattern_segment_q_b_count[segment_idx].detach().to(device=baseline.device, dtype=baseline.dtype)
+                    if float(q_count.detach().cpu().item()) > 0:
+                        q_mean = q_b
+                        q_sq_mean = (
+                            self.pattern_segment_q_b_sq_sum[segment_idx].detach().to(device=baseline.device, dtype=baseline.dtype)
+                            / q_count.clamp(min=1.0)
+                        )
+                        q_std = (q_sq_mean - q_mean ** 2).clamp(min=0.0).sqrt()
+                        q_b = (q_mean - q_std / q_count.clamp(min=1.0).sqrt()).clamp(min=0.0, max=1.0)
             rel_s = segment_reliability[segment_idx] if segment_idx < segment_reliability.numel() else torch.ones((), device=baseline.device, dtype=baseline.dtype)
             alpha_s = (q_b.detach() * reliability * rel_s).clamp(min=0.0, max=1.0)
-            scaled[:, :, start:end] = future_baseline * alpha_s.reshape(-1, 1, 1)
+            scaled[:, :, start:end] = future_baseline_calibrated * alpha_s.reshape(-1, 1, 1)
             segment_q_values.append(q_b.detach().reshape(1))
             segment_alpha_values.append(alpha_s)
             with torch.no_grad():
@@ -1084,9 +1299,7 @@ class CSDI_base(nn.Module):
 
         B, K, L = observed_data.shape
         if not self.noise_esti:
-            means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
-            stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
-            observed_data = (observed_data - means) / stdev
+            observed_data, _, _ = self._normalize_observed_data(observed_data, cond_mask)
 
         target_mask = observed_mask - cond_mask
         pattern = None
@@ -1145,8 +1358,19 @@ class CSDI_base(nn.Module):
             residual = (noise - predicted) * target_mask 
         else:
             residual = (diffusion_target - predicted) * target_mask
-        num_eval = target_mask.sum()
-        main_loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        if self.final_method_v25 and self.diffusion_snr_weighting not in {"", "none", "false", "off", "0"}:
+            num_eval_per_sample = target_mask.sum(dim=(1, 2))
+            valid = num_eval_per_sample > 0
+            loss_per_sample = (residual ** 2).sum(dim=(1, 2)) / num_eval_per_sample.clamp(min=1.0)
+            snr_weight = self.diffusion_snr_loss_weight[t].to(device=observed_data.device, dtype=observed_data.dtype).reshape(-1)
+            if valid.any():
+                main_loss = (loss_per_sample[valid] * snr_weight[valid]).mean()
+            else:
+                main_loss = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+            self._add_diag_scalar("diag_snr_weight_sum", "diag_snr_weight_count", snr_weight, count=None)
+        else:
+            num_eval = target_mask.sum()
+            main_loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         auxiliary_loss = torch.zeros((), device=observed_data.device)
         predicted_series = predicted
         if pattern_baseline is not None:
@@ -1171,6 +1395,18 @@ class CSDI_base(nn.Module):
         else:
             multi_res_aux = torch.zeros((), device=observed_data.device)
             mr_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+        if (not self.noise_esti) and self.final_method_v25 and self.frequency_aux_loss:
+            freq_raw = self._calc_frequency_loss(observed_data, predicted_series, target_mask)
+            if freq_raw.detach().abs() > 0:
+                freq_budget = self._frequency_aux_budget(observed_data, cond_mask, observed_data.device, observed_data.dtype)
+                frequency_aux = freq_budget * main_loss.detach() * freq_raw / freq_raw.detach().clamp(min=1e-6)
+                auxiliary_loss = auxiliary_loss + frequency_aux
+            else:
+                frequency_aux = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+                freq_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+        else:
+            frequency_aux = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+            freq_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
         aux_diag_scale = torch.ones((), device=observed_data.device)
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
@@ -1181,6 +1417,7 @@ class CSDI_base(nn.Module):
             self.diag_main_loss_sum.add_(main_loss.detach().float())
             self.diag_pattern_aux_sum.add_((pattern_aux.detach() * aux_diag_scale).float())
             self.diag_multi_res_aux_sum.add_((multi_res_aux.detach() * aux_diag_scale).float())
+            self.diag_frequency_aux_sum.add_((frequency_aux.detach() * aux_diag_scale).float())
             self.diag_loss_count.add_(1.0)
         return main_loss + auxiliary_loss
 
@@ -1287,6 +1524,93 @@ class CSDI_base(nn.Module):
         budget = (reliability_mean * segment_gain_mean * effective_segment_ratio).clamp(min=0.0, max=1.0)
         self._add_diag_scalar("diag_mr_budget_sum", "diag_mr_budget_count", budget)
         return budget
+
+    def _spectral_reliability(self, observed_data, cond_mask):
+        device = observed_data.device
+        dtype = observed_data.dtype
+        if not self.frequency_aux_loss:
+            return torch.zeros((), device=device, dtype=dtype)
+        hist_len = min(max(int(self.lookback_len), 1), observed_data.shape[-1])
+        if hist_len < 3:
+            return self._running_scalar_mean(
+                self.spectral_reliability_sum,
+                self.spectral_reliability_count,
+                device,
+                dtype,
+                default=0.0,
+            )
+        hist = observed_data[:, :, :hist_len]
+        hist_mask = cond_mask[:, :, :hist_len].float()
+        if hist_mask.sum() <= 0:
+            return self._running_scalar_mean(
+                self.spectral_reliability_sum,
+                self.spectral_reliability_count,
+                device,
+                dtype,
+                default=0.0,
+            )
+        mean, _, _ = self._masked_stats(hist, hist_mask, dim=2)
+        filled = torch.where(hist_mask > 0, hist, mean.expand_as(hist))
+        centered = (filled - mean) * hist_mask
+        power = torch.fft.rfft(centered, dim=2).abs().pow(2)
+        if power.shape[2] <= 1:
+            return torch.zeros((), device=device, dtype=dtype)
+        power = power[:, :, 1:]
+        total = power.sum(dim=2).clamp(min=1e-8)
+        k = min(int(self.frequency_aux_topk), power.shape[2])
+        concentration = power.topk(k, dim=2).values.sum(dim=2) / total
+        reliability = concentration.mean().detach().clamp(min=0.0, max=1.0).to(device=device, dtype=dtype)
+        if self.training:
+            self._add_diag_scalar("spectral_reliability_sum", "spectral_reliability_count", reliability)
+        self._add_diag_scalar("diag_spectral_reliability_sum", "diag_spectral_reliability_count", reliability)
+        if not self.training and float(self.spectral_reliability_count.detach().item()) > 0:
+            return self._running_scalar_mean(
+                self.spectral_reliability_sum,
+                self.spectral_reliability_count,
+                device,
+                dtype,
+                default=0.0,
+            ).clamp(min=0.0, max=1.0)
+        return reliability
+
+    def _frequency_aux_budget(self, observed_data, cond_mask, device, dtype):
+        horizons = self._get_active_multi_res_horizons()
+        if not horizons:
+            return torch.zeros((), device=device, dtype=dtype)
+        reliability_mean = self._active_segment_reliabilities(horizons).to(device=device, dtype=dtype).mean().clamp(min=0.0, max=1.0)
+        spectral_reliability = self._spectral_reliability(observed_data, cond_mask).to(device=device, dtype=dtype).clamp(min=0.0, max=1.0)
+        budget = (reliability_mean * spectral_reliability).clamp(min=0.0, max=1.0)
+        self._add_diag_scalar("diag_freq_budget_sum", "diag_freq_budget_count", budget)
+        return budget
+
+    def _calc_frequency_loss(self, observed_data, predicted, target_mask):
+        horizons = self._get_active_multi_res_horizons()
+        if len(horizons) == 0:
+            return torch.zeros((), device=observed_data.device)
+        segment_reliability = self._active_segment_reliabilities(horizons).to(device=observed_data.device, dtype=observed_data.dtype)
+        loss_sum = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+        weight_sum = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+        for h_idx, h in enumerate(horizons):
+            prev_h = int(horizons[h_idx - 1]) if h_idx > 0 else 0
+            start = int(self.lookback_len + prev_h)
+            end = int(self.lookback_len + h)
+            end = min(end, observed_data.shape[-1])
+            if end - start < 2:
+                continue
+            mask = target_mask[:, :, start:end].float()
+            if mask.sum() <= 0:
+                continue
+            target_segment = observed_data[:, :, start:end] * mask
+            pred_segment = predicted[:, :, start:end] * mask
+            target_amp = torch.log1p(torch.fft.rfft(target_segment, dim=2).abs())
+            pred_amp = torch.log1p(torch.fft.rfft(pred_segment, dim=2).abs())
+            freq_loss = ((target_amp - pred_amp) ** 2).mean()
+            weight = segment_reliability[h_idx] if h_idx < segment_reliability.numel() else torch.ones((), device=observed_data.device, dtype=observed_data.dtype)
+            loss_sum = loss_sum + weight * freq_loss
+            weight_sum = weight_sum + weight
+        if weight_sum <= 0:
+            return torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+        return loss_sum / weight_sum.clamp(min=1e-6)
 
     def _trend_segment_modulation(self, horizons, batch_size, trend_prior=None):
         if trend_prior is None:
@@ -1501,9 +1825,7 @@ class CSDI_base(nn.Module):
         else:
             self.sample_steps = self.num_steps
         if not self.noise_esti:
-            means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
-            stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
-            observed_data = (observed_data - means) / stdev
+            observed_data, means, stdev = self._normalize_observed_data(observed_data, cond_mask)
 
         pattern_baseline = None
         diffusion_observed_data = observed_data

@@ -178,7 +178,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 eval_points = eval_points.permute(0, 2, 1)
                 observed_points = observed_points.permute(0, 2, 1)
 
-                samples_median = samples.median(dim=1)
+                samples_point = samples.mean(dim=1)
                 all_target.append(c_target)
                 all_evalpoint.append(eval_points)
                 all_observed_point.append(observed_points)
@@ -198,16 +198,16 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     all_tokens.extend(tokens)
 
                 mse_current = (
-                    ((samples_median.values - c_target) * eval_points) ** 2
+                    ((samples_point - c_target) * eval_points) ** 2
                 ) * (scaler ** 2)
                 mae_current = (
-                    torch.abs((samples_median.values - c_target) * eval_points) 
+                    torch.abs((samples_point - c_target) * eval_points)
                 ) * scaler
                 nmse_current = (
-                    ((samples_median.values - c_target) * eval_points) ** 2
+                    ((samples_point - c_target) * eval_points) ** 2
                 )
                 nmae_current = (
-                    torch.abs((samples_median.values - c_target) * eval_points) 
+                    torch.abs((samples_point - c_target) * eval_points)
                 )
 
                 mse_total += mse_current.sum().item()

@@ -130,6 +130,7 @@ class CSDI_base(nn.Module):
         self.pattern_expert_weight = float(train_cfg.get("pattern_expert_weight", 0.05))
         self.pattern_baseline_detach = bool(train_cfg.get("pattern_baseline_detach", False))
         self.pattern_router_temperature = float(config["model"].get("pattern_router_temperature", 1.0))
+        self.guide_w_default = float(config["model"].get("guide_w_default", 1.0))
         self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
         self.multi_res_horizon_to_index = {
             int(horizon): idx for idx, horizon in enumerate(self.multi_res_horizons)
@@ -562,13 +563,18 @@ class CSDI_base(nn.Module):
         )
         return baseline, expert_futures
 
-    def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None):
+    def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0):
         B, K, L = observed_data.shape
         stats = self._compute_pattern_stats(observed_data, cond_mask)
         text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
-        router_input = torch.cat([stats, text_pattern], dim=1)
         temperature = max(float(self.pattern_router_temperature), 1e-3)
-        pi = F.softmax(self.pattern_router(router_input) / temperature, dim=-1)
+        numeric_router_input = torch.cat([stats, torch.zeros_like(text_pattern)], dim=1)
+        text_router_input = torch.cat([stats, text_pattern], dim=1)
+        numeric_logits = self.pattern_router(numeric_router_input) / temperature
+        text_logits = self.pattern_router(text_router_input) / temperature
+        scale = float(guidance_scale)
+        guided_logits = numeric_logits + scale * (text_logits - numeric_logits)
+        pi = F.softmax(guided_logits, dim=-1)
         baseline, expert_futures = self._build_pattern_baselines(observed_data, cond_mask, stats)
         future_len = expert_futures.shape[-1]
         if future_len > 0:
@@ -584,10 +590,13 @@ class CSDI_base(nn.Module):
         return {
             "stats": stats,
             "text_pattern": text_pattern,
+            "pi_numeric": F.softmax(numeric_logits, dim=-1),
+            "pi_text": F.softmax(text_logits, dim=-1),
             "pi": pi,
             "pseudo": pseudo.detach(),
             "baseline": baseline,
             "expert_futures": expert_futures,
+            "guidance_scale": scale,
         }
 
     def _calc_pattern_aux_loss(self, pattern, observed_data, target_mask):
@@ -645,6 +654,7 @@ class CSDI_base(nn.Module):
                 text_pooled=pattern_text_pooled,
                 text_mask=pattern_text_mask,
                 text_evidence_vec=pattern_text_evidence_vec,
+                guidance_scale=1.0,
             )
             pattern_baseline = pattern["baseline"]
             diffusion_target = observed_data - pattern_baseline
@@ -919,12 +929,14 @@ class CSDI_base(nn.Module):
         pattern_baseline = None
         diffusion_observed_data = observed_data
         if self.pattern_residual_diffusion and not self.noise_esti:
+            pattern_guidance_scale = self.guide_w_default if guide_w is None else float(guide_w)
             pattern = self._compute_pattern_outputs(
                 observed_data,
                 cond_mask,
                 text_pooled=pattern_text_pooled,
                 text_mask=pattern_text_mask,
                 text_evidence_vec=pattern_text_evidence_vec,
+                guidance_scale=pattern_guidance_scale,
             )
             pattern_baseline = pattern["baseline"]
             diffusion_observed_data = observed_data - pattern_baseline

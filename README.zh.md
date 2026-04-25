@@ -129,6 +129,7 @@ bash scripts/run_all_datasets_mainline.sh
 
 ## Guide weight 扫描
 - `--guide_w -1` 会使用内置列表自动扫描。
+- 在 Pattern-Adaptive residual 路径中，`guide_w` 控制从纯数值 pattern router 到文本条件 pattern router 的偏移强度：`0` 表示只用数值模式，`1` 表示使用训练时的文本条件 baseline，`>1` 表示放大文本证据。
 - 如需固定某个值，直接传 `--guide_w`。
 
 ## 调试

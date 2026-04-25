@@ -137,6 +137,7 @@ CoT is promoted from a text condition to a diffusion-path modulation signal.
 
 ## Guide weight sweep
 - `--guide_w -1` triggers the built-in sweep list.
+- In the pattern-adaptive residual path, `guide_w` controls the text-evidence shift from the numeric-only pattern router to the text-conditioned pattern router: `0` uses numeric patterns only, `1` uses the trained text-conditioned baseline, and values above `1` amplify the text evidence.
 - To override, pass a fixed `--guide_w` or run your own loop.
 
 ## Debug

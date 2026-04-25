@@ -44,8 +44,6 @@ def data_provider(args, flag):
         extra_kwargs['aug_time_warp_prob'] = getattr(args, "aug_time_warp_prob", 0.0)
         extra_kwargs['aug_segment_scale_std'] = getattr(args, "aug_segment_scale_std", 0.1)
         extra_kwargs['adaptive_noise_scale'] = getattr(args, "adaptive_noise_scale", 0.0)
-        extra_kwargs['text_quality_gate'] = getattr(args, "text_quality_gate", True)
-        extra_kwargs['text_quality_min_scale'] = getattr(args, "text_quality_min_scale", 0.0)
         extra_kwargs['text_quality_coverage_mix'] = getattr(args, "text_quality_coverage_mix", 0.5)
         extra_kwargs['text_recency_tau_days'] = getattr(args, "text_recency_tau_days", 14.0)
         extra_kwargs['text_coverage_kappa'] = getattr(args, "text_coverage_kappa", 3.0)
@@ -54,11 +52,6 @@ def data_provider(args, flag):
         extra_kwargs['text_trust_cot'] = getattr(args, "text_trust_cot", 0.5)
         extra_kwargs['text_quality_drop_threshold'] = getattr(args, "text_quality_drop_threshold", 0.3)
         extra_kwargs['text_quality_mid_threshold'] = getattr(args, "text_quality_mid_threshold", 0.6)
-        extra_kwargs['text_trend_ret_scale'] = getattr(args, "text_trend_ret_scale", 0.5)
-        extra_kwargs['text_trend_cot_scale'] = getattr(args, "text_trend_cot_scale", 0.3)
-        extra_kwargs['text_trend_raw_weight'] = getattr(args, "text_trend_raw_weight", 1.0)
-        extra_kwargs['text_trend_ret_weight'] = getattr(args, "text_trend_ret_weight", 0.35)
-        extra_kwargs['text_trend_cot_weight'] = getattr(args, "text_trend_cot_weight", 0.15)
         extra_kwargs['max_text_events'] = getattr(args, "max_text_events", 12)
     data_set = Data(
         root_path=args.root_path,

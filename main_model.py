@@ -94,96 +94,12 @@ class CSDI_base(nn.Module):
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.0)
         self.c_mask_prob = config["diffusion"]["c_mask_prob"]
         self.context_dim = config["model"]["context_dim"]
-        dataset_cfg = {}
-        dataset_cfg.update(config.get("data", {}))
-        dataset_cfg.update(config.get("dataset", {}))
         self.llm = config["model"]["llm"]
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
-        self.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
-        self.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
-        quality_weights = config["model"].get("text_quality_weights", [0.5, 0.3, 0.2])
-        if not isinstance(quality_weights, (list, tuple)) or len(quality_weights) != 3:
-            quality_weights = [0.5, 0.3, 0.2]
-        quality_weights = np.asarray(quality_weights, dtype=np.float32)
-        self.text_quality_weights = quality_weights / max(float(np.sum(quality_weights)), 1e-6)
-        self.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
-        self.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
-        self.text_use_ret_in_context = bool(config["model"].get("text_use_ret_in_context", False))
-        self.text_use_cot_in_context = bool(config["model"].get("text_use_cot_in_context", False))
-        self.text_trend_only_guidance = bool(config["model"].get("text_trend_only_guidance", True))
-        self.text_trend_ret_scale = float(config["model"].get("text_trend_ret_scale", 0.5))
-        self.text_trend_cot_scale = float(config["model"].get("text_trend_cot_scale", 0.3))
-        self.text_trend_raw_weight = float(config["model"].get("text_trend_raw_weight", 1.0))
-        self.text_trend_ret_weight = float(config["model"].get("text_trend_ret_weight", 0.35))
-        self.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
-        self.text_numeric_align_gamma = float(config["model"].get("text_numeric_align_gamma", 2.0))
-        self.multi_res_trend_source = str(config["model"].get("multi_res_trend_source", "numeric_only")).lower()
-        self.text_aug_max_ratio = float(config["model"].get("text_aug_max_ratio", 0.3))
-        self.coverage_power = float(config["model"].get("coverage_power", 2.0))
-        self.coverage_cfg_boost = float(config["model"].get("coverage_cfg_boost", 0.15))
-        self.reliability_min = float(config["model"].get("reliability_min", 0.1))
-        self.guide_reliability_power = float(config["model"].get("guide_reliability_power", 1.0))
-        self.semantic_dim = int(config["model"].get("semantic_dim", 6))
-        self.event_quality_dim = int(config["model"].get("event_quality_dim", 6))
-        self.event_quality_beta = float(config["model"].get("event_quality_beta", 4.0))
-        self.semantic_trend_scale = float(config["model"].get("semantic_trend_scale", 0.25))
-        self.text_recency_tau_days = float(dataset_cfg.get("text_recency_tau_days", 14.0))
-        self.text_coverage_kappa = float(dataset_cfg.get("text_coverage_kappa", 3.0))
         self.text_max_length = int(config["model"].get("text_max_length", 192))
-        self.event_text_max_length = int(config["model"].get("event_text_max_length", min(self.text_max_length, 96)))
         self.text_encode_batch_size = int(config["model"].get("text_encode_batch_size", 8))
-        self.use_gate_min = float(config["model"].get("use_gate_min", 0.0))
-        self.strength_gate_min = float(config["model"].get("strength_gate_min", 0.0))
-        self.strength_use_mix_floor = float(config["model"].get("strength_use_mix_floor", 0.5))
-        self.horizon_strength_bias = float(config["model"].get("horizon_strength_bias", 0.0))
-        self.text_context_ratio_min = float(config["model"].get("text_context_ratio_min", config["model"].get("text_context_strength_scale", 0.1)))
-        self.text_context_ratio_max = float(config["model"].get("text_context_ratio_max", 0.6))
-        self.text_context_max_base = float(config["model"].get("text_context_max_base", min(config["model"].get("text_context_strength_max", 0.03), 1.0)))
-        self.text_context_max_boost = float(config["model"].get("text_context_max_boost", 0.07))
-        self.text_context_horizon_bias = float(config["model"].get("text_context_horizon_bias", config["model"].get("horizon_strength_bias", 0.0)))
-        self.text_guide_ratio_max = float(config["model"].get("text_guide_ratio_max", 0.35))
-        self.text_guide_max_base = float(config["model"].get("text_guide_max_base", 0.02))
-        self.text_guide_max_boost = float(config["model"].get("text_guide_max_boost", 0.05))
-        self.text_guide_quality_power = float(config["model"].get("text_guide_quality_power", 0.5))
-        self.text_guide_step_low = float(config["model"].get("text_guide_step_low", 0.2))
-        self.text_guide_step_high = float(config["model"].get("text_guide_step_high", 0.8))
-        self.text_guide_step_k = float(config["model"].get("text_guide_step_k", 12.0))
-        self.use_gate_warmup_epochs = int(config["model"].get("use_gate_warmup_epochs", max(1, int(train_cfg.get("lr_warmup_epochs", 0)))))
-        self.strength_gate_warmup_epochs = int(config["model"].get("strength_gate_warmup_epochs", max(self.use_gate_warmup_epochs + 1, int(0.2 * max(int(train_cfg.get("epochs", 1)), 1)))))
-        self.text_use_weight = float(train_cfg.get("text_use_weight", train_cfg.get("text_benefit_weight", 0.0)))
-        self.text_use_margin = float(train_cfg.get("text_use_margin", 0.02))
-        self.text_strength_weight = float(train_cfg.get("text_strength_weight", train_cfg.get("text_uplift_weight", train_cfg.get("text_notext_fallback_weight", 0.0))))
-        self.text_strength_tau = float(train_cfg.get("text_strength_tau", train_cfg.get("text_uplift_tau", 0.1)))
-        self.text_context_benefit_weight = float(train_cfg.get("text_context_benefit_weight", 0.05))
-        self.text_context_benefit_tau = float(train_cfg.get("text_context_benefit_tau", self.text_strength_tau))
-        self.detach_text_baselines = bool(train_cfg.get("detach_text_baselines", True))
-        self.text_uplift_weight = self.text_strength_weight
-        self.text_uplift_tau = self.text_strength_tau
-        self.text_utility_weight = float(
-            train_cfg.get(
-                "text_utility_weight",
-                max(self.text_use_weight, self.text_strength_weight),
-            )
-        )
-        self.text_utility_tau = float(
-            train_cfg.get("text_utility_tau", max(self.text_strength_tau, 1e-6))
-        )
-        self.text_sparse_weight = float(train_cfg.get("text_sparse_weight", 0.0))
-        self.aux_basis_dim = max(int(config["model"].get("aux_basis_dim", 6)), 1)
-        self.use_text_residual = bool(config["model"].get("use_text_residual", True))
-        self.use_calendar_residual = bool(config["model"].get("use_calendar_residual", True))
-        self.text_residual_scale = float(config["model"].get("text_residual_scale", 0.05))
-        self.calendar_residual_scale = float(config["model"].get("calendar_residual_scale", 0.1))
-        self.aux_residual_mag_weight = float(
-            train_cfg.get("aux_residual_mag_weight", train_cfg.get("text_residual_mag_weight", 0.0))
-        )
-        self.aux_residual_smooth_weight = float(
-            train_cfg.get("aux_residual_smooth_weight", train_cfg.get("text_residual_smooth_weight", 0.0))
-        )
-        self.latest_reliability_stats = {}
-        self.latest_text_benefit_stats = {}
 
         self.multi_res_horizons = train_cfg.get("multi_res_horizons", [])
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
@@ -202,13 +118,18 @@ class CSDI_base(nn.Module):
         self.multi_res_difficulty_weight = float(train_cfg.get("multi_res_difficulty_weight", 0.0))
         self.multi_res_group_balance = bool(train_cfg.get("multi_res_group_balance", True))
         self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
-        self.text_consistency_weight = float(train_cfg.get("text_consistency_weight", 0.0))
-        self.text_benefit_weight = self.text_use_weight
-        self.text_aug_benefit_weight = float(train_cfg.get("text_aug_benefit_weight", 0.0))
-        self.text_aug_reg_weight = float(train_cfg.get("text_aug_reg_weight", 0.0))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
+        self.pattern_residual_diffusion = bool(config["model"].get("pattern_residual_diffusion", True))
+        self.pattern_text_evidence = bool(config["model"].get("pattern_text_evidence", True))
+        self.pattern_hidden_dim = int(config["model"].get("pattern_hidden_dim", 64))
+        self.pattern_stats_dim = 8
+        self.pattern_num_experts = 5
+        self.pattern_consistency_weight = float(train_cfg.get("pattern_consistency_weight", 0.03))
+        self.pattern_expert_weight = float(train_cfg.get("pattern_expert_weight", 0.05))
+        self.pattern_baseline_detach = bool(train_cfg.get("pattern_baseline_detach", False))
+        self.pattern_router_temperature = float(config["model"].get("pattern_router_temperature", 1.0))
         self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
         self.multi_res_horizon_to_index = {
             int(horizon): idx for idx, horizon in enumerate(self.multi_res_horizons)
@@ -220,11 +141,6 @@ class CSDI_base(nn.Module):
         )
         self.multi_res_huber_deltas = self._resolve_multi_res_huber_deltas(
             self.multi_res_horizons, self.multi_res_huber_deltas_cfg
-        )
-        self.register_buffer(
-            "aux_residual_basis",
-            self._build_residual_basis(self.pred_len, self.aux_basis_dim),
-            persistent=False,
         )
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
@@ -260,25 +176,6 @@ class CSDI_base(nn.Module):
                                                    nn.LayerNorm(self.diff_channels),
                                                    nn.ReLU(),)
 
-        self.calendar_feature_dim = 8
-        calendar_hidden_dim = int(config["model"].get("calendar_residual_hidden_dim", config["model"].get("text_residual_hidden_dim", 128)))
-        self.calendar_utility_head = nn.Sequential(
-            nn.Linear(self.calendar_feature_dim, calendar_hidden_dim),
-            nn.LayerNorm(calendar_hidden_dim),
-            nn.GELU(),
-            nn.Linear(calendar_hidden_dim, self.pred_len),
-        )
-        self.calendar_residual_head = nn.Sequential(
-            nn.Linear(self.calendar_feature_dim, calendar_hidden_dim),
-            nn.LayerNorm(calendar_hidden_dim),
-            nn.GELU(),
-            nn.Linear(calendar_hidden_dim, self.aux_basis_dim),
-        )
-        nn.init.zeros_(self.calendar_utility_head[-1].weight)
-        nn.init.constant_(self.calendar_utility_head[-1].bias, -2.0)
-        nn.init.zeros_(self.calendar_residual_head[-1].weight)
-        nn.init.zeros_(self.calendar_residual_head[-1].bias)
-
         if self.with_texts:
             self.text_encoder, self.tokenizer = get_llm(self.llm, config["model"]["llm_layers"])
             for param in self.text_encoder.parameters():
@@ -292,84 +189,29 @@ class CSDI_base(nn.Module):
                     self.tokenizer.pad_token = pad_token
             text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
             self.text_hidden_dim = int(text_hidden_dim)
-            benefit_hidden_dim = int(config["model"].get("text_benefit_hidden_dim", 128))
-            event_source_embed_dim = int(config["model"].get("event_source_embed_dim", 4))
-            self.text_benefit_head = nn.Sequential(
-                nn.Linear(text_hidden_dim + 7, benefit_hidden_dim),
-                nn.LayerNorm(benefit_hidden_dim),
+
+        pattern_input_dim = self.pattern_stats_dim + self.pattern_num_experts
+        self.pattern_router = nn.Sequential(
+            nn.Linear(pattern_input_dim, self.pattern_hidden_dim),
+            nn.LayerNorm(self.pattern_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
+        )
+        self.pattern_evidence_head = nn.Sequential(
+            nn.Linear(7, self.pattern_hidden_dim),
+            nn.LayerNorm(self.pattern_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
+        )
+        if self.with_texts:
+            self.pattern_text_head = nn.Sequential(
+                nn.Linear(self.text_hidden_dim, self.pattern_hidden_dim),
+                nn.LayerNorm(self.pattern_hidden_dim),
                 nn.ReLU(),
-                nn.Linear(benefit_hidden_dim, 1),
+                nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
             )
-            self.text_aux_feature_dim = 13
-            utility_hidden_dim = int(config["model"].get("text_utility_hidden_dim", benefit_hidden_dim))
-            residual_hidden_dim = int(config["model"].get("text_residual_hidden_dim", benefit_hidden_dim))
-            self.text_utility_head = nn.Sequential(
-                nn.Linear(text_hidden_dim + self.text_aux_feature_dim, utility_hidden_dim),
-                nn.LayerNorm(utility_hidden_dim),
-                nn.GELU(),
-                nn.Linear(utility_hidden_dim, self.pred_len),
-            )
-            self.text_residual_head = nn.Sequential(
-                nn.Linear(text_hidden_dim + self.semantic_dim + self.text_aux_feature_dim, residual_hidden_dim),
-                nn.LayerNorm(residual_hidden_dim),
-                nn.GELU(),
-                nn.Linear(residual_hidden_dim, self.aux_basis_dim),
-            )
-            nn.init.zeros_(self.text_utility_head[-1].weight)
-            nn.init.constant_(self.text_utility_head[-1].bias, -2.0)
-            nn.init.zeros_(self.text_residual_head[-1].weight)
-            nn.init.zeros_(self.text_residual_head[-1].bias)
-            gate_hidden_dim = int(config["model"].get("reliability_hidden_dim", 32))
-            evidence_dim = 7
-            self.event_source_embed = nn.Embedding(3, event_source_embed_dim)
-            self.event_semantic_proj = nn.Sequential(
-                nn.Linear(text_hidden_dim + event_source_embed_dim + self.event_quality_dim, gate_hidden_dim),
-                nn.LayerNorm(gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(gate_hidden_dim, self.semantic_dim),
-            )
-            self.semantic_proj = nn.Sequential(
-                nn.Linear(text_hidden_dim, gate_hidden_dim),
-                nn.LayerNorm(gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(gate_hidden_dim, self.semantic_dim),
-            )
-            self.semantic_to_trend = nn.Sequential(
-                nn.Linear(self.semantic_dim, gate_hidden_dim),
-                nn.LayerNorm(gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(gate_hidden_dim, self.pred_len * 3),
-            )
-            self.use_gate_head = nn.Sequential(
-                nn.Linear(evidence_dim, gate_hidden_dim),
-                nn.LayerNorm(gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(gate_hidden_dim, self.pred_len),
-            )
-            self.strength_gate_head = nn.Sequential(
-                nn.Linear(evidence_dim + self.semantic_dim + 6, gate_hidden_dim),
-                nn.LayerNorm(gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(gate_hidden_dim, self.pred_len),
-            )
-            nn.init.zeros_(self.use_gate_head[-1].weight)
-            nn.init.constant_(self.use_gate_head[-1].bias, -1.5)
-            nn.init.zeros_(self.strength_gate_head[-1].weight)
-            nn.init.constant_(self.strength_gate_head[-1].bias, -2.0)
-            aug_hidden_dim = int(config["model"].get("text_aug_hidden_dim", 128))
-            aug_input_dim = text_hidden_dim * 2 + 9
-            self.text_aug_gate_head = nn.Sequential(
-                nn.Linear(aug_input_dim, aug_hidden_dim),
-                nn.LayerNorm(aug_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(aug_hidden_dim, 1),
-            )
-            self.text_aug_adapter = nn.Sequential(
-                nn.Linear(aug_input_dim, aug_hidden_dim),
-                nn.LayerNorm(aug_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(aug_hidden_dim, text_hidden_dim),
-            )
+        else:
+            self.pattern_text_head = None
 
         config_diff = config["diffusion"]
         config_diff["side_dim"] = self.emb_total_dim
@@ -404,29 +246,6 @@ class CSDI_base(nn.Module):
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
-
-    def _build_residual_basis(self, pred_len, basis_dim):
-        pred_len = max(int(pred_len), 1)
-        basis_dim = max(int(basis_dim), 1)
-        pos = torch.linspace(0.0, 1.0, pred_len, dtype=torch.float32)
-        centered = 2.0 * pos - 1.0
-        components = [
-            torch.ones_like(pos),
-            centered,
-            centered.pow(2) - centered.pow(2).mean(),
-            torch.sin(math.pi * pos),
-            torch.exp(-0.5 * ((pos - 0.25) / 0.18).pow(2)),
-            torch.exp(-0.5 * ((pos - 0.75) / 0.18).pow(2)),
-        ]
-        freq = 2
-        while len(components) < basis_dim:
-            components.append(torch.sin(freq * math.pi * pos))
-            if len(components) < basis_dim:
-                components.append(torch.cos(freq * math.pi * pos))
-            freq += 1
-        basis = torch.stack(components[:basis_dim], dim=1)
-        basis = basis / basis.pow(2).mean(dim=0, keepdim=True).sqrt().clamp(min=1e-6)
-        return basis
 
     def _sanitize_multi_res_horizons(self, horizons):
         if isinstance(horizons, int):
@@ -533,8 +352,6 @@ class CSDI_base(nn.Module):
             "huber_deltas": list(self.multi_res_huber_deltas),
             "difficulty_ema": difficulty,
             "horizon_groups": [self._get_horizon_group(horizon) for horizon in active_horizons],
-            "reliability": dict(self.latest_reliability_stats),
-            "text_benefit": dict(self.latest_text_benefit_stats),
         }
 
     def time_embedding(self, pos, d_model=128):
@@ -596,19 +413,220 @@ class CSDI_base(nn.Module):
 
         return side_info
 
+    def _masked_mean(self, values, mask, dim, keepdim=True):
+        denom = mask.sum(dim=dim, keepdim=keepdim).clamp(min=1.0)
+        return (values * mask).sum(dim=dim, keepdim=keepdim) / denom
+
+    def _safe_lag_corr(self, series, mask, lag):
+        if lag <= 0 or series.shape[1] <= lag:
+            return torch.zeros((series.shape[0],), device=series.device, dtype=series.dtype)
+        x0 = series[:, :-lag]
+        x1 = series[:, lag:]
+        m = mask[:, :-lag] * mask[:, lag:]
+        denom = m.sum(dim=1).clamp(min=1.0)
+        mu0 = (x0 * m).sum(dim=1, keepdim=True) / denom.unsqueeze(1)
+        mu1 = (x1 * m).sum(dim=1, keepdim=True) / denom.unsqueeze(1)
+        z0 = (x0 - mu0) * m
+        z1 = (x1 - mu1) * m
+        cov = (z0 * z1).sum(dim=1)
+        var0 = (z0 ** 2).sum(dim=1)
+        var1 = (z1 ** 2).sum(dim=1)
+        return cov / torch.sqrt((var0 * var1).clamp(min=1e-6))
+
+    def _compute_pattern_stats(self, observed_data, cond_mask):
+        B, _, L = observed_data.shape
+        hist_len = min(max(int(self.lookback_len), 1), L)
+        hist = observed_data[:, :, :hist_len]
+        hist_mask = cond_mask[:, :, :hist_len].float()
+        time_mask = (hist_mask.sum(dim=1) > 0).float()
+        series = (hist * hist_mask).sum(dim=1) / hist_mask.sum(dim=1).clamp(min=1.0)
+        series_mean = self._masked_mean(series, time_mask, dim=1, keepdim=True)
+        series = torch.where(time_mask > 0, series, series_mean.expand_as(series))
+        t = torch.linspace(-1.0, 1.0, hist_len, device=observed_data.device, dtype=observed_data.dtype).unsqueeze(0)
+        t_mean = self._masked_mean(t.expand(B, -1), time_mask, dim=1, keepdim=True)
+        x_mean = self._masked_mean(series, time_mask, dim=1, keepdim=True)
+        t_center = (t - t_mean) * time_mask
+        x_center = (series - x_mean) * time_mask
+        slope = (t_center * x_center).sum(dim=1) / (t_center ** 2).sum(dim=1).clamp(min=1e-6)
+        fitted = x_mean + slope.unsqueeze(1) * (t - t_mean)
+        ss_res = (((series - fitted) * time_mask) ** 2).sum(dim=1)
+        ss_tot = (((series - x_mean) * time_mask) ** 2).sum(dim=1).clamp(min=1e-6)
+        trend_r2 = (1.0 - ss_res / ss_tot).clamp(min=0.0, max=1.0)
+        acf1 = self._safe_lag_corr(series, time_mask, 1).clamp(min=-1.0, max=1.0)
+        period_candidates = [2, 3, 4, 6, 7, 12, 24, 52, 96]
+        season_scores = [
+            self._safe_lag_corr(series, time_mask, p).clamp(min=0.0, max=1.0)
+            for p in period_candidates
+            if hist_len > p
+        ]
+        if len(season_scores) > 0:
+            season_strength = torch.stack(season_scores, dim=1).max(dim=1).values
+        else:
+            season_strength = torch.zeros((B,), device=observed_data.device, dtype=observed_data.dtype)
+        diff = series[:, 1:] - series[:, :-1] if hist_len > 1 else torch.zeros((B, 1), device=observed_data.device, dtype=observed_data.dtype)
+        diff_mask = time_mask[:, 1:] * time_mask[:, :-1] if hist_len > 1 else torch.zeros_like(diff)
+        diff_abs = diff.abs() * diff_mask
+        diff_mean = diff_abs.sum(dim=1) / diff_mask.sum(dim=1).clamp(min=1.0)
+        diff_std = torch.sqrt((((diff_abs - diff_mean.unsqueeze(1)) * diff_mask) ** 2).sum(dim=1) / diff_mask.sum(dim=1).clamp(min=1.0) + 1e-6)
+        volatility = diff_std / (series.std(dim=1, unbiased=False).clamp(min=1e-3))
+        event_score = torch.sigmoid(diff_abs.max(dim=1).values / (diff_mean + diff_std + 1e-3) - 2.0)
+        state_score = (acf1.clamp(min=0.0, max=1.0) * torch.exp(-volatility.clamp(min=0.0, max=5.0))).clamp(min=0.0, max=1.0)
+        last = series[:, -1]
+        mean_revert = torch.sigmoid((last - x_mean.squeeze(1)).abs() / series.std(dim=1, unbiased=False).clamp(min=1e-3) - 1.0)
+        trend_strength = trend_r2 * torch.tanh(slope.abs())
+        stats = torch.stack(
+            [
+                trend_strength,
+                trend_r2,
+                acf1.clamp(min=0.0, max=1.0),
+                season_strength,
+                state_score,
+                mean_revert,
+                event_score,
+                volatility.clamp(min=0.0, max=5.0) / 5.0,
+            ],
+            dim=1,
+        )
+        return stats.clamp(min=0.0, max=1.0)
+
+    def _compute_pattern_text_evidence(self, text_pooled, text_mask, text_evidence_vec, batch_size, device):
+        if not self.pattern_text_evidence:
+            return torch.zeros((batch_size, self.pattern_num_experts), device=device)
+        logits = torch.zeros((batch_size, self.pattern_num_experts), device=device)
+        has_signal = False
+        if text_evidence_vec is not None:
+            evidence = text_evidence_vec.float()
+            if evidence.dim() == 1:
+                evidence = evidence.reshape(batch_size, -1)
+            if evidence.shape[1] < 7:
+                evidence = F.pad(evidence, (0, 7 - evidence.shape[1]))
+            logits = logits + self.pattern_evidence_head(evidence[:, :7])
+            has_signal = True
+        if self.with_texts and self.pattern_text_head is not None and text_pooled is not None:
+            logits = logits + self.pattern_text_head(text_pooled.float())
+            has_signal = True
+        if not has_signal:
+            return torch.zeros_like(logits)
+        evidence = F.softmax(logits, dim=-1)
+        if text_mask is not None:
+            availability = text_mask.float()
+            if availability.dim() > 1:
+                availability = availability.mean(dim=1)
+            evidence = evidence * (availability.reshape(-1, 1) > 0).float()
+        return evidence
+
+    def _build_pattern_baselines(self, observed_data, cond_mask, stats):
+        B, K, L = observed_data.shape
+        baseline = torch.zeros_like(observed_data)
+        future_len = min(max(int(self.pred_len), 0), max(L - self.lookback_len, 0))
+        if future_len <= 0:
+            experts = torch.zeros((B, self.pattern_num_experts, K, 0), device=observed_data.device, dtype=observed_data.dtype)
+            return baseline, experts
+        hist_len = min(max(int(self.lookback_len), 1), L)
+        hist = observed_data[:, :, :hist_len]
+        hist_mask = cond_mask[:, :, :hist_len].float()
+        mean = self._masked_mean(hist, hist_mask, dim=2, keepdim=True)
+        filled_hist = torch.where(hist_mask > 0, hist, mean.expand_as(hist))
+        first = filled_hist[:, :, 0:1]
+        last = filled_hist[:, :, -1:]
+        prev = filled_hist[:, :, -2:-1] if hist_len > 1 else last
+        slope = (last - first) / max(hist_len - 1, 1)
+        steps = torch.arange(1, future_len + 1, device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
+        trend_future = last + slope * steps
+        state_future = last.expand(-1, -1, future_len)
+        phi = torch.exp(-steps / max(float(future_len), 1.0))
+        mean_future = mean + phi * (last - mean)
+        event_future = last + (last - prev) * phi
+
+        season_candidates = []
+        season_weights = []
+        for p in [2, 3, 4, 6, 7, 12, 24, 52, 96]:
+            if hist_len <= p:
+                continue
+            idx = hist_len - p + (torch.arange(future_len, device=observed_data.device) % p)
+            season_candidates.append(filled_hist[:, :, idx])
+            series = filled_hist.mean(dim=1)
+            time_mask = (hist_mask.sum(dim=1) > 0).float()
+            season_weights.append(self._safe_lag_corr(series, time_mask, p).clamp(min=0.0, max=1.0))
+        if len(season_candidates) > 0:
+            candidate_tensor = torch.stack(season_candidates, dim=1)
+            weight_tensor = torch.stack(season_weights, dim=1)
+            weight_tensor = F.softmax(4.0 * weight_tensor, dim=1).view(B, -1, 1, 1)
+            season_future = (candidate_tensor * weight_tensor).sum(dim=1)
+        else:
+            season_future = state_future
+
+        expert_futures = torch.stack(
+            [trend_future, season_future, state_future, mean_future, event_future],
+            dim=1,
+        )
+        return baseline, expert_futures
+
+    def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None):
+        B, K, L = observed_data.shape
+        stats = self._compute_pattern_stats(observed_data, cond_mask)
+        text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
+        router_input = torch.cat([stats, text_pattern], dim=1)
+        temperature = max(float(self.pattern_router_temperature), 1e-3)
+        pi = F.softmax(self.pattern_router(router_input) / temperature, dim=-1)
+        baseline, expert_futures = self._build_pattern_baselines(observed_data, cond_mask, stats)
+        future_len = expert_futures.shape[-1]
+        if future_len > 0:
+            mixed_future = (pi.view(B, self.pattern_num_experts, 1, 1) * expert_futures).sum(dim=1)
+            baseline[:, :, self.lookback_len:self.lookback_len + future_len] = mixed_future
+        pseudo = torch.stack(
+            [stats[:, 1], stats[:, 3], stats[:, 4], stats[:, 5], stats[:, 6]],
+            dim=1,
+        ).clamp(min=1e-4)
+        pseudo = pseudo / pseudo.sum(dim=1, keepdim=True).clamp(min=1e-4)
+        if self.pattern_baseline_detach:
+            baseline = baseline.detach()
+        return {
+            "stats": stats,
+            "text_pattern": text_pattern,
+            "pi": pi,
+            "pseudo": pseudo.detach(),
+            "baseline": baseline,
+            "expert_futures": expert_futures,
+        }
+
+    def _calc_pattern_aux_loss(self, pattern, observed_data, target_mask):
+        aux = torch.zeros((), device=observed_data.device)
+        if pattern is None:
+            return aux
+        pi = pattern["pi"].clamp(min=1e-6)
+        pseudo = pattern["pseudo"].clamp(min=1e-6)
+        if self.pattern_consistency_weight > 0:
+            consistency = (pseudo * (pseudo.log() - pi.log())).sum(dim=1).mean()
+            aux = aux + self.pattern_consistency_weight * consistency
+        if self.pattern_expert_weight > 0 and pattern["expert_futures"].numel() > 0:
+            future_len = pattern["expert_futures"].shape[-1]
+            start = int(self.lookback_len)
+            end = start + future_len
+            future_mask = target_mask[:, :, start:end].unsqueeze(1)
+            future_target = observed_data[:, :, start:end].unsqueeze(1)
+            residual = (pattern["expert_futures"] - future_target) * future_mask
+            abs_res = residual.abs()
+            huber = torch.where(abs_res <= 1.0, 0.5 * residual ** 2, abs_res - 0.5)
+            denom = future_mask.sum(dim=(2, 3)).clamp(min=1.0)
+            expert_loss = huber.sum(dim=(2, 3)) / denom
+            weighted_expert_loss = (pattern["pi"] * expert_loss).sum(dim=1).mean()
+            aux = aux + self.pattern_expert_weight * weighted_expert_loss
+        return aux
+
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, text_mask=text_mask, use_gate=use_gate, context_raw=context_raw, aug_gate=aug_gate, strength_gate=strength_gate, context_gate=context_gate, text_utility=text_utility, text_residual=text_residual, calendar_utility=calendar_utility, calendar_residual=calendar_residual
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, pattern_text_pooled=pattern_text_pooled, pattern_text_mask=pattern_text_mask, pattern_text_evidence_vec=pattern_text_evidence_vec
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, use_gate=None, context_raw=None, aug_gate=None, strength_gate=None, context_gate=None, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, set_t=-1
     ):
 
         B, K, L = observed_data.shape
@@ -617,22 +635,36 @@ class CSDI_base(nn.Module):
             stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
             observed_data = (observed_data - means) / stdev
 
+        pattern = None
+        pattern_baseline = None
+        diffusion_target = observed_data
+        if self.pattern_residual_diffusion and not self.noise_esti:
+            pattern = self._compute_pattern_outputs(
+                observed_data,
+                cond_mask,
+                text_pooled=pattern_text_pooled,
+                text_mask=pattern_text_mask,
+                text_evidence_vec=pattern_text_evidence_vec,
+            )
+            pattern_baseline = pattern["baseline"]
+            diffusion_target = observed_data - pattern_baseline
+
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
         else:
             t = torch.randint(0, self.num_steps, [B]).to(self.device)
         current_alpha = self.alpha_torch[t]
-        noise = torch.randn_like(observed_data)
-        noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
+        noise = torch.randn_like(diffusion_target)
+        noisy_data = (current_alpha ** 0.5) * diffusion_target + (1.0 - current_alpha) ** 0.5 * noise
 
-        total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask)
+        total_input = self.set_input_to_diffmodel(noisy_data, diffusion_target, cond_mask)
 
         if self.cfg:
             cfg_mask = torch.bernoulli(torch.ones((B, )) - self.c_mask_prob).to(self.device)
         else:
             cfg_mask = None
 
-        predicted_base = self._run_diffusion_model(
+        predicted = self._run_diffusion_model(
             total_input,
             side_info,
             t,
@@ -644,70 +676,23 @@ class CSDI_base(nn.Module):
 
         if self.timestep_branch and timesteps is not None:
             predicted_from_timestep = self.timestep_pred(timesteps)
-            predicted_base = 0.9 * predicted_base + 0.1 * predicted_from_timestep
-
-        predicted = self._apply_aux_residual(
-            predicted_base,
-            text_utility=text_utility,
-            text_residual=text_residual,
-            calendar_utility=calendar_utility,
-            calendar_residual=calendar_residual,
-        )
+            predicted = 0.9 * predicted + 0.1 * predicted_from_timestep
 
         target_mask = observed_mask - cond_mask
         if self.noise_esti:
             residual = (noise - predicted) * target_mask 
         else:
-            residual = (observed_data - predicted) * target_mask 
+            residual = (diffusion_target - predicted) * target_mask
         num_eval = target_mask.sum()
         main_loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         auxiliary_loss = torch.zeros((), device=observed_data.device)
+        predicted_series = predicted
+        if pattern_baseline is not None:
+            predicted_series = predicted + pattern_baseline
+            auxiliary_loss = auxiliary_loss + self._calc_pattern_aux_loss(pattern, observed_data, target_mask)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
-            aux_loss = self._calc_multi_res_loss(observed_data, predicted, target_mask, t=t, trend_prior=trend_prior)
+            aux_loss = self._calc_multi_res_loss(observed_data, predicted_series, target_mask, t=t, trend_prior=trend_prior)
             auxiliary_loss = auxiliary_loss + self.multi_res_loss_weight * aux_loss
-        if (not self.noise_esti) and self.training:
-            if self.text_utility_weight > 0 and text_utility is not None and text_residual is not None:
-                utility_loss = self._calc_aux_utility_loss(
-                    predicted_base,
-                    observed_data,
-                    target_mask,
-                    text_utility,
-                    text_residual,
-                    update_debug=True,
-                )
-                auxiliary_loss = auxiliary_loss + self.text_utility_weight * utility_loss
-            if self.text_utility_weight > 0 and calendar_utility is not None and calendar_residual is not None:
-                calendar_utility_loss = self._calc_aux_utility_loss(
-                    predicted_base,
-                    observed_data,
-                    target_mask,
-                    calendar_utility,
-                    calendar_residual,
-                    update_debug=False,
-                )
-                auxiliary_loss = auxiliary_loss + self.text_utility_weight * calendar_utility_loss
-            if self.text_sparse_weight > 0:
-                sparse_terms = []
-                if text_utility is not None:
-                    sparse_terms.append(self._ensure_horizon_gate(text_utility).float().mean())
-                if calendar_utility is not None:
-                    sparse_terms.append(self._ensure_horizon_gate(calendar_utility).float().mean())
-                if sparse_terms:
-                    auxiliary_loss = auxiliary_loss + self.text_sparse_weight * torch.stack(sparse_terms).mean()
-            if self.aux_residual_mag_weight > 0 or self.aux_residual_smooth_weight > 0:
-                mag_terms = []
-                smooth_terms = []
-                for utility, residual_value in (
-                    (text_utility, text_residual),
-                    (calendar_utility, calendar_residual),
-                ):
-                    mag_loss, smooth_loss = self._calc_aux_residual_reg(utility, residual_value, observed_data.device)
-                    mag_terms.append(mag_loss)
-                    smooth_terms.append(smooth_loss)
-                if self.aux_residual_mag_weight > 0:
-                    auxiliary_loss = auxiliary_loss + self.aux_residual_mag_weight * torch.stack(mag_terms).mean()
-                if self.aux_residual_smooth_weight > 0:
-                    auxiliary_loss = auxiliary_loss + self.aux_residual_smooth_weight * torch.stack(smooth_terms).mean()
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
             auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
@@ -720,130 +705,17 @@ class CSDI_base(nn.Module):
 
     def _run_diffusion_model(self, total_input, side_info, t, cfg_mask, timestep_emb=None, size_emb=None, context=None):
         if self.decomp:
-            seasonal_context = None if self.text_trend_only_guidance else context
-            trend_context = context
             predicted_seasonal = self._unwrap_diffmodel_output(
-                self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb, seasonal_context)
+                self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb, context)
             )
             predicted_trend = self._unwrap_diffmodel_output(
-                self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb, trend_context)
+                self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb, context)
             )
             return predicted_seasonal + predicted_trend
         if self.save_attn:
             predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
             return predicted
         return self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
-
-    def _calc_text_consistency_loss(self, predicted, predicted_no_text, target_mask, text_mask):
-        diff = (predicted - predicted_no_text) * target_mask
-        num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
-        per_sample = (diff ** 2).sum(dim=(1, 2)) / num_eval
-        quality = text_mask.float().clamp(min=0.0, max=1.0)
-        if quality.dim() > 1:
-            quality = quality.mean(dim=1)
-        else:
-            quality = quality.reshape(-1)
-        weights = 1.0 - quality
-        valid = weights > 0
-        if not valid.any():
-            return torch.zeros((), device=predicted.device)
-        return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
-
-    def _calc_per_sample_forecast_loss(self, predicted, observed_data, target_mask):
-        residual = (observed_data - predicted) * target_mask
-        num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
-        return (residual ** 2).sum(dim=(1, 2)) / num_eval
-
-    def _calc_per_horizon_forecast_loss(self, predicted, observed_data, target_mask):
-        future_slice = slice(self.lookback_len, self.lookback_len + self.pred_len)
-        future_residual = (observed_data - predicted)[:, :, future_slice] * target_mask[:, :, future_slice]
-        future_mask = target_mask[:, :, future_slice]
-        num_eval = future_mask.sum(dim=1).clamp(min=1.0)
-        return (future_residual ** 2).sum(dim=1) / num_eval
-
-    def _calc_text_benefit_loss(self, predicted, predicted_no_text, observed_data, target_mask, benefit_gate):
-        text_loss = self._calc_per_sample_forecast_loss(predicted, observed_data, target_mask)
-        base_loss = self._calc_per_sample_forecast_loss(predicted_no_text, observed_data, target_mask)
-        target = (base_loss.detach() > text_loss.detach()).float()
-        if benefit_gate.dim() > 1:
-            gate = benefit_gate.float().mean(dim=1)
-        else:
-            gate = benefit_gate.reshape(-1).float()
-        gate = gate.clamp(min=1e-4, max=1.0 - 1e-4)
-        return F.binary_cross_entropy(gate, target)
-
-    def _calc_text_use_loss(self, predicted, predicted_no_text, observed_data, target_mask, use_gate):
-        gate = self._ensure_horizon_gate(use_gate)
-        if gate is None:
-            return torch.zeros((), device=predicted.device)
-        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
-        base_loss = self._calc_per_horizon_forecast_loss(predicted_no_text, observed_data, target_mask)
-        margin = max(float(self.text_use_margin), 0.0)
-        target = (text_loss.detach() <= (base_loss.detach() + margin)).float()
-        gate = gate.float().clamp(min=1e-4, max=1.0 - 1e-4)
-        return F.binary_cross_entropy(gate, target)
-
-    def _calc_text_aug_reg_loss(self, predicted_aug, predicted_raw, target_mask, aug_gate):
-        diff = (predicted_aug - predicted_raw) * target_mask
-        num_eval = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
-        per_sample = (diff ** 2).sum(dim=(1, 2)) / num_eval
-        if aug_gate.dim() > 1:
-            aug_weight = aug_gate.float().mean(dim=1)
-        else:
-            aug_weight = aug_gate.reshape(-1).float()
-        weights = 1.0 - aug_weight.clamp(min=0.0, max=1.0)
-        valid = weights > 0
-        if not valid.any():
-            return torch.zeros((), device=predicted_aug.device)
-        return (per_sample[valid] * weights[valid]).sum() / weights[valid].sum().clamp(min=1e-6)
-
-    def _calc_text_strength_loss(self, predicted, predicted_no_text, observed_data, target_mask, strength_gate):
-        gate = self._ensure_horizon_gate(strength_gate)
-        if gate is None:
-            return torch.zeros((), device=predicted.device)
-        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
-        base_loss = self._calc_per_horizon_forecast_loss(predicted_no_text, observed_data, target_mask)
-        tau = max(self.text_strength_tau, 1e-6)
-        usable_target = (text_loss.detach() <= (base_loss.detach() + max(float(self.text_use_margin), 0.0))).float()
-        target = torch.sigmoid((base_loss.detach() - text_loss.detach()) / tau) * usable_target
-        gate = gate.float()
-        valid = gate > 0
-        if not valid.any():
-            return torch.zeros((), device=predicted.device)
-        gate = gate[valid].clamp(min=1e-4, max=1.0 - 1e-4)
-        return F.binary_cross_entropy(gate, target[valid])
-
-    def _calc_context_benefit_loss(self, predicted, predicted_no_text, observed_data, target_mask, context_gate):
-        gate = self._ensure_horizon_gate(context_gate)
-        if gate is None:
-            return torch.zeros((), device=predicted.device)
-        text_loss = self._calc_per_horizon_forecast_loss(predicted, observed_data, target_mask)
-        base_loss = self._calc_per_horizon_forecast_loss(predicted_no_text, observed_data, target_mask)
-        tau = max(float(self.text_context_benefit_tau), 1e-6)
-        target = torch.sigmoid((base_loss.detach() - text_loss.detach()) / tau)
-        valid = target_mask[:, :, self.lookback_len:self.lookback_len + self.pred_len].sum(dim=1) > 0
-        valid = valid & (gate > 0)
-        if not valid.any():
-            return torch.zeros((), device=predicted.device)
-        gate = gate[valid].float().clamp(min=1e-4, max=1.0 - 1e-4)
-        target_valid = target[valid].float().clamp(min=0.0, max=1.0)
-        loss = F.binary_cross_entropy(gate, target_valid)
-        self._update_text_benefit_debug(gate.detach(), target_valid.detach(), text_loss.detach(), base_loss.detach())
-        return loss
-
-    def _update_text_benefit_debug(self, gate, target, text_loss, base_loss):
-        if gate.numel() == 0 or target.numel() == 0:
-            return
-        gain = (base_loss - text_loss).reshape(-1).float()
-        target_values = target.reshape(-1).float()
-        gate_values = gate.reshape(-1).float()
-        self.latest_text_benefit_stats = {
-            "gate_mean": float(gate_values.mean().detach().cpu().item()),
-            "target_mean": float(target_values.mean().detach().cpu().item()),
-            "target_p90": float(torch.quantile(target_values.detach().cpu(), 0.9).item()),
-            "gain_mean": float(gain.mean().detach().cpu().item()),
-            "gain_positive_rate": float((gain > 0).float().mean().detach().cpu().item()),
-        }
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -1025,31 +897,8 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def get_guidance_step_gate(self, step_index, time_steps=None):
-        low = min(max(float(self.text_guide_step_low), 0.0), 1.0)
-        high = min(max(float(self.text_guide_step_high), 0.0), 1.0)
-        if high <= low:
-            return 1.0
-        if self.ddim and time_steps is not None:
-            current_step = float(time_steps[step_index])
-        else:
-            current_step = float(step_index)
-        tau = min(max(current_step / max(self.num_steps - 1, 1), 0.0), 1.0)
-        k = max(float(self.text_guide_step_k), 1e-6)
-        left = 1.0 / (1.0 + math.exp(-k * (tau - low)))
-        right = 1.0 / (1.0 + math.exp(-k * (high - tau)))
-        return left * right
-
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, text_mask=None, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None):
         B, K, L = observed_data.shape
-        guide_w_tensor = self._to_samplewise_weight(guide_w, B, observed_data.device)
-        if text_mask is not None:
-            if text_mask.dim() > 1:
-                effective_guide_w = guide_w_tensor.unsqueeze(1) * text_mask.clamp(min=0.0, max=1.0).pow(self.guide_reliability_power)
-            else:
-                effective_guide_w = guide_w_tensor * text_mask.clamp(min=0.0, max=1.0).pow(self.guide_reliability_power)
-        else:
-            effective_guide_w = guide_w_tensor
         if self.ddim:
             if self.sample_method == 'linear':
                 a = self.num_steps // self.sample_steps
@@ -1066,90 +915,60 @@ class CSDI_base(nn.Module):
             means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
             stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
             observed_data = (observed_data - means) / stdev
+
+        pattern_baseline = None
+        diffusion_observed_data = observed_data
+        if self.pattern_residual_diffusion and not self.noise_esti:
+            pattern = self._compute_pattern_outputs(
+                observed_data,
+                cond_mask,
+                text_pooled=pattern_text_pooled,
+                text_mask=pattern_text_mask,
+                text_evidence_vec=pattern_text_evidence_vec,
+            )
+            pattern_baseline = pattern["baseline"]
+            diffusion_observed_data = observed_data - pattern_baseline
         
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
-        if self.cfg:
-            side_info = side_info.repeat(2, 1, 1, 1)
-            if timestep_emb is not None:
-                timestep_emb = timestep_emb.repeat(2, 1, 1, 1)
-            if context is not None:
-                context = context.repeat(2, 1, 1)
-            cfg_mask = torch.zeros((2*B, )).to(self.device) 
-            cfg_mask[:B] = 1.
-        else:
-            cfg_mask = None
+        cfg_mask = None
 
         for i in range(n_samples):
             if self.is_unconditional == True:
-                noisy_obs = observed_data
+                noisy_obs = diffusion_observed_data
                 noisy_cond_history = []
                 for t in range(self.num_steps):
                     noise = torch.randn_like(noisy_obs)
                     noisy_obs = (self.alpha_hat[t] ** 0.5) * noisy_obs + self.beta[t] ** 0.5 * noise
                     noisy_cond_history.append(noisy_obs * cond_mask)
 
-            current_sample = torch.randn_like(observed_data)
+            current_sample = torch.randn_like(diffusion_observed_data)
             for t in range(self.sample_steps - 1, -1, -1):
                 if self.is_unconditional == True:
                     diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
                     diff_input = diff_input.unsqueeze(1) 
                 else:
                     if self.decomp:
-                        cond_obs = cond_mask * observed_data
+                        cond_obs = cond_mask * diffusion_observed_data
                         noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1) # (B, 1, K, L)
                         res, moving_mean = self.decomposition(cond_obs) # (B, K, L), (B, K, L)
                         res, moving_mean = res.unsqueeze(1), moving_mean.unsqueeze(1) # (B, 1, K, L), (B, 1, K, L)
                         res_input = torch.cat([res, noisy_target], dim=1)  # (B,2,K,L)
                         moving_mean_input = torch.cat([moving_mean, noisy_target], dim=1)  # (B,2,K,L)
-                        if self.cfg:
-                            res_input = res_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
-                            moving_mean_input = moving_mean_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
-                        seasonal_context = None if self.text_trend_only_guidance else context
-                        trend_context = context
                         predicted_seasonal = self._unwrap_diffmodel_output(
-                            self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, seasonal_context)
+                            self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
                         ) # (2*B, K, L)
                         predicted_trend = self._unwrap_diffmodel_output(
-                            self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, trend_context)
+                            self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
                         ) # (2*B, K, L)
                         predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
                     else:
-                        cond_obs = (cond_mask * observed_data).unsqueeze(1) # (B, 1, K, L)
+                        cond_obs = (cond_mask * diffusion_observed_data).unsqueeze(1) # (B, 1, K, L)
                         noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1) # (B, 1, K, L)
                         diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B, 2, K, L)
-                        if self.cfg:
-                            diff_input = diff_input.repeat(2, 1, 1, 1) # (2*B, 2, K, L)
                         if self.save_attn:
                             predicted, attn = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                         else:
                             predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
-                if self.cfg:
-                    predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
-                    guidance_step_gate = self.get_guidance_step_gate(t, time_steps if self.ddim else None)
-                    effective_guide_w_t = effective_guide_w * guidance_step_gate
-                    if self.trend_cfg:
-                        if self.trend_cfg_random:
-                            trend_prior = self.sample_random_trend_prior(B, observed_data.device)
-                        if trend_prior is not None:
-                            step_ratio = self.get_trend_step_ratio(t, time_steps if self.ddim else None) * guidance_step_gate
-                            trend_weight = self.get_trend_guidance_weight(trend_prior, step_ratio, guide_w_tensor, text_mask)
-                            seq_trend_weight = self._build_future_seq_weight(trend_weight, L)
-                            if seq_trend_weight is None:
-                                predicted = predicted_uncond + trend_weight[:, None, None] * (predicted_cond - predicted_uncond)
-                            else:
-                                predicted = predicted_uncond + seq_trend_weight * (predicted_cond - predicted_uncond)
-                        else:
-                            seq_weight = self._build_future_seq_weight(effective_guide_w_t, L)
-                            if seq_weight is None:
-                                predicted = predicted_uncond + effective_guide_w_t[:, None, None] * (predicted_cond - predicted_uncond)
-                            else:
-                                predicted = predicted_uncond + seq_weight * (predicted_cond - predicted_uncond)
-                    else:
-                        seq_weight = self._build_future_seq_weight(effective_guide_w_t, L)
-                        if seq_weight is None:
-                            predicted = predicted_uncond + effective_guide_w_t[:, None, None] * (predicted_cond - predicted_uncond)
-                        else:
-                            predicted = predicted_uncond + seq_weight * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -1192,17 +1011,13 @@ class CSDI_base(nn.Module):
                             ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
                         )
 
-            imputed_samples[:, i] = current_sample.detach()
+            sample = current_sample.detach()
+            if pattern_baseline is not None:
+                sample = sample + pattern_baseline.detach()
+            imputed_samples[:, i] = sample
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 imputed_samples[:, i] = 0.9 * imputed_samples[:, i] + 0.1 * predicted_from_timestep.detach()
-            imputed_samples[:, i] = self._apply_aux_residual(
-                imputed_samples[:, i],
-                text_utility=text_utility,
-                text_residual=text_residual,
-                calendar_utility=calendar_utility,
-                calendar_residual=calendar_residual,
-            ).detach()
             if not self.noise_esti:
                 imputed_samples[:, i] = imputed_samples[:, i] * stdev + means
         if self.save_attn:
@@ -1271,11 +1086,37 @@ class CSDI_Forecasting(CSDI_base):
         gt_mask = batch["gt_mask"].to(self.device).float()
         batch_size = observed_data.shape[0]
         text_mask = batch["text_mark"].to(self.device).float().reshape(-1).clamp(0.0, 1.0)
+        text_quality_raw = batch.get("text_quality_raw")
+        if text_quality_raw is not None:
+            text_quality_raw = text_quality_raw.to(self.device).float().reshape(-1)
+        else:
+            text_quality_raw = text_mask
         trend_prior_num = batch.get("trend_prior_num", batch.get("trend_prior"))
         if trend_prior_num is None:
             trend_prior_num = torch.zeros((observed_data.shape[0], 3), device=self.device)
         else:
             trend_prior_num = trend_prior_num.to(self.device).float()
+        trend_prior_text = batch.get("trend_prior_text")
+        if trend_prior_text is None:
+            trend_prior_text = trend_prior_num.clone()
+        else:
+            trend_prior_text = trend_prior_text.to(self.device).float()
+        text_evidence_vec = batch.get("text_evidence_vec")
+        if text_evidence_vec is not None:
+            text_evidence_vec = text_evidence_vec.to(self.device).float().reshape(observed_data.shape[0], -1)
+        else:
+            text_evidence_vec = torch.stack(
+                [
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                ],
+                dim=1,
+            )
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
@@ -1303,11 +1144,6 @@ class CSDI_Forecasting(CSDI_base):
             text_event_time_deltas = None
             text_event_quality_feats = None
             text_event_mask = None
-        domain_text_coverage = batch.get("domain_text_coverage")
-        if domain_text_coverage is not None:
-            domain_text_coverage = domain_text_coverage.to(self.device).float().reshape(-1)
-        else:
-            domain_text_coverage = torch.ones(batch_size, device=self.device)
 
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
@@ -1330,12 +1166,13 @@ class CSDI_Forecasting(CSDI_base):
             texts,
             text_mask,
             trend_prior_num,
+            trend_prior_text,
+            text_evidence_vec,
             text_event_texts,
             text_event_source_ids,
             text_event_time_deltas,
             text_event_quality_feats,
             text_event_mask,
-            domain_text_coverage,
         )        
 
     def _unpack_forecasting_batch(self, data):
@@ -1345,14 +1182,15 @@ class CSDI_Forecasting(CSDI_base):
             "texts": None,
             "text_mask": None,
             "trend_prior_num": None,
+            "trend_prior_text": None,
+            "text_evidence_vec": None,
             "text_event_texts": None,
             "text_event_source_ids": None,
             "text_event_time_deltas": None,
             "text_event_quality_feats": None,
             "text_event_mask": None,
-            "domain_text_coverage": None,
         }
-        if len(data) >= 17:
+        if len(data) >= 18:
             (
                 observed_data,
                 observed_mask,
@@ -1365,12 +1203,13 @@ class CSDI_Forecasting(CSDI_base):
                 defaults["texts"],
                 defaults["text_mask"],
                 defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+                defaults["text_evidence_vec"],
                 defaults["text_event_texts"],
                 defaults["text_event_source_ids"],
                 defaults["text_event_time_deltas"],
                 defaults["text_event_quality_feats"],
                 defaults["text_event_mask"],
-                defaults["domain_text_coverage"],
             ) = data
         elif len(data) == 13:
             (
@@ -1385,6 +1224,23 @@ class CSDI_Forecasting(CSDI_base):
                 defaults["texts"],
                 defaults["text_mask"],
                 defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+                defaults["text_evidence_vec"],
+            ) = data
+        elif len(data) == 12:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
             ) = data
         elif len(data) == 11:
             (
@@ -1400,6 +1256,7 @@ class CSDI_Forecasting(CSDI_base):
                 defaults["text_mask"],
                 defaults["trend_prior_num"],
             ) = data
+            defaults["trend_prior_text"] = defaults["trend_prior_num"]
         elif len(data) == 10:
             (
                 observed_data,
@@ -1481,374 +1338,6 @@ class CSDI_Forecasting(CSDI_base):
             return value
         return torch.full((batch_size,), float(value), device=device)
 
-    def _update_reliability_debug(self, use_gate, strength_gate=None, evidence_vec=None, context_gate=None, guide_gate=None):
-        if use_gate is None and strength_gate is None and context_gate is None and guide_gate is None:
-            self.latest_reliability_stats = {}
-            return
-        use_values = None if use_gate is None else use_gate.detach().reshape(-1).float().cpu()
-        strength_values = None if strength_gate is None else strength_gate.detach().reshape(-1).float().cpu()
-        context_values = None if context_gate is None else context_gate.detach().reshape(-1).float().cpu()
-        guide_values = None if guide_gate is None else guide_gate.detach().reshape(-1).float().cpu()
-        if (
-            (use_values is None or use_values.numel() == 0)
-            and (strength_values is None or strength_values.numel() == 0)
-            and (context_values is None or context_values.numel() == 0)
-            and (guide_values is None or guide_values.numel() == 0)
-        ):
-            self.latest_reliability_stats = {}
-            return
-        stats = {}
-        if use_values is not None and use_values.numel() > 0:
-            stats["use_gate"] = {
-                "mean": float(use_values.mean().item()),
-                "std": float(use_values.std(unbiased=False).item()),
-                "p10": float(torch.quantile(use_values, 0.1).item()),
-                "p50": float(torch.quantile(use_values, 0.5).item()),
-                "p90": float(torch.quantile(use_values, 0.9).item()),
-            }
-            if use_gate.dim() > 1:
-                thirds = torch.chunk(use_gate.detach().float().cpu(), 3, dim=1)
-                labels = ("near", "mid", "far")
-                for label, chunk in zip(labels, thirds):
-                    stats["use_gate"][label] = float(chunk.mean().item())
-        if strength_values is not None and strength_values.numel() > 0:
-            stats["strength_gate"] = {
-                "mean": float(strength_values.mean().item()),
-                "std": float(strength_values.std(unbiased=False).item()),
-                "p10": float(torch.quantile(strength_values, 0.1).item()),
-                "p50": float(torch.quantile(strength_values, 0.5).item()),
-                "p90": float(torch.quantile(strength_values, 0.9).item()),
-            }
-            if strength_gate.dim() > 1:
-                thirds = torch.chunk(strength_gate.detach().float().cpu(), 3, dim=1)
-                labels = ("near", "mid", "far")
-                for label, chunk in zip(labels, thirds):
-                    stats["strength_gate"][label] = float(chunk.mean().item())
-        for gate_name, gate, values in (
-            ("context_gate", context_gate, context_values),
-            ("guide_gate", guide_gate, guide_values),
-        ):
-            if values is not None and values.numel() > 0:
-                stats[gate_name] = {
-                    "mean": float(values.mean().item()),
-                    "std": float(values.std(unbiased=False).item()),
-                    "p10": float(torch.quantile(values, 0.1).item()),
-                    "p50": float(torch.quantile(values, 0.5).item()),
-                    "p90": float(torch.quantile(values, 0.9).item()),
-                }
-                if gate.dim() > 1:
-                    thirds = torch.chunk(gate.detach().float().cpu(), 3, dim=1)
-                    labels = ("near", "mid", "far")
-                    for label, chunk in zip(labels, thirds):
-                        stats[gate_name][label] = float(chunk.mean().item())
-        if evidence_vec is not None:
-            evidence_mean = evidence_vec.detach().float().mean(dim=0).cpu().tolist()
-            stats["evidence_mean"] = [float(v) for v in evidence_mean]
-        self.latest_reliability_stats = stats
-
-    def _get_gate_warmup_scale(self, gate_name):
-        epoch = max(int(self.current_epoch), 0)
-        if gate_name == "use":
-            full_epoch = max(int(self.use_gate_warmup_epochs), 0)
-            if full_epoch <= 0:
-                return 1.0
-            return float(min(max(epoch, 0), full_epoch)) / float(full_epoch)
-        delay_epoch = max(int(self.use_gate_warmup_epochs), 0)
-        full_epoch = max(int(self.strength_gate_warmup_epochs), delay_epoch)
-        if epoch <= delay_epoch:
-            return 0.0
-        if full_epoch <= delay_epoch:
-            return 1.0
-        return float(min(epoch - delay_epoch, full_epoch - delay_epoch)) / float(full_epoch - delay_epoch)
-
-    def _get_gate_loss_scale(self, gate_name):
-        return self._get_gate_warmup_scale(gate_name)
-
-    def _ensure_horizon_gate(self, gate, batch_size=None):
-        if gate is None:
-            return None
-        if gate.dim() == 1:
-            return gate.unsqueeze(1).expand(-1, self.pred_len)
-        if gate.dim() == 2:
-            return gate
-        if gate.dim() > 2:
-            return gate.reshape(gate.shape[0], -1)[:, : self.pred_len]
-        if batch_size is not None:
-            return gate.reshape(batch_size, self.pred_len)
-        return gate
-
-    def _collapse_horizon_gate(self, gate):
-        if gate is None:
-            return None
-        if gate.dim() <= 1:
-            return gate.reshape(-1)
-        return gate.mean(dim=1)
-
-    def _resize_horizon_gate(self, gate, target_len):
-        if gate is None:
-            return None
-        if gate.dim() <= 1:
-            return gate.reshape(-1, 1).float().expand(-1, target_len)
-        if gate.shape[1] == target_len:
-            return gate.float()
-        gate = gate.float().unsqueeze(1)
-        resized = F.interpolate(gate, size=target_len, mode="linear", align_corners=False)
-        return resized.squeeze(1)
-
-    def _build_future_seq_weight(self, weight, total_len):
-        if weight is None:
-            return None
-        if weight.dim() == 1:
-            return weight[:, None, None]
-        seq_weight = torch.ones((weight.shape[0], total_len), device=weight.device, dtype=weight.dtype)
-        future_len = min(self.pred_len, total_len - self.lookback_len)
-        if future_len > 0:
-            seq_weight[:, self.lookback_len:self.lookback_len + future_len] = weight[:, :future_len]
-        return seq_weight.unsqueeze(1)
-
-    def _combine_text_evidence(self, text_evidence_vec, event_quality_summary):
-        base_evidence = None if text_evidence_vec is None else text_evidence_vec.float()
-        event_evidence = None if event_quality_summary is None else event_quality_summary.float()
-        if event_evidence is not None and base_evidence is not None:
-            return 0.4 * base_evidence + 0.6 * event_evidence
-        if event_evidence is not None:
-            return event_evidence
-        return base_evidence
-
-    def _expand_evidence_to_horizon(self, evidence_vec, batch_size=None, device=None):
-        if evidence_vec is None:
-            return None
-        evidence = evidence_vec.float().clamp(min=0.0, max=1.0)
-        if evidence.dim() == 1:
-            evidence = evidence.reshape(-1, 1)
-        if evidence.dim() == 2:
-            return evidence.unsqueeze(1).expand(-1, self.pred_len, -1)
-        if evidence.dim() == 3:
-            if evidence.shape[1] == self.pred_len:
-                return evidence
-            evidence = evidence.permute(0, 2, 1)
-            resized = F.interpolate(evidence, size=self.pred_len, mode="linear", align_corners=False)
-            return resized.permute(0, 2, 1).clamp(min=0.0, max=1.0)
-        if batch_size is None:
-            batch_size = evidence.shape[0]
-        if device is None:
-            device = evidence.device
-        return torch.zeros((batch_size, self.pred_len, 7), device=device, dtype=evidence.dtype)
-
-    def _build_horizon_evidence(self, base_evidence, text_event_quality_feats=None, text_event_time_deltas=None, text_event_mask=None):
-        fallback = self._expand_evidence_to_horizon(base_evidence)
-        if fallback is None:
-            return None
-        if text_event_quality_feats is None or text_event_time_deltas is None or text_event_mask is None:
-            return fallback
-        feats = text_event_quality_feats.float().clamp(min=1e-4, max=1.0)
-        mask = text_event_mask.float().clamp(min=0.0, max=1.0)
-        if feats.shape[-1] < 6 or not torch.any(mask > 0):
-            return fallback
-        horizon_index = torch.arange(self.pred_len, device=feats.device, dtype=feats.dtype).view(1, 1, -1)
-        event_time = text_event_time_deltas.float().unsqueeze(-1)
-        relevance = torch.exp(-torch.abs(event_time - horizon_index) / max(self.text_recency_tau_days, 1e-6))
-        source = feats[:, :, 0:1]
-        freshness = feats[:, :, 1:2]
-        informativeness = feats[:, :, 2:3]
-        novelty = feats[:, :, 3:4]
-        agreement = feats[:, :, 4:5]
-        event_score = feats[:, :, 5:6]
-        log_quality = (
-            torch.log(source)
-            + torch.log(freshness)
-            + torch.log(informativeness)
-            + torch.log(agreement)
-            + torch.log(event_score)
-        ) / 5.0
-        quality = torch.exp(log_quality).clamp(min=0.0, max=1.0)
-        relevance_4d = relevance.unsqueeze(-1)
-        event_mask_4d = mask.unsqueeze(-1).unsqueeze(-1)
-        quality_4d = quality.unsqueeze(2)
-        weight = quality_4d * relevance_4d * event_mask_4d
-        denom = weight.sum(dim=1).clamp(min=1e-6)
-        density = (relevance * mask.unsqueeze(-1)).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + self.text_coverage_kappa)
-        regime = fallback[:, :, 5:6]
-        event_evidence = torch.cat(
-            [
-                (weight * quality_4d).sum(dim=1) / denom,
-                density.unsqueeze(-1).clamp(min=0.0, max=1.0),
-                (weight * freshness.unsqueeze(2)).sum(dim=1) / denom,
-                (weight * novelty.unsqueeze(2)).sum(dim=1) / denom,
-                (weight * agreement.unsqueeze(2)).sum(dim=1) / denom,
-                regime,
-                (weight * event_score.unsqueeze(2)).sum(dim=1) / denom,
-            ],
-            dim=-1,
-        ).clamp(min=0.0, max=1.0)
-        valid = (mask.sum(dim=1) > 0).float().view(-1, 1, 1)
-        return torch.where(valid > 0, 0.4 * fallback + 0.6 * event_evidence, fallback).clamp(min=0.0, max=1.0)
-
-    def _compute_numeric_uncertainty(self, observed_data, cond_mask):
-        lookback_data = observed_data[:, :, :self.lookback_len].float()
-        lookback_mask = cond_mask[:, :, :self.lookback_len].float().clamp(min=0.0, max=1.0)
-        denom = lookback_mask.sum(dim=(1, 2)).clamp(min=1.0)
-        mean = (lookback_data * lookback_mask).sum(dim=(1, 2)) / denom
-        centered = (lookback_data - mean.view(-1, 1, 1)) * lookback_mask
-        std = torch.sqrt((centered ** 2).sum(dim=(1, 2)) / denom + 1e-6)
-        if self.lookback_len > 1:
-            diff = lookback_data[:, :, 1:] - lookback_data[:, :, :-1]
-            diff_mask = lookback_mask[:, :, 1:] * lookback_mask[:, :, :-1]
-            diff_denom = diff_mask.sum(dim=(1, 2)).clamp(min=1.0)
-            volatility = (diff.abs() * diff_mask).sum(dim=(1, 2)) / diff_denom
-            volatility = volatility / (std + 1e-6)
-        else:
-            volatility = torch.zeros_like(std)
-        mid = max(self.lookback_len // 2, 1)
-        early_mask = lookback_mask[:, :, :mid]
-        late_mask = lookback_mask[:, :, mid:]
-        early_denom = early_mask.sum(dim=(1, 2)).clamp(min=1.0)
-        late_denom = late_mask.sum(dim=(1, 2)).clamp(min=1.0)
-        early_mean = (lookback_data[:, :, :mid] * early_mask).sum(dim=(1, 2)) / early_denom
-        late_mean = (lookback_data[:, :, mid:] * late_mask).sum(dim=(1, 2)) / late_denom
-        regime = torch.abs(late_mean - early_mean) / (std + 1e-6)
-        base_uncertainty = torch.sigmoid(0.6 * volatility + 0.8 * regime - 1.0).view(-1, 1)
-        horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=observed_data.device, dtype=observed_data.dtype).view(1, -1)
-        return (0.7 * base_uncertainty + 0.3 * horizon_pos).clamp(min=0.0, max=1.0)
-
-    def _compute_context_gate(self, strength_gate, evidence_vec=None, numeric_uncertainty=None, trend_align=None):
-        if strength_gate is None:
-            return None
-        gate = self._ensure_horizon_gate(strength_gate.float(), self.pred_len).clamp(min=0.0, max=1.0)
-        if evidence_vec is None:
-            ratio = torch.full_like(gate, min(max(float(self.text_context_ratio_min), 0.0), 1.0))
-            dynamic_max = torch.full_like(gate, min(max(float(self.text_context_max_base), 0.0), 1.0))
-        else:
-            evidence = self._expand_evidence_to_horizon(evidence_vec).clamp(min=0.0, max=1.0)
-            quality = evidence[:, :, 0]
-            density = evidence[:, :, 1] if evidence.shape[-1] > 1 else quality
-            freshness = evidence[:, :, 2] if evidence.shape[-1] > 2 else quality
-            novelty = evidence[:, :, 3] if evidence.shape[-1] > 3 else quality
-            agreement = evidence[:, :, 4] if evidence.shape[-1] > 4 else quality
-            regime = evidence[:, :, 5] if evidence.shape[-1] > 5 else quality
-            event_score = evidence[:, :, 6] if evidence.shape[-1] > 6 else quality
-            temporal_support = (0.5 * density + 0.5 * freshness).clamp(min=0.0, max=1.0)
-            semantic_support = (0.5 * agreement + 0.5 * event_score).clamp(min=0.0, max=1.0)
-            if numeric_uncertainty is not None:
-                uncertainty = self._ensure_horizon_gate(numeric_uncertainty.float(), self.pred_len).clamp(min=0.0, max=1.0)
-                event_exception = (event_score * regime * uncertainty).clamp(min=0.0, max=1.0)
-            else:
-                uncertainty = torch.zeros_like(gate)
-                event_exception = torch.zeros_like(gate)
-            if trend_align is not None:
-                align = self._ensure_horizon_gate(trend_align.float(), self.pred_len).clamp(min=0.0, max=1.0)
-                alignment_support = torch.maximum(align, event_exception)
-            else:
-                alignment_support = 0.5 + 0.5 * event_exception
-            risk_adjusted = (
-                quality
-                * (0.35 + 0.65 * temporal_support)
-                * (0.5 + 0.5 * agreement)
-                * (0.6 + 0.4 * novelty)
-                * (0.5 + 0.5 * event_score)
-                * (0.7 + 0.3 * regime)
-                * (0.5 + 0.5 * uncertainty)
-                * (0.4 + 0.6 * alignment_support)
-            ).clamp(min=0.0, max=1.0)
-            ratio_min = min(max(float(self.text_context_ratio_min), 0.0), 1.0)
-            ratio_max = min(max(float(self.text_context_ratio_max), ratio_min), 1.0)
-            ratio = ratio_min + (ratio_max - ratio_min) * risk_adjusted
-            dynamic_max = max(float(self.text_context_max_base), 0.0) + max(float(self.text_context_max_boost), 0.0) * (
-                quality * temporal_support * semantic_support * (0.5 + 0.5 * alignment_support)
-            )
-            dynamic_max = dynamic_max.clamp(min=0.0, max=1.0)
-        if self.text_context_horizon_bias != 0.0:
-            horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=gate.device, dtype=gate.dtype).view(1, -1)
-            horizon_bias = (1.0 + self.text_context_horizon_bias * (0.5 - horizon_pos)).clamp(min=0.0)
-            ratio = ratio * horizon_bias
-        context_gate = gate * ratio
-        context_gate = torch.minimum(context_gate, dynamic_max)
-        return context_gate.clamp(min=0.0, max=1.0)
-
-    def _compute_guide_gate(self, strength_gate, evidence_vec=None, trend_align=None):
-        if strength_gate is None:
-            return None
-        gate = self._ensure_horizon_gate(strength_gate.float(), self.pred_len).clamp(min=0.0, max=1.0)
-        if evidence_vec is None:
-            ratio = torch.full_like(gate, min(max(float(self.text_guide_ratio_max), 0.0), 1.0))
-            dynamic_max = torch.full_like(gate, min(max(float(self.text_guide_max_base), 0.0), 1.0))
-        else:
-            evidence = evidence_vec.float().clamp(min=0.0, max=1.0)
-            if evidence.dim() == 1:
-                evidence = evidence.reshape(-1, 1)
-            quality = evidence[:, 0:1]
-            density = evidence[:, 1:2] if evidence.shape[1] > 1 else quality
-            freshness = evidence[:, 2:3] if evidence.shape[1] > 2 else quality
-            agreement = evidence[:, 4:5] if evidence.shape[1] > 4 else quality
-            event_score = evidence[:, 6:7] if evidence.shape[1] > 6 else quality
-            source_support = torch.sqrt((agreement * event_score).clamp(min=0.0, max=1.0))
-            temporal_support = ((0.25 + 0.75 * freshness) * (0.25 + 0.75 * density)).clamp(min=0.0, max=1.0)
-            strict_quality = (quality * source_support * temporal_support).clamp(min=0.0, max=1.0)
-            quality_power = max(float(self.text_guide_quality_power), 1e-6)
-            ratio_max = min(max(float(self.text_guide_ratio_max), 0.0), 1.0)
-            ratio = ratio_max * strict_quality.pow(quality_power)
-            dynamic_max = max(float(self.text_guide_max_base), 0.0) + max(float(self.text_guide_max_boost), 0.0) * (
-                quality * source_support * freshness
-            )
-            ratio = ratio.expand(-1, self.pred_len)
-            dynamic_max = dynamic_max.expand(-1, self.pred_len).clamp(min=0.0, max=1.0)
-        if trend_align is not None:
-            align = self._ensure_horizon_gate(trend_align.float(), self.pred_len).clamp(min=0.0, max=1.0)
-            ratio = ratio * align
-            dynamic_max = dynamic_max * (0.25 + 0.75 * align)
-        guide_gate = gate * ratio
-        guide_gate = torch.minimum(guide_gate, dynamic_max)
-        return guide_gate.clamp(min=0.0, max=1.0)
-
-    def _compute_horizon_quality_prior(self, text_event_quality_feats, text_event_time_deltas, text_event_mask, fallback_quality):
-        fallback = fallback_quality.reshape(-1, 1).float().clamp(0.0, 1.0).expand(-1, self.pred_len)
-        if text_event_quality_feats is None or text_event_time_deltas is None or text_event_mask is None:
-            return fallback
-        quality_feats = text_event_quality_feats.float().clamp(min=0.0, max=1.0)
-        event_mask = text_event_mask.float().clamp(min=0.0, max=1.0)
-        event_strength = quality_feats.mean(dim=-1) * event_mask
-        horizon_index = torch.arange(self.pred_len, device=quality_feats.device, dtype=quality_feats.dtype).view(1, 1, -1)
-        event_time = text_event_time_deltas.float().unsqueeze(-1)
-        relevance = torch.exp(-torch.abs(event_time - horizon_index) / max(self.text_recency_tau_days, 1e-6))
-        weighted = event_strength.unsqueeze(-1) * relevance
-        denom = (relevance * event_mask.unsqueeze(-1)).sum(dim=1).clamp(min=1e-6)
-        horizon_prior = weighted.sum(dim=1) / denom
-        return torch.maximum(horizon_prior.clamp(0.0, 1.0), fallback)
-
-    def _build_horizon_trend_priors(self, trend_prior_num, trend_prior_text, semantic_state, text_mask=None):
-        if trend_prior_num is None and trend_prior_text is None:
-            return None, None
-        if trend_prior_num is None:
-            trend_prior_num = trend_prior_text
-        if trend_prior_text is None:
-            trend_prior_text = trend_prior_num
-        num_prior = trend_prior_num.float().unsqueeze(1).expand(-1, self.pred_len, -1)
-        text_prior = trend_prior_text.float().unsqueeze(1).expand(-1, self.pred_len, -1)
-        if semantic_state is not None and hasattr(self, "semantic_to_trend"):
-            semantic_delta = self.semantic_to_trend(semantic_state.float()).reshape(-1, self.pred_len, 3)
-            semantic_delta = torch.tanh(semantic_delta)
-            semantic_delta = torch.cat(
-                [
-                    semantic_delta[:, :, :1],
-                    0.5 * semantic_delta[:, :, 1:],
-                ],
-                dim=-1,
-            )
-            text_prior = text_prior + self.semantic_trend_scale * semantic_delta
-            text_prior = torch.cat(
-                [
-                    text_prior[:, :, :1],
-                    text_prior[:, :, 1:].clamp(min=0.0),
-                ],
-                dim=-1,
-            )
-        diff = torch.abs(text_prior - num_prior).sum(dim=-1)
-        align = torch.exp(-self.text_numeric_align_gamma * diff).clamp(0.0, 1.0)
-        if text_mask is not None:
-            align = align * self._ensure_horizon_gate(text_mask).float().clamp(0.0, 1.0)
-        fused = align.unsqueeze(-1) * text_prior + (1.0 - align).unsqueeze(-1) * num_prior
-        return fused, align
-
     def _reshape_text_event_batch(self, event_texts, batch_size):
         if event_texts is None:
             return None
@@ -1861,221 +1350,8 @@ class CSDI_Forecasting(CSDI_base):
             return [[str(item) for item in row] for row in transposed]
         return None
 
-    def _encode_event_texts(self, text_event_texts, text_event_mask):
-        if not self.with_texts or text_event_texts is None or text_event_mask is None:
-            return None
-        batch_size = len(text_event_texts)
-        if batch_size <= 0:
-            return None
-        event_count = len(text_event_texts[0]) if len(text_event_texts[0]) > 0 else 0
-        if event_count <= 0:
-            return None
-        flat_texts = []
-        for row in text_event_texts:
-            if len(row) != event_count:
-                row = list(row) + ["NA"] * max(event_count - len(row), 0)
-                row = row[:event_count]
-            flat_texts.extend(row)
-        _, pooled, _ = self._encode_text_source_with_options(
-            flat_texts,
-            max_length=self.event_text_max_length,
-            return_sequence=False,
-        )
-        pooled = pooled.reshape(batch_size, event_count, -1)
-        if text_event_mask is not None:
-            pooled = pooled * text_event_mask.unsqueeze(-1).float()
-        return pooled
-
-    def _compute_event_quality_scores(self, text_event_quality_feats, text_event_mask):
-        if text_event_quality_feats is None or text_event_mask is None:
-            return None
-        feats = text_event_quality_feats.float().clamp(min=1e-4, max=1.0)
-        log_score = torch.log(feats).mean(dim=-1)
-        log_score = log_score + torch.log(text_event_mask.float().clamp(min=1e-4))
-        masked_log_score = log_score.masked_fill(text_event_mask <= 0, float("-inf"))
-        all_invalid = (text_event_mask.sum(dim=1) <= 0)
-        if all_invalid.any():
-            masked_log_score = masked_log_score.clone()
-            masked_log_score[all_invalid] = 0.0
-        scores = torch.softmax(self.event_quality_beta * masked_log_score, dim=1)
-        scores = scores * text_event_mask.float()
-        denom = scores.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        return scores / denom
-
-    def _summarize_event_quality(self, text_event_quality_feats, event_scores, text_event_mask, base_evidence=None):
-        if text_event_quality_feats is None or event_scores is None or text_event_mask is None:
-            return base_evidence
-        feats = text_event_quality_feats.float()
-        mask = text_event_mask.float()
-        weights = event_scores * mask
-        denom = weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        weighted = (weights.unsqueeze(-1) * feats).sum(dim=1) / denom
-        density = (mask.sum(dim=1) / float(mask.shape[1])).clamp(0.0, 1.0)
-        mean_score = (weights * feats.mean(dim=-1)).sum(dim=1) / denom.squeeze(1)
-        regime = torch.zeros_like(mean_score)
-        event_strength = weighted[:, 5]
-        if base_evidence is not None and base_evidence.shape[1] >= 7:
-            regime = base_evidence[:, 5].float().clamp(0.0, 1.0)
-            event_strength = 0.5 * event_strength + 0.5 * base_evidence[:, 6].float().clamp(0.0, 1.0)
-        return torch.stack(
-            [
-                mean_score.clamp(0.0, 1.0),
-                density,
-                weighted[:, 1].clamp(0.0, 1.0),
-                weighted[:, 3].clamp(0.0, 1.0),
-                weighted[:, 4].clamp(0.0, 1.0),
-                regime,
-                event_strength.clamp(0.0, 1.0),
-            ],
-            dim=1,
-        )
-
-    def _build_event_semantic_state(self, text_event_texts, text_event_source_ids, text_event_quality_feats, text_event_mask, base_evidence=None):
-        if (
-            not self.with_texts
-            or text_event_texts is None
-            or text_event_source_ids is None
-            or text_event_quality_feats is None
-            or text_event_mask is None
-        ):
-            return None, base_evidence
-        event_pooled = self._encode_event_texts(text_event_texts, text_event_mask)
-        if event_pooled is None:
-            return None, base_evidence
-        source_emb = self.event_source_embed(text_event_source_ids.long().clamp(min=0, max=2))
-        event_features = torch.cat(
-            [
-                event_pooled.float(),
-                source_emb.float(),
-                text_event_quality_feats.float(),
-            ],
-            dim=-1,
-        )
-        event_semantics = self.event_semantic_proj(event_features)
-        event_scores = self._compute_event_quality_scores(text_event_quality_feats, text_event_mask)
-        if event_scores is None:
-            return None, base_evidence
-        semantic_state = (event_scores.unsqueeze(-1) * event_semantics).sum(dim=1)
-        event_summary = self._summarize_event_quality(
-            text_event_quality_feats,
-            event_scores,
-            text_event_mask,
-            base_evidence=base_evidence,
-        )
-        return semantic_state, event_summary
-
-    def _compute_text_gates(self, text_evidence_vec, text_mask=None, text_pooled=None, trend_prior_num=None, trend_prior_text=None, event_semantic_state=None, event_quality_summary=None, text_event_quality_feats=None, text_event_time_deltas=None, text_event_mask=None):
-        if (text_evidence_vec is None and event_quality_summary is None) or not self.with_texts:
-            use_gate = text_mask
-            strength_gate = text_mask
-            self._update_reliability_debug(use_gate, strength_gate, None)
-            return use_gate, strength_gate, None
-        evidence = self._combine_text_evidence(text_evidence_vec, event_quality_summary)
-        if text_mask is not None:
-            text_mask = text_mask.reshape(-1).float().clamp(0.0, 1.0)
-        base_quality = evidence[:, 0].clamp(0.0, 1.0)
-        if text_mask is not None:
-            base_quality = base_quality * text_mask
-        horizon_quality_prior = self._compute_horizon_quality_prior(
-            text_event_quality_feats,
-            text_event_time_deltas,
-            text_event_mask,
-            base_quality,
-        )
-        if text_mask is not None:
-            horizon_quality_prior = horizon_quality_prior * text_mask.unsqueeze(1)
-
-        semantic_state = event_semantic_state
-        if semantic_state is None and text_pooled is not None:
-            semantic_state = self.semantic_proj(text_pooled.float())
-
-        raw_use_gate = torch.sigmoid(self.use_gate_head(evidence))
-        raw_use_gate = self.reliability_min + (1.0 - self.reliability_min) * raw_use_gate
-        use_scale = self._get_gate_warmup_scale("use")
-        use_gate = (1.0 - use_scale) * horizon_quality_prior + use_scale * raw_use_gate
-        use_gate = self.use_gate_min + (1.0 - self.use_gate_min) * use_gate
-        if text_mask is not None:
-            use_gate = use_gate * text_mask.unsqueeze(1)
-
-        if trend_prior_num is None:
-            trend_prior_num = torch.zeros((evidence.shape[0], 3), device=evidence.device)
-        if trend_prior_text is None:
-            trend_prior_text = trend_prior_num
-        if semantic_state is None:
-            semantic_state = torch.zeros((evidence.shape[0], self.semantic_dim), device=evidence.device)
-
-        strength_features = torch.cat(
-            [
-                evidence,
-                semantic_state,
-                trend_prior_num.float(),
-                trend_prior_text.float(),
-            ],
-            dim=1,
-        )
-        raw_strength_gate = torch.sigmoid(self.strength_gate_head(strength_features))
-        raw_strength_gate = self.reliability_min + (1.0 - self.reliability_min) * raw_strength_gate
-        strength_scale = self._get_gate_warmup_scale("strength")
-        strength_gate = (1.0 - strength_scale) * horizon_quality_prior + strength_scale * raw_strength_gate
-        use_floor = min(max(self.strength_use_mix_floor, 0.0), 1.0)
-        strength_gate = strength_gate * (use_floor + (1.0 - use_floor) * use_gate)
-        if self.horizon_strength_bias != 0.0:
-            horizon_pos = torch.linspace(0.0, 1.0, self.pred_len, device=strength_gate.device, dtype=strength_gate.dtype).view(1, -1)
-            bias = (1.0 + self.horizon_strength_bias * (0.5 - horizon_pos)).clamp(min=0.0)
-            strength_gate = strength_gate * bias
-        strength_gate = self.strength_gate_min + (1.0 - self.strength_gate_min) * strength_gate
-        if text_mask is not None:
-            strength_gate = strength_gate * text_mask.unsqueeze(1)
-        strength_gate = strength_gate.clamp(min=0.0, max=1.0)
-
-        self._update_reliability_debug(use_gate, strength_gate, evidence)
-        return use_gate, strength_gate, semantic_state
-
-    def get_trend_guidance_weight(self, trend_prior, step_ratio, guide_w, text_mask=None):
-        base_weight = self._to_samplewise_weight(guide_w, trend_prior.shape[0], trend_prior.device)
-        if trend_prior.dim() == 3:
-            strength = trend_prior[:, :, 1].clamp(min=0.0)
-            volatility = trend_prior[:, :, 2].clamp(min=0.0) * self.trend_volatility_scale
-            base_weight = base_weight.unsqueeze(1).expand(-1, trend_prior.shape[1])
-        else:
-            strength = trend_prior[:, 1].clamp(min=0.0)
-            volatility = trend_prior[:, 2].clamp(min=0.0) * self.trend_volatility_scale
-        strength = 1.0 + self.trend_strength_scale * (strength - 1.0)
-        strength = strength.clamp(min=0.0)
-        vol_penalty = 1.0 / (1.0 + volatility)
-        weight = base_weight * step_ratio * strength * vol_penalty
-        if text_mask is not None:
-            weight = weight * text_mask
-        return weight
-
-    def sample_random_trend_prior(self, batch_size, device):
-        direction = torch.randint(0, 3, (batch_size,), device=device).float() - 1.0
-        strength_choices = torch.tensor([0.5, 1.0, 1.5], device=device)
-        volatility_choices = torch.tensor([0.0, 0.5, 1.0], device=device)
-        strength = strength_choices[torch.randint(0, 3, (batch_size,), device=device)]
-        volatility = volatility_choices[torch.randint(0, 3, (batch_size,), device=device)]
-        return torch.stack([direction, strength, volatility], dim=1)
-
-    def fuse_trend_priors(self, trend_prior_num, trend_prior_text, text_mask=None):
-        if trend_prior_num is None and trend_prior_text is None:
-            return None, None
-        if trend_prior_num is None:
-            trend_prior_num = trend_prior_text
-        if trend_prior_text is None:
-            trend_prior_text = trend_prior_num
-        diff = torch.abs(trend_prior_text - trend_prior_num).sum(dim=1)
-        align = torch.exp(-self.text_numeric_align_gamma * diff).clamp(0.0, 1.0)
-        if text_mask is not None:
-            if text_mask.dim() > 1:
-                align = align.unsqueeze(1) * text_mask.float().clamp(0.0, 1.0)
-                fused = align.unsqueeze(-1) * trend_prior_text.unsqueeze(1) + (1.0 - align).unsqueeze(-1) * trend_prior_num.unsqueeze(1)
-                return fused, align
-            align = align * text_mask.reshape(-1).float().clamp(0.0, 1.0)
-        fused = align.unsqueeze(1) * trend_prior_text + (1.0 - align).unsqueeze(1) * trend_prior_num
-        return fused, align
-    
     def _encode_text_source(self, text):
-        return self._encode_text_source_with_options(text, max_length=self.text_max_length, return_sequence=True)
+        return self._encode_text_source_with_options(text, max_length=self.text_max_length, return_sequence=False)
 
     def _encode_text_source_with_options(self, text, max_length=None, return_sequence=True):
         if isinstance(text, str):
@@ -2119,277 +1395,6 @@ class CSDI_Forecasting(CSDI_base):
         }
         return encoded_text, pooled_text, token_input
 
-    def _build_text_context(self, encoded_text, text_scale):
-        if encoded_text is None or text_scale is None:
-            return None
-        token_scale = self._resize_horizon_gate(text_scale, encoded_text.shape[1]).clamp(min=0.0, max=1.0)
-        context = encoded_text * token_scale.unsqueeze(-1)
-        return context.permute(0, 2, 1)
-
-    def _summarize_numeric_context(self, observed_data, cond_mask):
-        lookback = observed_data[:, :, :self.lookback_len]
-        lookback_mask = cond_mask[:, :, :self.lookback_len]
-        denom = lookback_mask.sum(dim=2).clamp(min=1.0)
-        mean = (lookback * lookback_mask).sum(dim=2) / denom
-        centered = (lookback - mean.unsqueeze(2)) * lookback_mask
-        std = torch.sqrt((centered ** 2).sum(dim=2) / denom + 1e-6)
-        first = lookback[:, :, 0]
-        last = lookback[:, :, self.lookback_len - 1]
-        slope = last - first
-        mean_abs = (lookback.abs() * lookback_mask).sum(dim=2) / denom
-        return torch.stack(
-            [
-                mean.mean(dim=1),
-                std.mean(dim=1),
-                slope.mean(dim=1),
-                mean_abs.mean(dim=1),
-            ],
-            dim=1,
-        )
-
-    def _summarize_timestep_context(self, timesteps):
-        if timesteps is None:
-            return None
-        lookback = timesteps[:, :, :self.lookback_len].float()
-        mean = lookback.mean(dim=(1, 2))
-        std = lookback.std(dim=(1, 2), unbiased=False)
-        first = lookback[:, :, 0].mean(dim=1)
-        last = lookback[:, :, -1].mean(dim=1)
-        return torch.stack([mean, std, first, last], dim=1)
-
-    def _build_text_aux_features(self, observed_data, cond_mask, text_mask, domain_text_coverage=None, event_quality_summary=None):
-        batch_size = observed_data.shape[0]
-        numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
-        if event_quality_summary is None:
-            event_quality_summary = torch.zeros((batch_size, 7), device=observed_data.device, dtype=observed_data.dtype)
-        else:
-            event_quality_summary = event_quality_summary.float()
-        if text_mask is None:
-            text_quality = torch.zeros((batch_size, 1), device=observed_data.device, dtype=observed_data.dtype)
-        else:
-            text_quality = text_mask.reshape(-1, 1).float().clamp(0.0, 1.0)
-        if domain_text_coverage is None:
-            coverage = torch.ones((batch_size, 1), device=observed_data.device, dtype=observed_data.dtype)
-        else:
-            coverage = domain_text_coverage.reshape(-1, 1).float().clamp(0.0, 1.0)
-        return torch.cat(
-            [
-                numeric_summary,
-                event_quality_summary,
-                text_quality,
-                coverage,
-            ],
-            dim=1,
-        )
-
-    def _build_calendar_features(self, observed_data, cond_mask, timesteps):
-        batch_size = observed_data.shape[0]
-        numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
-        time_summary = self._summarize_timestep_context(timesteps)
-        if time_summary is None:
-            time_summary = torch.zeros((batch_size, 4), device=observed_data.device, dtype=observed_data.dtype)
-        return torch.cat([numeric_summary, time_summary], dim=1)
-
-    def _basis_to_residual(self, coeffs, scale):
-        coeffs = coeffs.float()
-        basis = self.aux_residual_basis.to(device=coeffs.device, dtype=coeffs.dtype)
-        residual = torch.matmul(coeffs, basis[:, : coeffs.shape[-1]].transpose(0, 1))
-        return float(scale) * torch.tanh(residual)
-
-    def _compute_calendar_adjustment(self, observed_data, cond_mask, timesteps):
-        if (not self.use_calendar_residual) or timesteps is None:
-            return None, None
-        calendar_features = self._build_calendar_features(observed_data, cond_mask, timesteps)
-        calendar_utility = torch.sigmoid(self.calendar_utility_head(calendar_features))
-        calendar_coeffs = self.calendar_residual_head(calendar_features)
-        calendar_residual = self._basis_to_residual(calendar_coeffs, self.calendar_residual_scale)
-        return calendar_utility.clamp(0.0, 1.0), calendar_residual
-
-    def _compute_text_adjustment(self, observed_data, cond_mask, text_pooled, text_mask, domain_text_coverage=None, event_quality_summary=None, event_semantic_state=None):
-        if (not self.use_text_residual) or (not self.with_texts) or text_pooled is None:
-            return None, None
-        aux_features = self._build_text_aux_features(
-            observed_data,
-            cond_mask,
-            text_mask,
-            domain_text_coverage=domain_text_coverage,
-            event_quality_summary=event_quality_summary,
-        )
-        utility_input = torch.cat([text_pooled.float(), aux_features], dim=1)
-        text_utility = torch.sigmoid(self.text_utility_head(utility_input))
-        availability = aux_features[:, -2:-1] * aux_features[:, -1:]
-        text_utility = text_utility * availability
-        if event_semantic_state is None:
-            event_semantic_state = torch.zeros(
-                (text_pooled.shape[0], self.semantic_dim),
-                device=text_pooled.device,
-                dtype=text_pooled.dtype,
-            )
-        residual_input = torch.cat([text_pooled.float(), event_semantic_state.float(), aux_features], dim=1)
-        text_coeffs = self.text_residual_head(residual_input)
-        text_residual = self._basis_to_residual(text_coeffs, self.text_residual_scale)
-        if text_mask is not None:
-            text_residual = text_residual * text_mask.reshape(-1, 1).float().clamp(0.0, 1.0)
-        return text_utility.clamp(0.0, 1.0), text_residual
-
-    def _apply_aux_residual(self, predicted_base, text_utility=None, text_residual=None, calendar_utility=None, calendar_residual=None):
-        predicted = self._apply_text_residual(predicted_base, calendar_utility, calendar_residual)
-        predicted = self._apply_text_residual(predicted, text_utility, text_residual)
-        return predicted
-
-    def _apply_text_residual(self, predicted_base, text_utility, text_residual):
-        if predicted_base is None or text_utility is None or text_residual is None:
-            return predicted_base
-        future_len = min(self.pred_len, predicted_base.shape[-1] - self.lookback_len)
-        if future_len <= 0:
-            return predicted_base
-        utility = self._ensure_horizon_gate(text_utility.float()).clamp(min=0.0, max=1.0)[:, :future_len]
-        if text_residual.dim() == 2:
-            residual = text_residual[:, :future_len].unsqueeze(1)
-        elif text_residual.dim() == 3:
-            residual = text_residual[:, :, :future_len]
-        else:
-            residual = text_residual.reshape(text_residual.shape[0], 1, -1)[:, :, :future_len]
-        correction = utility.unsqueeze(1) * residual
-        predicted = predicted_base.clone()
-        future_slice = slice(self.lookback_len, self.lookback_len + future_len)
-        predicted[:, :, future_slice] = predicted[:, :, future_slice] + correction
-        return predicted
-
-    def _calc_aux_utility_loss(self, predicted_base, observed_data, target_mask, utility, residual, update_debug=False):
-        gate = self._ensure_horizon_gate(utility)
-        if gate is None or residual is None:
-            return torch.zeros((), device=predicted_base.device)
-        with torch.no_grad():
-            candidate_gate = torch.ones_like(gate)
-            candidate = self._apply_text_residual(predicted_base.detach(), candidate_gate, residual.detach())
-            candidate_loss = self._calc_per_horizon_forecast_loss(candidate, observed_data, target_mask)
-            base_loss = self._calc_per_horizon_forecast_loss(predicted_base.detach(), observed_data, target_mask)
-        tau = max(float(self.text_utility_tau), 1e-6)
-        gain = base_loss - candidate_loss
-        positive = (gain > max(float(self.text_use_margin), 0.0)).float()
-        target = torch.sigmoid(gain / tau) * positive
-        valid = target_mask[:, :, self.lookback_len:self.lookback_len + self.pred_len].sum(dim=1) > 0
-        if not valid.any():
-            return torch.zeros((), device=predicted_base.device)
-        gate = gate[valid].float().clamp(min=1e-4, max=1.0 - 1e-4)
-        target = target[valid].float().clamp(min=0.0, max=1.0)
-        if update_debug:
-            self._update_text_benefit_debug(gate.detach(), target.detach(), candidate_loss.detach(), base_loss.detach())
-        return F.binary_cross_entropy(gate, target)
-
-    def _calc_aux_residual_reg(self, utility, residual, device):
-        if utility is None or residual is None:
-            zero = torch.zeros((), device=device)
-            return zero, zero
-        future_len = min(self.pred_len, residual.shape[-1])
-        if future_len <= 0:
-            zero = torch.zeros((), device=device)
-            return zero, zero
-        gate = self._ensure_horizon_gate(utility.float()).clamp(min=0.0, max=1.0)[:, :future_len]
-        if residual.dim() == 2:
-            residual_seq = residual[:, :future_len].unsqueeze(1)
-        elif residual.dim() == 3:
-            residual_seq = residual[:, :, :future_len]
-        else:
-            residual_seq = residual.reshape(residual.shape[0], 1, -1)[:, :, :future_len]
-        applied = gate.unsqueeze(1) * residual_seq
-        mag_loss = applied.pow(2).mean()
-        if future_len <= 1:
-            smooth_loss = torch.zeros((), device=device)
-        else:
-            smooth_loss = (applied[:, :, 1:] - applied[:, :, :-1]).pow(2).mean()
-        return mag_loss, smooth_loss
-
-    def _compute_text_benefit_gate(self, observed_data, cond_mask, text_pooled, text_mask, trend_align, domain_coverage=None):
-        if text_pooled is None or text_mask is None:
-            return None
-        numeric_summary = self._summarize_numeric_context(observed_data, cond_mask)
-        quality = text_mask.reshape(-1, 1).float().clamp(0.0, 1.0)
-        if trend_align is None:
-            trend_align = torch.ones_like(quality.squeeze(1))
-        align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
-        if domain_coverage is None:
-            domain_coverage = torch.ones(text_pooled.shape[0], device=text_pooled.device)
-        cov = domain_coverage.reshape(-1, 1).float().clamp(0.0, 1.0)
-        benefit_input = torch.cat([numeric_summary, text_pooled, quality, align, cov], dim=1)
-        benefit_gate = torch.sigmoid(self.text_benefit_head(benefit_input)).reshape(-1)
-        coverage_cap = domain_coverage.reshape(-1).float().clamp(0.0, 1.0).pow(self.coverage_power)
-        benefit_gate = benefit_gate * coverage_cap
-        return benefit_gate
-
-    def _get_aug_inputs(self, batch):
-        text_ret = batch.get("text_ret", batch.get("retrieved_text"))
-        text_cot = batch.get("text_cot", batch.get("cot_text"))
-        quality_ret = batch.get("text_quality_ret")
-        quality_cot = batch.get("text_quality_cot")
-        if quality_ret is not None:
-            quality_ret = quality_ret.to(self.device).float().reshape(-1)
-        if quality_cot is not None:
-            quality_cot = quality_cot.to(self.device).float().reshape(-1)
-        return text_ret, text_cot, quality_ret, quality_cot
-
-    def _build_augmented_context(
-        self,
-        batch,
-        context_raw,
-        raw_gate,
-        trend_prior_num,
-        trend_prior_text,
-        trend_align,
-        raw_token_len,
-    ):
-        if context_raw is None or raw_gate is None or raw_token_len is None:
-            return context_raw, None
-        text_ret, text_cot, quality_ret, quality_cot = self._get_aug_inputs(batch)
-        if text_ret is None or text_cot is None or quality_ret is None or quality_cot is None:
-            return context_raw, None
-        _, pooled_ret, _ = self._encode_text_source(text_ret)
-        _, pooled_cot, _ = self._encode_text_source(text_cot)
-        if trend_prior_num is None:
-            trend_prior_num = torch.zeros((pooled_ret.shape[0], 3), device=self.device)
-        if trend_prior_text is None:
-            trend_prior_text = trend_prior_num
-        if trend_align is None:
-            trend_align = torch.ones((pooled_ret.shape[0],), device=self.device)
-        if trend_align.dim() > 1:
-            align = trend_align.mean(dim=1, keepdim=True).float().clamp(0.0, 1.0)
-        else:
-            align = trend_align.reshape(-1, 1).float().clamp(0.0, 1.0)
-        q_ret = quality_ret.reshape(-1, 1).float().clamp(0.0, 1.0)
-        q_cot = quality_cot.reshape(-1, 1).float().clamp(0.0, 1.0)
-        aug_features = torch.cat(
-            [
-                pooled_ret,
-                pooled_cot,
-                trend_prior_text.float(),
-                trend_prior_num.float(),
-                q_ret,
-                q_cot,
-                align,
-            ],
-            dim=1,
-        )
-        aug_base_gate = torch.sigmoid(self.text_aug_gate_head(aug_features)).reshape(-1)
-        aug_available = torch.maximum(q_ret.reshape(-1), q_cot.reshape(-1))
-        token_gate = self._resize_horizon_gate(raw_gate, raw_token_len).clamp(min=0.0, max=1.0)
-        aug_gate = self.text_aug_max_ratio * token_gate * aug_base_gate.unsqueeze(1) * aug_available.unsqueeze(1)
-        if torch.all(aug_gate <= 0):
-            return context_raw, aug_gate
-        aug_residual = self.text_aug_adapter(aug_features)
-        aug_residual = aug_residual.unsqueeze(2).expand(-1, self.text_hidden_dim, raw_token_len)
-        context_aug = context_raw + aug_gate.unsqueeze(1) * aug_residual
-        return context_aug, aug_gate
-
-    def get_text_info(self, text, text_mask):
-        encoded_text, _, token_input = self._encode_text_source(text)
-        context = self._build_text_context(encoded_text, text_mask)
-        if self.save_token:
-            tokens_str = self.tokenizer.batch_decode(token_input['input_ids'])
-            return context, tokens_str
-        else:
-            return context
-
     def get_side_info(self, observed_tp, cond_mask, feature_id=None, timesteps=None, texts=None):
         B, K, L = cond_mask.shape
 
@@ -2422,12 +1427,13 @@ class CSDI_Forecasting(CSDI_base):
         texts = unpacked["texts"]
         text_mask = unpacked["text_mask"]
         trend_prior_num = unpacked["trend_prior_num"]
+        trend_prior_text = unpacked["trend_prior_text"]
+        text_evidence_vec = unpacked["text_evidence_vec"]
         text_event_texts = unpacked["text_event_texts"]
         text_event_source_ids = unpacked["text_event_source_ids"]
         text_event_time_deltas = unpacked["text_event_time_deltas"]
         text_event_quality_feats = unpacked["text_event_quality_feats"]
         text_event_mask = unpacked["text_event_mask"]
-        domain_text_coverage = unpacked["domain_text_coverage"]
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
@@ -2454,35 +1460,10 @@ class CSDI_Forecasting(CSDI_base):
         else:
             size_emb = None
 
-        calendar_utility, calendar_residual = self._compute_calendar_adjustment(
-            observed_data,
-            cond_mask,
-            timesteps,
-        )
-
         if self.with_texts:
             _, text_pooled, _ = self._encode_text_source(texts)
-            event_semantic_state, event_quality_summary = self._build_event_semantic_state(
-                text_event_texts,
-                text_event_source_ids,
-                text_event_quality_feats,
-                text_event_mask,
-                base_evidence=None,
-            )
-            text_utility, text_residual = self._compute_text_adjustment(
-                observed_data,
-                cond_mask,
-                text_pooled,
-                text_mask,
-                domain_text_coverage=domain_text_coverage,
-                event_quality_summary=event_quality_summary,
-                event_semantic_state=event_semantic_state,
-            )
         else:
-            text_utility = None
-            text_residual = None
-
-        trend_prior_for_multires = trend_prior_num
+            text_pooled = None
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
@@ -2496,12 +1477,10 @@ class CSDI_Forecasting(CSDI_base):
             timestep_emb=timestep_emb,
             size_emb=size_emb,
             context=None,
-            trend_prior=trend_prior_for_multires,
-            text_mask=text_mask,
-            text_utility=text_utility,
-            text_residual=text_residual,
-            calendar_utility=calendar_utility,
-            calendar_residual=calendar_residual,
+            trend_prior=trend_prior_num,
+            pattern_text_pooled=text_pooled,
+            pattern_text_mask=text_mask,
+            pattern_text_evidence_vec=text_evidence_vec,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -2512,12 +1491,13 @@ class CSDI_Forecasting(CSDI_base):
         texts = unpacked["texts"]
         text_mask = unpacked["text_mask"]
         trend_prior_num = unpacked["trend_prior_num"]
+        trend_prior_text = unpacked["trend_prior_text"]
+        text_evidence_vec = unpacked["text_evidence_vec"]
         text_event_texts = unpacked["text_event_texts"]
         text_event_source_ids = unpacked["text_event_source_ids"]
         text_event_time_deltas = unpacked["text_event_time_deltas"]
         text_event_quality_feats = unpacked["text_event_quality_feats"]
         text_event_mask = unpacked["text_event_mask"]
-        domain_text_coverage = unpacked["domain_text_coverage"]
 
         with torch.no_grad():
             cond_mask = gt_mask
@@ -2535,39 +1515,17 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 size_emb = None
 
-            calendar_utility, calendar_residual = self._compute_calendar_adjustment(
-                observed_data,
-                cond_mask,
-                timesteps,
-            )
-
+            tokens = None
             if self.with_texts:
                 _, text_pooled, token_input = self._encode_text_source(texts)
-                event_semantic_state, event_quality_summary = self._build_event_semantic_state(
-                    text_event_texts,
-                    text_event_source_ids,
-                    text_event_quality_feats,
-                    text_event_mask,
-                    base_evidence=None,
-                )
-                text_utility, text_residual = self._compute_text_adjustment(
-                    observed_data,
-                    cond_mask,
-                    text_pooled,
-                    text_mask,
-                    domain_text_coverage=domain_text_coverage,
-                    event_quality_summary=event_quality_summary,
-                    event_semantic_state=event_semantic_state,
-                )
                 if self.save_token:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
-                text_utility = None
-                text_residual = None
+                text_pooled = None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, trend_prior=trend_prior_num, text_mask=text_mask, text_utility=text_utility, text_residual=text_residual, calendar_utility=calendar_utility, calendar_residual=calendar_residual)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, trend_prior=trend_prior_num, text_mask=text_mask, text_utility=text_utility, text_residual=text_residual, calendar_utility=calendar_utility, calendar_residual=calendar_residual)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec)
 
         if self.save_attn:
             if self.save_token:

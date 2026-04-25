@@ -62,7 +62,6 @@ class Dataset_Custom(Dataset):
                  two_stage_gate=True, trend_slope_eps=1e-3,
                  aug_noise_std=0.0, aug_time_warp_prob=0.0,
                  aug_segment_scale_std=0.1, adaptive_noise_scale=0.0,
-                 text_quality_gate=True, text_quality_min_scale=0.0,
                  text_quality_coverage_mix=0.5,
                  text_recency_tau_days=14.0,
                  text_coverage_kappa=3.0,
@@ -120,8 +119,6 @@ class Dataset_Custom(Dataset):
         self.aug_time_warp_prob = float(aug_time_warp_prob)
         self.aug_segment_scale_std = float(aug_segment_scale_std)
         self.adaptive_noise_scale = float(adaptive_noise_scale)
-        self.text_quality_gate = bool(text_quality_gate)
-        self.text_quality_min_scale = float(text_quality_min_scale)
         self.text_quality_coverage_mix = float(text_quality_coverage_mix)
         self.text_recency_tau_days = float(max(text_recency_tau_days, 1e-6))
         self.text_coverage_kappa = float(max(text_coverage_kappa, 1e-6))
@@ -403,8 +400,6 @@ class Dataset_Custom(Dataset):
         return 0.5
 
     def _compute_text_quality(self, text, source_name, seq_x):
-        if not self.text_quality_gate:
-            return 1.0 if self._normalize_text(text) else 0.0
         availability = self._score_text_availability(text)
         if availability <= 0.0:
             return 0.0
@@ -412,7 +407,6 @@ class Dataset_Custom(Dataset):
         alignment = self._score_text_alignment(text, seq_x)
         trust = self._get_source_trust(source_name)
         quality = availability * informativeness * alignment * trust
-        quality = max(quality, self.text_quality_min_scale if quality > 0 else 0.0)
         return float(np.clip(quality, 0.0, 1.0))
 
     def _tokenize_text_simple(self, text):
@@ -602,22 +596,22 @@ class Dataset_Custom(Dataset):
             "ret": base_prior,
             "cot": base_prior,
         }
-        raw_gate = float(np.clip(quality_pkg["quality_raw"], 0.0, 1.0))
-        ret_gate = min(float(np.clip(quality_pkg["quality_ret"], 0.0, 1.0)), self.text_trend_ret_scale * raw_gate)
-        cot_gate = min(float(np.clip(quality_pkg["quality_cot"], 0.0, 1.0)), self.text_trend_cot_scale * ret_gate)
+        raw_score = float(np.clip(quality_pkg["quality_raw"], 0.0, 1.0))
+        ret_score = min(float(np.clip(quality_pkg["quality_ret"], 0.0, 1.0)), self.text_trend_ret_scale * raw_score)
+        cot_score = min(float(np.clip(quality_pkg["quality_cot"], 0.0, 1.0)), self.text_trend_cot_scale * ret_score)
 
-        for source_name, text_value, gate_value, source_weight in (
-            ("raw", raw_text, raw_gate, self.text_trend_raw_weight),
-            ("ret", ret_text, ret_gate, self.text_trend_ret_weight),
-            ("cot", cot_text, cot_gate, self.text_trend_cot_weight),
+        for source_name, text_value, evidence_score, source_weight in (
+            ("raw", raw_text, raw_score, self.text_trend_raw_weight),
+            ("ret", ret_text, ret_score, self.text_trend_ret_weight),
+            ("cot", cot_text, cot_score, self.text_trend_cot_weight),
         ):
-            if gate_value <= 0 or source_weight <= 0:
+            if evidence_score <= 0 or source_weight <= 0:
                 continue
             fields = self._infer_text_trend_fields(text_value)
             if fields is None:
                 continue
             source_fields.append(fields)
-            source_weights.append(float(gate_value * source_weight))
+            source_weights.append(float(evidence_score * source_weight))
             source_vectors[source_name] = trend_fields_to_vector(fields)
         if len(source_fields) == 0:
             return base_prior, source_vectors

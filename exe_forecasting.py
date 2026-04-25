@@ -356,6 +356,78 @@ config["model"]["cot_device"] = args.cot_device
 config["model"]["cot_load_in_8bit"] = args.cot_load_in_8bit
 config["model"]["cot_load_in_4bit"] = args.cot_load_in_4bit
 config["model"]["save_trend_prior"] = args.save_trend_prior
+config["model"]["pattern_residual_diffusion"] = bool(config["model"].get("pattern_residual_diffusion", True))
+config["model"]["pattern_text_evidence"] = bool(config["model"].get("pattern_text_evidence", True))
+config["model"]["pattern_hidden_dim"] = int(config["model"].get("pattern_hidden_dim", 64))
+config["model"]["pattern_router_temperature"] = float(config["model"].get("pattern_router_temperature", 1.0))
+config["train"]["pattern_consistency_weight"] = float(config["train"].get("pattern_consistency_weight", 0.03))
+config["train"]["pattern_expert_weight"] = float(config["train"].get("pattern_expert_weight", 0.05))
+legacy_model_keys = [
+    "pattern_adaptive",
+    "pattern_disable_legacy_text_gates",
+    "text_quality_gate",
+    "text_quality_min_scale",
+    "text_use_ret_in_context",
+    "text_use_cot_in_context",
+    "text_trend_only_guidance",
+    "text_trend_ret_scale",
+    "text_trend_cot_scale",
+    "text_trend_raw_weight",
+    "text_trend_ret_weight",
+    "text_trend_cot_weight",
+    "text_numeric_align_gamma",
+    "multi_res_trend_source",
+    "text_aug_max_ratio",
+    "coverage_power",
+    "coverage_cfg_boost",
+    "reliability_min",
+    "guide_reliability_power",
+    "semantic_dim",
+    "event_quality_dim",
+    "event_quality_beta",
+    "event_text_max_length",
+    "use_gate_min",
+    "strength_gate_min",
+    "strength_use_mix_floor",
+    "horizon_strength_bias",
+    "text_context_ratio_min",
+    "text_context_ratio_max",
+    "text_context_max_base",
+    "text_context_max_boost",
+    "text_context_horizon_bias",
+    "text_guide_ratio_max",
+    "text_guide_max_base",
+    "text_guide_max_boost",
+    "text_guide_quality_power",
+    "text_guide_step_low",
+    "text_guide_step_high",
+    "text_guide_step_k",
+    "use_gate_warmup_epochs",
+    "strength_gate_warmup_epochs",
+    "text_benefit_hidden_dim",
+    "text_aug_hidden_dim",
+    "reliability_hidden_dim",
+    "event_source_embed_dim",
+]
+legacy_train_keys = [
+    "text_consistency_weight",
+    "text_use_weight",
+    "text_use_margin",
+    "text_aug_benefit_weight",
+    "text_aug_reg_weight",
+    "text_notext_fallback_weight",
+    "text_strength_weight",
+    "text_strength_tau",
+    "text_context_benefit_weight",
+    "text_context_benefit_tau",
+    "text_positive_benefit_margin",
+    "text_positive_benefit_tau",
+    "detach_text_baselines",
+]
+for key in legacy_model_keys:
+    config["model"].pop(key, None)
+for key in legacy_train_keys:
+    config["train"].pop(key, None)
 config["diffusion"]["trend_cfg"] = args.trend_cfg
 config["diffusion"]["trend_cfg_power"] = args.trend_cfg_power
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
@@ -381,8 +453,6 @@ args.aug_noise_std = float(dataset_cfg.get("aug_noise_std", 0.0))
 args.aug_time_warp_prob = float(dataset_cfg.get("aug_time_warp_prob", 0.0))
 args.aug_segment_scale_std = float(dataset_cfg.get("aug_segment_scale_std", 0.1))
 args.adaptive_noise_scale = float(config.get("train", {}).get("adaptive_noise_scale", 0.0))
-args.text_quality_gate = bool(config["model"].get("text_quality_gate", True))
-args.text_quality_min_scale = float(config["model"].get("text_quality_min_scale", 0.0))
 args.text_quality_coverage_mix = float(config["model"].get("text_quality_coverage_mix", 0.5))
 args.text_recency_tau_days = float(dataset_cfg.get("text_recency_tau_days", 14.0))
 args.text_coverage_kappa = float(dataset_cfg.get("text_coverage_kappa", 3.0))
@@ -391,11 +461,6 @@ args.text_trust_ret = float(config["model"].get("text_trust_ret", 0.75))
 args.text_trust_cot = float(config["model"].get("text_trust_cot", 0.5))
 args.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_threshold", 0.3))
 args.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
-args.text_trend_ret_scale = float(config["model"].get("text_trend_ret_scale", 0.5))
-args.text_trend_cot_scale = float(config["model"].get("text_trend_cot_scale", 0.3))
-args.text_trend_raw_weight = float(config["model"].get("text_trend_raw_weight", 1.0))
-args.text_trend_ret_weight = float(config["model"].get("text_trend_ret_weight", 0.35))
-args.text_trend_cot_weight = float(config["model"].get("text_trend_cot_weight", 0.15))
 args.max_text_events = int(dataset_cfg.get("max_text_events", 12))
 args.num_workers = int(dataset_cfg.get("num_workers", args.num_workers))
 

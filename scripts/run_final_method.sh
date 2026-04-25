@@ -38,17 +38,10 @@ cfg.setdefault("model", {})
 cfg.setdefault("train", {})
 cfg["model"]["guide_mode"] = "auto"
 cfg["model"]["final_method"] = True
-cfg["model"]["final_method_v25"] = True
 cfg["model"]["pattern_residual_diffusion"] = True
 cfg["model"]["pattern_text_evidence"] = True
 cfg["train"]["multi_res_segment_loss"] = True
 cfg["train"]["multi_res_use_stat_horizons"] = True
-cfg["train"]["frequency_aux_loss"] = True
-cfg["train"]["diffusion_snr_weighting"] = "auto"
-cfg["train"]["diffusion_snr_gamma"] = None
-cfg["train"]["pattern_affine_calibration"] = True
-cfg["train"]["pattern_alpha_lower_confidence"] = True
-cfg["train"]["revin_multiscale"] = True
 cfg["train"].pop("multi_res_difficulty_gamma", None)
 os.makedirs(os.path.dirname(final_path), exist_ok=True)
 with open(final_path, "w") as f:

@@ -120,7 +120,7 @@ bash ./run.sh
 - `config/climate_96_12_mainline.yaml`
 - `config/agriculture_36_12_mainline.yaml`
 
-主线配置开启自适应 horizons、Progressive Curriculum、EMA Difficulty、Per-Horizon Huber Delta、Gradient Clipping、LR Warmup、Lookback Augmentation、Two-stage RAG/CoT、质量门控和文本收益监督；各数据集原有的训练规模与 diffusion 数值超参保持不变。
+主线配置开启自适应 horizons、Progressive Curriculum、EMA Difficulty、Per-Horizon Huber Delta、Gradient Clipping、LR Warmup、Lookback Augmentation、Two-stage RAG/CoT 和 Pattern-Adaptive residual diffusion；各数据集原有的训练规模与 diffusion 数值超参保持不变。
 
 运行全数据集主线：
 ```bash

@@ -34,21 +34,7 @@ train:
   lr_warmup_epochs: 10
   max_grad_norm: 1.0
   adaptive_noise_scale: 0.0
-  text_consistency_weight: 0.0
   auxiliary_loss_max_ratio: 0.5
-  detach_text_baselines: true
-  text_use_weight: 0.03
-  text_use_margin: 0.02
-  text_aug_benefit_weight: 0.05
-  text_aug_reg_weight: 0.01
-  text_notext_fallback_weight: 0.0
-  text_strength_weight: 0.03
-  text_strength_tau: 0.1
-  text_context_benefit_weight: 0.05
-  text_context_benefit_tau: 0.1
-  text_positive_benefit_margin: 0.01
-  text_positive_benefit_tau: 0.05
-  text_utility_weight: 0.03
   aux_residual_mag_weight: 0.001
   aux_residual_smooth_weight: 0.01
 diffusion:
@@ -89,12 +75,8 @@ model:
   decomp: false
   llm: bert
   llm_layers: 0
-  text_benefit_hidden_dim: 128
-  text_aug_hidden_dim: 128
   use_rag_cot: true
   use_two_stage_rag: true
-  text_quality_gate: true
-  text_quality_min_scale: 0.0
   text_quality_coverage_mix: 0.5
   text_quality_weights:
   - 0.5
@@ -104,49 +86,11 @@ model:
   text_trust_cot: 0.5
   text_quality_drop_threshold: 0.3
   text_quality_mid_threshold: 0.6
-  text_use_ret_in_context: false
-  text_use_cot_in_context: false
-  text_trend_only_guidance: true
-  text_trend_ret_scale: 0.5
-  text_trend_cot_scale: 0.3
-  text_trend_raw_weight: 1.0
-  text_trend_ret_weight: 0.35
-  text_trend_cot_weight: 0.15
-  text_numeric_align_gamma: 2.0
-  multi_res_trend_source: numeric_only
-  text_aug_max_ratio: 0.3
-  coverage_power: 2.0
-  coverage_cfg_boost: 0.15
-  reliability_min: 0.1
-  reliability_hidden_dim: 32
-  guide_reliability_power: 1.0
-  semantic_dim: 6
   aux_basis_dim: 6
-  use_text_residual: true
   use_calendar_residual: true
-  text_residual_scale: 0.05
   calendar_residual_scale: 0.1
   text_max_length: 160
-  event_text_max_length: 64
   text_encode_batch_size: 4
-  use_gate_min: 0.1
-  strength_gate_min: 0.04
-  strength_use_mix_floor: 0.5
-  horizon_strength_bias: 0.15
-  text_context_ratio_min: 0.1
-  text_context_ratio_max: 0.6
-  text_context_max_base: 0.03
-  text_context_max_boost: 0.07
-  text_context_horizon_bias: 0.15
-  text_guide_ratio_max: 0.35
-  text_guide_max_base: 0.02
-  text_guide_max_boost: 0.05
-  text_guide_quality_power: 0.5
-  text_guide_step_low: 0.2
-  text_guide_step_high: 0.8
-  text_guide_step_k: 12.0
-  use_gate_warmup_epochs: 10
-  strength_gate_warmup_epochs: 16
 dataset:
   aug_noise_std: 0.01
   aug_time_warp_prob: 0.3

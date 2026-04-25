@@ -104,7 +104,7 @@ The latest mainline profile covers every dataset domain in the benchmark:
 
 The mainline profile enables adaptive horizons, progressive curriculum, EMA difficulty,
 per-horizon Huber delta, gradient clipping, LR warmup, lookback augmentation, two-stage
-RAG/CoT, quality gating, and text benefit supervision. Dataset-specific train scale and
+RAG/CoT, and pattern-adaptive residual diffusion. Dataset-specific train scale and
 diffusion hyperparameters are kept from the original per-dataset configs.
 
 Run the full mainline suite:

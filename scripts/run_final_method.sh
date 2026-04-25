@@ -40,6 +40,11 @@ cfg["model"]["guide_mode"] = "auto"
 cfg["model"]["final_method"] = True
 cfg["model"]["pattern_residual_diffusion"] = True
 cfg["model"]["pattern_text_evidence"] = True
+cfg["model"]["timestamp_prior"] = True
+cfg["model"]["timestamp_prior_residual"] = True
+cfg["model"]["timestamp_prior_fusion"] = True
+cfg["model"]["source_specific_text_gain"] = True
+cfg["model"]["event_evidence_alignment"] = True
 cfg["train"]["multi_res_segment_loss"] = True
 cfg["train"]["multi_res_use_stat_horizons"] = True
 cfg["train"].pop("multi_res_difficulty_gamma", None)

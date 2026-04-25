@@ -118,6 +118,10 @@ class CSDI_base(nn.Module):
         self.multi_res_difficulty_weight = float(train_cfg.get("multi_res_difficulty_weight", 0.0))
         self.multi_res_group_balance = bool(train_cfg.get("multi_res_group_balance", True))
         self.multi_res_group_max_ratio = float(train_cfg.get("multi_res_group_max_ratio", 2.0))
+        self.multi_res_segment_loss = bool(train_cfg.get("multi_res_segment_loss", True))
+        self.multi_res_reliability_weight = float(train_cfg.get("multi_res_reliability_weight", 1.0))
+        self.multi_res_difficulty_inverse = bool(train_cfg.get("multi_res_difficulty_inverse", True))
+        self.multi_res_difficulty_gamma = float(train_cfg.get("multi_res_difficulty_gamma", 0.5))
         self.auxiliary_loss_max_ratio = float(train_cfg.get("auxiliary_loss_max_ratio", 0.0))
         self.current_epoch = 0
         self.total_epochs = max(int(train_cfg.get("epochs", 1)), 1)
@@ -131,15 +135,30 @@ class CSDI_base(nn.Module):
         self.pattern_baseline_detach = bool(train_cfg.get("pattern_baseline_detach", False))
         self.pattern_router_temperature = float(config["model"].get("pattern_router_temperature", 1.0))
         self.guide_w_default = float(config["model"].get("guide_w_default", 1.0))
+        self.pattern_reliability = bool(config["model"].get("pattern_reliability", True))
+        self.pattern_reliability_threshold = float(config["model"].get("pattern_reliability_threshold", 0.35))
+        self.pattern_reliability_temperature = float(config["model"].get("pattern_reliability_temperature", 0.1))
+        self.pattern_reliability_min = float(config["model"].get("pattern_reliability_min", 0.05))
+        self.pattern_reliability_max = float(config["model"].get("pattern_reliability_max", 1.0))
+        self.pattern_aux_reliability = bool(config["model"].get("pattern_aux_reliability", True))
+        self.pattern_text_drop_prob = float(config["model"].get("pattern_text_drop_prob", 0.0))
         self.multi_res_horizons = self._sanitize_multi_res_horizons(self.multi_res_horizons)
         self.multi_res_horizon_to_index = {
             int(horizon): idx for idx, horizon in enumerate(self.multi_res_horizons)
         }
+        self.multi_res_horizon_reliabilities = self._resolve_multi_res_horizon_reliabilities(
+            train_cfg.get("multi_res_horizon_reliabilities", None)
+        )
         difficulty_size = max(len(self.multi_res_horizons), 1)
         self.register_buffer(
             "multi_res_difficulty_ema",
             torch.ones(difficulty_size, dtype=torch.float32),
         )
+        reliability_size = max(len(self.multi_res_horizons), 1)
+        reliability_tensor = torch.ones(reliability_size, dtype=torch.float32)
+        if len(self.multi_res_horizon_reliabilities) > 0:
+            reliability_tensor = torch.tensor(self.multi_res_horizon_reliabilities, dtype=torch.float32)
+        self.register_buffer("multi_res_reliability", reliability_tensor)
         self.multi_res_huber_deltas = self._resolve_multi_res_huber_deltas(
             self.multi_res_horizons, self.multi_res_huber_deltas_cfg
         )
@@ -275,6 +294,30 @@ class CSDI_base(nn.Module):
 
         return sorted(set(sanitized))
 
+    def _resolve_multi_res_horizon_reliabilities(self, reliabilities):
+        if len(self.multi_res_horizons) == 0:
+            return []
+        if reliabilities is None:
+            return [1.0 for _ in self.multi_res_horizons]
+        if isinstance(reliabilities, (int, float)):
+            values = [float(reliabilities)]
+        elif isinstance(reliabilities, (list, tuple)):
+            values = []
+            for value in reliabilities:
+                try:
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    values.append(1.0)
+        else:
+            values = [1.0 for _ in self.multi_res_horizons]
+        if len(values) != len(self.multi_res_horizons):
+            warnings.warn(
+                "multi_res_horizon_reliabilities length does not match final multi_res_horizons; falling back to 1.0.",
+                RuntimeWarning,
+            )
+            values = [1.0 for _ in self.multi_res_horizons]
+        return [float(min(max(value, 0.0), 1.0)) for value in values]
+
     def _resolve_multi_res_huber_deltas(self, horizons, delta_cfg):
         if len(horizons) == 0:
             return []
@@ -351,8 +394,11 @@ class CSDI_base(nn.Module):
             "final_horizons": list(self.multi_res_horizons),
             "active_horizons": list(active_horizons),
             "huber_deltas": list(self.multi_res_huber_deltas),
+            "horizon_reliabilities": list(self.multi_res_horizon_reliabilities),
             "difficulty_ema": difficulty,
             "horizon_groups": [self._get_horizon_group(horizon) for horizon in active_horizons],
+            "segment_loss": self.multi_res_segment_loss,
+            "difficulty_inverse": self.multi_res_difficulty_inverse,
         }
 
     def time_embedding(self, pos, d_model=128):
@@ -516,6 +562,34 @@ class CSDI_base(nn.Module):
             evidence = evidence * (availability.reshape(-1, 1) > 0).float()
         return evidence
 
+    def _maybe_drop_pattern_text(self, text_pattern):
+        if (not self.training) or self.pattern_text_drop_prob <= 0:
+            return text_pattern
+        keep_prob = 1.0 - min(max(float(self.pattern_text_drop_prob), 0.0), 1.0)
+        keep = torch.bernoulli(torch.full((text_pattern.shape[0], 1), keep_prob, device=text_pattern.device))
+        return text_pattern * keep
+
+    def _compute_pattern_reliability(self, stats, text_pattern):
+        if not self.pattern_reliability:
+            return torch.ones((stats.shape[0],), device=stats.device, dtype=stats.dtype)
+        trend_r2 = stats[:, 1]
+        season_strength = stats[:, 3]
+        state_score = stats[:, 4]
+        stability = 1.0 - stats[:, 7].clamp(min=0.0, max=1.0)
+        text_strength = text_pattern.max(dim=1).values if text_pattern.numel() > 0 else torch.zeros_like(trend_r2)
+        score = (
+            0.35 * season_strength
+            + 0.25 * trend_r2
+            + 0.20 * state_score
+            + 0.10 * stability
+            + 0.10 * text_strength
+        )
+        temperature = max(float(self.pattern_reliability_temperature), 1e-6)
+        rho = torch.sigmoid((score - float(self.pattern_reliability_threshold)) / temperature)
+        rho_min = min(max(float(self.pattern_reliability_min), 0.0), 1.0)
+        rho_max = min(max(float(self.pattern_reliability_max), rho_min), 1.0)
+        return (rho_min + (rho_max - rho_min) * rho).clamp(min=rho_min, max=rho_max)
+
     def _build_pattern_baselines(self, observed_data, cond_mask, stats):
         B, K, L = observed_data.shape
         baseline = torch.zeros_like(observed_data)
@@ -567,6 +641,7 @@ class CSDI_base(nn.Module):
         B, K, L = observed_data.shape
         stats = self._compute_pattern_stats(observed_data, cond_mask)
         text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
+        text_pattern = self._maybe_drop_pattern_text(text_pattern)
         temperature = max(float(self.pattern_router_temperature), 1e-3)
         numeric_router_input = torch.cat([stats, torch.zeros_like(text_pattern)], dim=1)
         text_router_input = torch.cat([stats, text_pattern], dim=1)
@@ -577,8 +652,11 @@ class CSDI_base(nn.Module):
         pi = F.softmax(guided_logits, dim=-1)
         baseline, expert_futures = self._build_pattern_baselines(observed_data, cond_mask, stats)
         future_len = expert_futures.shape[-1]
+        reliability = self._compute_pattern_reliability(stats, text_pattern)
         if future_len > 0:
             mixed_future = (pi.view(B, self.pattern_num_experts, 1, 1) * expert_futures).sum(dim=1)
+            safe_future = expert_futures[:, 2]
+            mixed_future = reliability.view(B, 1, 1) * mixed_future + (1.0 - reliability).view(B, 1, 1) * safe_future
             baseline[:, :, self.lookback_len:self.lookback_len + future_len] = mixed_future
         pseudo = torch.stack(
             [stats[:, 1], stats[:, 3], stats[:, 4], stats[:, 5], stats[:, 6]],
@@ -596,6 +674,7 @@ class CSDI_base(nn.Module):
             "pseudo": pseudo.detach(),
             "baseline": baseline,
             "expert_futures": expert_futures,
+            "baseline_reliability": reliability,
             "guidance_scale": scale,
         }
 
@@ -605,8 +684,15 @@ class CSDI_base(nn.Module):
             return aux
         pi = pattern["pi"].clamp(min=1e-6)
         pseudo = pattern["pseudo"].clamp(min=1e-6)
+        reliability = pattern.get("baseline_reliability")
+        if reliability is None:
+            reliability = torch.ones((pi.shape[0],), device=observed_data.device, dtype=observed_data.dtype)
+        reliability = reliability.reshape(-1).clamp(min=0.0, max=1.0)
+        if not self.pattern_aux_reliability:
+            reliability = torch.ones_like(reliability)
         if self.pattern_consistency_weight > 0:
-            consistency = (pseudo * (pseudo.log() - pi.log())).sum(dim=1).mean()
+            consistency = (pseudo * (pseudo.log() - pi.log())).sum(dim=1)
+            consistency = (reliability * consistency).mean()
             aux = aux + self.pattern_consistency_weight * consistency
         if self.pattern_expert_weight > 0 and pattern["expert_futures"].numel() > 0:
             future_len = pattern["expert_futures"].shape[-1]
@@ -619,7 +705,8 @@ class CSDI_base(nn.Module):
             huber = torch.where(abs_res <= 1.0, 0.5 * residual ** 2, abs_res - 0.5)
             denom = future_mask.sum(dim=(2, 3)).clamp(min=1.0)
             expert_loss = huber.sum(dim=(2, 3)) / denom
-            weighted_expert_loss = (pattern["pi"] * expert_loss).sum(dim=1).mean()
+            weighted_expert_loss = (pattern["pi"] * expert_loss).sum(dim=1)
+            weighted_expert_loss = (reliability * weighted_expert_loss).mean()
             aux = aux + self.pattern_expert_weight * weighted_expert_loss
         return aux
 
@@ -788,7 +875,15 @@ class CSDI_base(nn.Module):
         if len(active_indices) != len(horizons):
             return base_weights.clamp(min=1e-6)
 
+        if self.multi_res_reliability_weight > 0 and self.multi_res_reliability.numel() >= len(self.multi_res_horizons):
+            reliability = self.multi_res_reliability[active_indices].detach().clamp(min=0.0, max=1.0)
+            reliability = reliability.unsqueeze(0).expand(batch_size, -1)
+            rel_mix = float(min(max(self.multi_res_reliability_weight, 0.0), 1.0))
+            base_weights = base_weights * ((1.0 - rel_mix) + rel_mix * reliability)
+
         difficulty = self.multi_res_difficulty_ema[active_indices].detach().clamp(min=1e-6)
+        if self.multi_res_difficulty_inverse:
+            difficulty = (difficulty.mean().clamp(min=1e-6) / difficulty).pow(max(float(self.multi_res_difficulty_gamma), 0.0))
         if self.multi_res_group_balance:
             group_to_indices = {}
             for idx, horizon in enumerate(horizons):
@@ -855,8 +950,14 @@ class CSDI_base(nn.Module):
             if h <= 0:
                 continue
             horizon_mask = torch.zeros_like(target_mask)
-            start = int(self.lookback_len)
+            if self.multi_res_segment_loss:
+                prev_h = int(horizons[h_idx - 1]) if h_idx > 0 else 0
+                start = int(self.lookback_len + prev_h)
+            else:
+                start = int(self.lookback_len)
             end = int(self.lookback_len + h)
+            if end <= start:
+                continue
             horizon_mask[:, :, start:end] = 1.0
             horizon_mask = horizon_mask * target_mask
             num_eval = horizon_mask.sum(dim=(1, 2))

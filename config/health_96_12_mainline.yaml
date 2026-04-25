@@ -35,8 +35,6 @@ train:
   max_grad_norm: 1.0
   adaptive_noise_scale: 0.0
   auxiliary_loss_max_ratio: 0.5
-  aux_residual_mag_weight: 0.001
-  aux_residual_smooth_weight: 0.01
 diffusion:
   layers: 6
   channels: 64
@@ -86,9 +84,6 @@ model:
   text_trust_cot: 0.5
   text_quality_drop_threshold: 0.3
   text_quality_mid_threshold: 0.6
-  aux_basis_dim: 6
-  use_calendar_residual: true
-  calendar_residual_scale: 0.1
   text_max_length: 160
   text_encode_batch_size: 4
 dataset:

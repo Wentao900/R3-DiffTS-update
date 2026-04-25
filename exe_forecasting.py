@@ -46,6 +46,7 @@ parser.add_argument('--cot_device', type=str, default=None, help='device for CoT
 parser.add_argument('--cot_load_in_8bit', action='store_true', help='load CoT model in 8-bit (requires bitsandbytes)')
 parser.add_argument('--cot_load_in_4bit', action='store_true', help='load CoT model in 4-bit (requires bitsandbytes)')
 parser.add_argument('--guide_w', type=float, default=-1, help='override guidance weight when cfg is enabled; negative to use default sweep')
+parser.add_argument('--guide_list', type=str, default="", help='comma-separated guide weights for cfg sweep; overrides the built-in sweep when guide_w is negative')
 parser.add_argument('--trend_cfg', action='store_true', help='enable trend-aware CFG modulation from CoT')
 parser.add_argument('--trend_cfg_power', type=float, default=1.0, help='power for trend CFG time schedule')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace trend prior with random draws')
@@ -168,6 +169,31 @@ def build_balanced_horizons(pred_len, candidates, max_count=5):
     return sorted(selected[:max_count])
 
 
+def compute_horizon_reliabilities(horizons, stats, threshold=0.2, temperature=0.05):
+    if not horizons:
+        return []
+    if not stats:
+        return [1.0 for _ in horizons]
+    acf_values = stats.get("acf_values") or stats.get("acf_head") or []
+    peak_lag = stats.get("peak_lag")
+    peak_value = stats.get("peak_value")
+    reliabilities = []
+    temp = max(float(temperature), 1e-6)
+    for horizon in horizons:
+        score = None
+        h = int(horizon)
+        if 0 <= h < len(acf_values):
+            score = float(acf_values[h])
+        elif peak_lag is not None and int(peak_lag) == h and peak_value is not None:
+            score = float(peak_value)
+        if score is None:
+            score = 1.0 if not acf_values else 0.0
+        score = max(score, 0.0)
+        rel = 1.0 / (1.0 + math.exp(-(score - float(threshold)) / temp))
+        reliabilities.append(float(min(max(rel, 0.0), 1.0)))
+    return reliabilities
+
+
 def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
     explicit_horizons = sanitize_multi_res_horizons(
         train_cfg.get("multi_res_horizons"),
@@ -177,7 +203,8 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
         return {
             "horizons": explicit_horizons,
             "source": "explicit",
-            "stats": {},
+            "stats": {"horizon_reliabilities": [1.0 for _ in explicit_horizons]},
+            "horizon_reliabilities": [1.0 for _ in explicit_horizons],
             "fallback_used": False,
         }
 
@@ -193,18 +220,22 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
         limit=4,
     )
     if not bool(train_cfg.get("multi_res_use_stat_horizons", True)):
+        reliabilities = [1.0 for _ in fallback_horizons]
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {"anchor_horizons": anchor_horizons},
+            "stats": {"anchor_horizons": anchor_horizons, "horizon_reliabilities": reliabilities},
+            "horizon_reliabilities": reliabilities,
             "fallback_used": True,
         }
 
     if train_dataset is None or not hasattr(train_dataset, "estimate_horizon_statistics"):
+        reliabilities = [1.0 for _ in fallback_horizons]
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {"reason": "training dataset does not expose ACF statistics"},
+            "stats": {"reason": "training dataset does not expose ACF statistics", "horizon_reliabilities": reliabilities},
+            "horizon_reliabilities": reliabilities,
             "fallback_used": True,
         }
 
@@ -230,17 +261,27 @@ def resolve_multi_res_horizons(train_cfg, train_dataset, pred_len):
         if len(horizons) == 0:
             raise RuntimeError("no valid horizons generated from training ACF")
         stats["anchor_horizons"] = anchor_horizons
+        reliabilities = compute_horizon_reliabilities(
+            horizons,
+            stats,
+            threshold=train_cfg.get("multi_res_acf_reliability_threshold", 0.2),
+            temperature=train_cfg.get("multi_res_acf_reliability_temperature", 0.05),
+        )
+        stats["horizon_reliabilities"] = reliabilities
         return {
             "horizons": horizons,
             "source": "train_acf",
             "stats": stats,
+            "horizon_reliabilities": reliabilities,
             "fallback_used": False,
         }
     except Exception as exc:
+        reliabilities = [1.0 for _ in fallback_horizons]
         return {
             "horizons": fallback_horizons,
             "source": "ratio_fallback",
-            "stats": {"reason": str(exc)},
+            "stats": {"reason": str(exc), "horizon_reliabilities": reliabilities},
+            "horizon_reliabilities": reliabilities,
             "fallback_used": True,
         }
 
@@ -360,8 +401,21 @@ config["model"]["pattern_residual_diffusion"] = bool(config["model"].get("patter
 config["model"]["pattern_text_evidence"] = bool(config["model"].get("pattern_text_evidence", True))
 config["model"]["pattern_hidden_dim"] = int(config["model"].get("pattern_hidden_dim", 64))
 config["model"]["pattern_router_temperature"] = float(config["model"].get("pattern_router_temperature", 1.0))
+config["model"]["pattern_reliability"] = bool(config["model"].get("pattern_reliability", True))
+config["model"]["pattern_reliability_threshold"] = float(config["model"].get("pattern_reliability_threshold", 0.35))
+config["model"]["pattern_reliability_temperature"] = float(config["model"].get("pattern_reliability_temperature", 0.1))
+config["model"]["pattern_reliability_min"] = float(config["model"].get("pattern_reliability_min", 0.05))
+config["model"]["pattern_reliability_max"] = float(config["model"].get("pattern_reliability_max", 1.0))
+config["model"]["pattern_aux_reliability"] = bool(config["model"].get("pattern_aux_reliability", True))
+config["model"]["pattern_text_drop_prob"] = float(config["model"].get("pattern_text_drop_prob", config["diffusion"].get("c_mask_prob", 0.0)))
 config["train"]["pattern_consistency_weight"] = float(config["train"].get("pattern_consistency_weight", 0.03))
 config["train"]["pattern_expert_weight"] = float(config["train"].get("pattern_expert_weight", 0.05))
+config["train"]["multi_res_segment_loss"] = bool(config["train"].get("multi_res_segment_loss", True))
+config["train"]["multi_res_reliability_weight"] = float(config["train"].get("multi_res_reliability_weight", 1.0))
+config["train"]["multi_res_difficulty_inverse"] = bool(config["train"].get("multi_res_difficulty_inverse", True))
+config["train"]["multi_res_difficulty_gamma"] = float(config["train"].get("multi_res_difficulty_gamma", 0.5))
+config["train"]["multi_res_acf_reliability_threshold"] = float(config["train"].get("multi_res_acf_reliability_threshold", 0.2))
+config["train"]["multi_res_acf_reliability_temperature"] = float(config["train"].get("multi_res_acf_reliability_temperature", 0.05))
 legacy_model_keys = [
     "pattern_adaptive",
     "pattern_disable_legacy_text_gates",
@@ -408,6 +462,9 @@ legacy_model_keys = [
     "text_aug_hidden_dim",
     "reliability_hidden_dim",
     "event_source_embed_dim",
+    "aux_basis_dim",
+    "use_calendar_residual",
+    "calendar_residual_scale",
 ]
 legacy_train_keys = [
     "text_consistency_weight",
@@ -423,6 +480,8 @@ legacy_train_keys = [
     "text_positive_benefit_margin",
     "text_positive_benefit_tau",
     "detach_text_baselines",
+    "aux_residual_mag_weight",
+    "aux_residual_smooth_weight",
 ]
 for key in legacy_model_keys:
     config["model"].pop(key, None)
@@ -486,8 +545,13 @@ horizon_info = resolve_multi_res_horizons(
 config["train"]["multi_res_horizons"] = horizon_info["horizons"]
 config["train"]["multi_res_horizon_source"] = horizon_info["source"]
 config["train"]["multi_res_horizon_stats"] = horizon_info["stats"]
+config["train"]["multi_res_horizon_reliabilities"] = horizon_info.get(
+    "horizon_reliabilities",
+    horizon_info.get("stats", {}).get("horizon_reliabilities", []),
+)
 print("resolved multi_res_horizons:", horizon_info["horizons"])
 print("multi_res source:", horizon_info["source"])
+print("multi_res reliabilities:", config["train"]["multi_res_horizon_reliabilities"])
 print(json.dumps(config, indent=4))
 with open(foldername + "config_results.json", "w") as f:
     json.dump(config, f, indent=4)
@@ -519,7 +583,12 @@ guide_sweep_metrics = []
 if config["diffusion"]["cfg"]:
     best_mse = 10e10
     best_metrics = None
-    guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
+    if args.guide_w >= 0:
+        guide_list = [args.guide_w]
+    elif args.guide_list.strip():
+        guide_list = [float(value) for value in args.guide_list.split(",") if value.strip()]
+    else:
+        guide_list = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 4.5, 5.0]
     for guide_w in guide_list:
         metrics = evaluate(
             model,

@@ -272,6 +272,7 @@ class Dataset_Custom(Dataset):
             "peak_lag": None if peak_lag is None else int(peak_lag),
             "peak_value": None if peak_lag is None else float(avg_acf[peak_lag]),
             "acf_head": [float(x) for x in avg_acf[: min(max_lag + 1, 16)]],
+            "acf_values": [float(x) for x in avg_acf],
         }
 
     def _normalize_text(self, text):

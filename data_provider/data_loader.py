@@ -922,23 +922,6 @@ class Dataset_Custom(Dataset):
         ) else 0
 
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
-        quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
-        trend_prior_text, source_priors = self._build_text_trend_components(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            seq_x,
-        )
-        text_evidence_vec = self._build_window_evidence(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            source_priors,
-            text_meta,
-            seq_x,
-        )
         text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
             raw_events=text_meta.get("raw_events", []),
             retrieved_records=retrieved_records,
@@ -971,18 +954,10 @@ class Dataset_Custom(Dataset):
             'text_event_quality_feats': text_event_quality_feats,
             'text_event_mask': text_event_mask,
             'text_mark': txt_mark,
-            'text_quality_raw': np.asarray(quality_pkg["quality_raw"], dtype=np.float32),
-            'text_quality_ret': np.asarray(quality_pkg["quality_ret"], dtype=np.float32),
-            'text_quality_cot': np.asarray(quality_pkg["quality_cot"], dtype=np.float32),
-            'text_gate_raw': np.asarray(quality_pkg["gate_raw"], dtype=np.float32),
-            'text_gate_ret': np.asarray(quality_pkg["gate_ret"], dtype=np.float32),
-            'text_gate_cot': np.asarray(quality_pkg["gate_cot"], dtype=np.float32),
-            'text_evidence_vec': text_evidence_vec,
             'cot_text': cot_text,
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior_num,
             'trend_prior_num': trend_prior_num,
-            'trend_prior_text': trend_prior_text,
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
 

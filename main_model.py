@@ -138,14 +138,6 @@ class CSDI_base(nn.Module):
         self.guide_w_default = float(config["model"].get("guide_w_default", 1.0))
         self.guide_mode = str(config["model"].get("guide_mode", "manual")).lower()
         self.final_method = bool(config["model"].get("final_method", self.guide_mode == "auto"))
-        self.timestamp_prior = bool(config["model"].get("timestamp_prior", False))
-        self.timestamp_prior_residual = bool(config["model"].get("timestamp_prior_residual", True))
-        self.timestamp_prior_fusion = bool(config["model"].get("timestamp_prior_fusion", True))
-        self.timestamp_prior_temperature = float(config["model"].get("timestamp_prior_temperature", 0.05))
-        self.timestamp_prior_trend_mix = float(config["model"].get("timestamp_prior_trend_mix", 0.15))
-        self.timestamp_prior_max_alpha = float(config["model"].get("timestamp_prior_max_alpha", 0.5))
-        self.source_specific_text_gain = bool(config["model"].get("source_specific_text_gain", False))
-        self.event_evidence_alignment = bool(config["model"].get("event_evidence_alignment", False))
         self.pattern_reliability = bool(config["model"].get("pattern_reliability", True))
         self.pattern_reliability_threshold = float(config["model"].get("pattern_reliability_threshold", 0.35))
         self.pattern_reliability_temperature = float(config["model"].get("pattern_reliability_temperature", 0.1))
@@ -184,13 +176,6 @@ class CSDI_base(nn.Module):
         self.register_buffer("pattern_q_b_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("pattern_segment_q_b_sum", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("pattern_segment_q_b_count", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("timestamp_segment_q_sum", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("timestamp_segment_q_count", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("diag_timestamp_alpha_sum", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("diag_timestamp_alpha_sq_sum", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("diag_timestamp_alpha_count", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("diag_timestamp_baseline_mse_sum", torch.zeros(reliability_size, dtype=torch.float32))
-        self.register_buffer("diag_timestamp_baseline_mse_count", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("diag_segment_alpha_sum", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("diag_segment_alpha_sq_sum", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("diag_segment_alpha_count", torch.zeros(reliability_size, dtype=torch.float32))
@@ -198,10 +183,6 @@ class CSDI_base(nn.Module):
         self.register_buffer("diag_segment_baseline_mse_count", torch.zeros(reliability_size, dtype=torch.float32))
         self.register_buffer("text_gain_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("text_gain_count", torch.zeros((), dtype=torch.float32))
-        self.register_buffer("text_source_gain_sum", torch.zeros(3, dtype=torch.float32))
-        self.register_buffer("text_source_gain_count", torch.zeros(3, dtype=torch.float32))
-        self.register_buffer("diag_text_source_quality_sum", torch.zeros(3, dtype=torch.float32))
-        self.register_buffer("diag_text_source_quality_count", torch.zeros(3, dtype=torch.float32))
         self.register_buffer("diag_text_gain_batch_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_text_gain_batch_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_w_auto_sum", torch.zeros((), dtype=torch.float32))
@@ -219,8 +200,6 @@ class CSDI_base(nn.Module):
         self.register_buffer("diag_main_loss_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_aux_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_multi_res_aux_sum", torch.zeros((), dtype=torch.float32))
-        self.register_buffer("diag_timestamp_budget_sum", torch.zeros((), dtype=torch.float32))
-        self.register_buffer("diag_timestamp_budget_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_budget_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_budget_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_mr_budget_sum", torch.zeros((), dtype=torch.float32))
@@ -486,30 +465,15 @@ class CSDI_base(nn.Module):
         text_count = float(self.diag_text_quality_count.detach().cpu().item())
         text_gain_count = float(self.text_gain_count.detach().cpu().item())
         text_gain_batch_count = float(self.diag_text_gain_batch_count.detach().cpu().item())
-        source_gain_count = self.text_source_gain_count.detach().cpu().clamp(min=1.0)
-        source_quality_count = self.diag_text_source_quality_count.detach().cpu().clamp(min=1.0)
         agree_count = float(self.diag_router_agreement_count.detach().cpu().item())
         baseline_count = float(self.diag_pattern_baseline_mse_count.detach().cpu().item())
         loss_count = float(self.diag_loss_count.detach().cpu().item())
-        timestamp_budget_count = float(self.diag_timestamp_budget_count.detach().cpu().item())
         pattern_budget_count = float(self.diag_pattern_budget_count.detach().cpu().item())
         mr_budget_count = float(self.diag_mr_budget_count.detach().cpu().item())
         main_loss_mean = float(self.diag_main_loss_sum.detach().cpu().item() / max(loss_count, 1.0))
         pattern_aux_mean = float(self.diag_pattern_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         multi_res_aux_mean = float(self.diag_multi_res_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         segment_q_b = self._segment_running_mean(self.pattern_segment_q_b_sum, self.pattern_segment_q_b_count).detach().cpu().tolist()
-        timestamp_q = self._segment_running_mean(self.timestamp_segment_q_sum, self.timestamp_segment_q_count).detach().cpu()
-        timestamp_alpha_count = self.diag_timestamp_alpha_count.detach().cpu().clamp(min=1.0)
-        timestamp_alpha_mean_tensor = self.diag_timestamp_alpha_sum.detach().cpu() / timestamp_alpha_count
-        timestamp_alpha_var = self.diag_timestamp_alpha_sq_sum.detach().cpu() / timestamp_alpha_count - timestamp_alpha_mean_tensor ** 2
-        timestamp_alpha_mean = torch.where(self.diag_timestamp_alpha_count.detach().cpu() > 0, timestamp_alpha_mean_tensor, torch.zeros_like(timestamp_alpha_mean_tensor))
-        timestamp_alpha_std = torch.where(self.diag_timestamp_alpha_count.detach().cpu() > 0, timestamp_alpha_var.clamp(min=0.0).sqrt(), torch.zeros_like(timestamp_alpha_var))
-        timestamp_mse_count = self.diag_timestamp_baseline_mse_count.detach().cpu().clamp(min=1.0)
-        timestamp_mse_mean = torch.where(
-            self.diag_timestamp_baseline_mse_count.detach().cpu() > 0,
-            self.diag_timestamp_baseline_mse_sum.detach().cpu() / timestamp_mse_count,
-            torch.zeros_like(timestamp_mse_count),
-        )
         segment_alpha_count = self.diag_segment_alpha_count.detach().cpu().clamp(min=1.0)
         segment_alpha_mean_tensor = self.diag_segment_alpha_sum.detach().cpu() / segment_alpha_count
         segment_alpha_var = self.diag_segment_alpha_sq_sum.detach().cpu() / segment_alpha_count - segment_alpha_mean_tensor ** 2
@@ -524,11 +488,6 @@ class CSDI_base(nn.Module):
         return {
             "guide_mode": self.guide_mode,
             "final_method": self.final_method,
-            "timestamp_prior": self.timestamp_prior,
-            "timestamp_prior_residual": self.timestamp_prior_residual,
-            "timestamp_prior_fusion": self.timestamp_prior_fusion,
-            "source_specific_text_gain": self.source_specific_text_gain,
-            "event_evidence_alignment": self.event_evidence_alignment,
             "final_horizons": list(self.multi_res_horizons),
             "active_horizons": list(active_horizons),
             "huber_deltas": list(self.multi_res_huber_deltas),
@@ -546,16 +505,8 @@ class CSDI_base(nn.Module):
             "text_quality_mean": float(self.diag_text_quality_sum.detach().cpu().item() / max(text_count, 1.0)),
             "text_gain_running_mean": float(self.text_gain_sum.detach().cpu().item() / max(text_gain_count, 1.0)),
             "text_gain_running_count": text_gain_count,
-            "text_source_gain_running_mean": (self.text_source_gain_sum.detach().cpu() / source_gain_count).tolist(),
-            "text_source_gain_running_count": self.text_source_gain_count.detach().cpu().tolist(),
-            "text_source_quality_mean": (self.diag_text_source_quality_sum.detach().cpu() / source_quality_count).tolist(),
             "text_gain_batch_mean": float(self.diag_text_gain_batch_sum.detach().cpu().item() / max(text_gain_batch_count, 1.0)),
             "router_agreement_mean": float(self.diag_router_agreement_sum.detach().cpu().item() / max(agree_count, 1.0)),
-            "timestamp_q_running_mean": timestamp_q.tolist(),
-            "timestamp_alpha_mean": timestamp_alpha_mean.tolist(),
-            "timestamp_alpha_std": timestamp_alpha_std.tolist(),
-            "timestamp_baseline_mse": timestamp_mse_mean.tolist(),
-            "timestamp_budget": float(self.diag_timestamp_budget_sum.detach().cpu().item() / max(timestamp_budget_count, 1.0)),
             "alpha_b_mean": alpha_mean,
             "alpha_b_std": float(max(alpha_var, 0.0) ** 0.5),
             "segment_alpha_b_mean": segment_alpha_mean.tolist(),
@@ -829,51 +780,8 @@ class CSDI_base(nn.Module):
         )
         return q_t.clamp(min=0.0, max=1.0)
 
-    def _compute_text_source_quality(self, text_evidence_vec, text_mask, batch_size, device, dtype):
-        if text_evidence_vec is not None:
-            evidence = text_evidence_vec.float()
-            if evidence.dim() == 1:
-                evidence = evidence.reshape(batch_size, -1)
-            if evidence.shape[1] >= 10:
-                source_quality = evidence[:, 7:10].to(device=device, dtype=dtype)
-            else:
-                total_quality = self._compute_text_quality(text_evidence_vec, text_mask, batch_size, device, dtype)
-                source_quality = torch.stack([total_quality, torch.zeros_like(total_quality), torch.zeros_like(total_quality)], dim=1)
-        else:
-            if text_mask is None:
-                raw = torch.ones((batch_size,), device=device, dtype=dtype)
-            else:
-                raw = text_mask.float()
-                if raw.dim() > 1:
-                    raw = raw.mean(dim=1)
-                raw = raw.reshape(-1).to(device=device, dtype=dtype).clamp(0.0, 1.0)
-            source_quality = torch.stack([raw, torch.zeros_like(raw), torch.zeros_like(raw)], dim=1)
-        source_quality = source_quality.clamp(min=0.0, max=1.0)
-        if self.event_evidence_alignment and text_evidence_vec is not None:
-            evidence = text_evidence_vec.float()
-            if evidence.dim() == 1:
-                evidence = evidence.reshape(batch_size, -1)
-            if evidence.shape[1] >= 7:
-                event = evidence[:, 6].to(device=device, dtype=dtype).clamp(0.0, 1.0)
-                agreement = evidence[:, 4].to(device=device, dtype=dtype).clamp(0.0, 1.0)
-                source_quality = source_quality * (0.5 + 0.5 * torch.maximum(event, agreement)).unsqueeze(1)
-        if text_mask is not None:
-            availability = text_mask.float()
-            if availability.dim() > 1:
-                availability = availability.mean(dim=1)
-            availability = availability.reshape(-1).to(device=device, dtype=dtype).clamp(0.0, 1.0)
-            source_quality = source_quality * availability.unsqueeze(1)
-        with torch.no_grad():
-            self.diag_text_source_quality_sum.add_(source_quality.detach().float().mean(dim=0))
-            self.diag_text_source_quality_count.add_(torch.ones_like(self.diag_text_source_quality_count))
-        return source_quality.clamp(min=0.0, max=1.0)
-
-    def _compute_text_gain(self, observed_data, cond_mask, pi_numeric, pi_text, source_quality=None):
+    def _compute_text_gain(self, observed_data, cond_mask, pi_numeric, pi_text):
         if not self.training:
-            if self.source_specific_text_gain and source_quality is not None and float(self.text_source_gain_count.sum().detach().item()) > 0:
-                source_gain = (self.text_source_gain_sum / self.text_source_gain_count.clamp(min=1.0)).to(device=pi_numeric.device, dtype=pi_numeric.dtype).clamp(0.0, 1.0)
-                denom = source_quality.sum(dim=1).clamp(min=1e-6)
-                return ((source_quality * source_gain.reshape(1, 3)).sum(dim=1) / denom).clamp(0.0, 1.0)
             return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
         if observed_data is None or cond_mask is None:
             return self._text_gain_running_mean(pi_numeric.device, pi_numeric.dtype)
@@ -905,12 +813,6 @@ class CSDI_base(nn.Module):
         gain = ((loss_num - loss_text) / loss_num.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
         if self.training:
             self._add_diag_scalar("text_gain_sum", "text_gain_count", gain)
-            if self.source_specific_text_gain and source_quality is not None:
-                with torch.no_grad():
-                    q = source_quality.detach().float()
-                    active = (q > 0).float().mean(dim=0)
-                    self.text_source_gain_sum.add_(gain.detach().float() * active)
-                    self.text_source_gain_count.add_(active)
         self._add_diag_scalar("diag_text_gain_batch_sum", "diag_text_gain_batch_count", gain)
         return gain.detach().to(device=pi_numeric.device, dtype=pi_numeric.dtype)
 
@@ -927,16 +829,7 @@ class CSDI_base(nn.Module):
             numeric_logits.device,
             numeric_logits.dtype,
         )
-        source_quality = self._compute_text_source_quality(
-            text_evidence_vec,
-            text_mask,
-            batch_size,
-            numeric_logits.device,
-            numeric_logits.dtype,
-        )
-        text_gain = self._compute_text_gain(observed_data, cond_mask, pi_num, pi_text, source_quality=source_quality)
-        if self.source_specific_text_gain:
-            text_quality = source_quality.sum(dim=1).clamp(0.0, 1.0)
+        text_gain = self._compute_text_gain(observed_data, cond_mask, pi_num, pi_text)
         w_auto = (text_quality * router_agreement * text_gain).clamp(min=0.0, max=1.0)
         self._add_diag_scalar("diag_w_auto_sum", "diag_w_auto_count", w_auto, count=None, sq_sum_name="diag_w_auto_sq_sum")
         self._add_diag_scalar("diag_text_quality_sum", "diag_text_quality_count", text_quality, count=None)
@@ -996,100 +889,6 @@ class CSDI_base(nn.Module):
         hist_mask = cond_mask[:, :, :hist_len].float()
         expert_futures = self._build_expert_futures_from_history(hist, hist_mask, future_len)
         return baseline, expert_futures
-
-    def _build_timestamp_prior_baseline(self, observed_data, cond_mask, timesteps):
-        baseline = torch.zeros_like(observed_data)
-        if (not self.timestamp_prior) or timesteps is None:
-            return baseline, torch.zeros((observed_data.shape[0],), device=observed_data.device, dtype=observed_data.dtype)
-        B, K, L = observed_data.shape
-        hist_len = min(max(int(self.lookback_len), 1), L)
-        future_len = min(max(int(self.pred_len), 0), max(L - hist_len, 0))
-        if future_len <= 0:
-            return baseline, torch.zeros((B,), device=observed_data.device, dtype=observed_data.dtype)
-        ts = timesteps
-        if ts.dim() != 3:
-            return baseline, torch.zeros((B,), device=observed_data.device, dtype=observed_data.dtype)
-        if ts.shape[-1] != L and ts.shape[1] == L:
-            ts = ts.permute(0, 2, 1)
-        if ts.shape[-1] < hist_len + future_len:
-            return baseline, torch.zeros((B,), device=observed_data.device, dtype=observed_data.dtype)
-
-        hist = observed_data[:, :, :hist_len]
-        hist_mask = cond_mask[:, :, :hist_len].float()
-        hist_time_mask = (hist_mask.sum(dim=1) > 0).float()
-        mean = self._masked_mean(hist, hist_mask, dim=2, keepdim=True)
-        filled_hist = torch.where(hist_mask > 0, hist, mean.expand_as(hist))
-        hist_ts = ts[:, :, :hist_len].float()
-        future_ts = ts[:, :, hist_len:hist_len + future_len].float()
-
-        diff = future_ts.transpose(1, 2).unsqueeze(2) - hist_ts.transpose(1, 2).unsqueeze(1)
-        dist = (diff ** 2).mean(dim=-1)
-        temp = max(float(self.timestamp_prior_temperature), 1e-6)
-        logits = -dist / temp
-        logits = logits.masked_fill(hist_time_mask.unsqueeze(1) <= 0, -1e4)
-        weights = torch.softmax(logits, dim=-1)
-        matched = torch.einsum("bfh,bkh->bkf", weights, filled_hist)
-        last = filled_hist[:, :, -1:]
-        first = filled_hist[:, :, 0:1]
-        slope = (last - first) / max(hist_len - 1, 1)
-        steps = torch.arange(1, future_len + 1, device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
-        trend = last + slope * steps
-        mix = min(max(float(self.timestamp_prior_trend_mix), 0.0), 1.0)
-        future = (1.0 - mix) * matched + mix * trend
-        baseline[:, :, hist_len:hist_len + future_len] = future
-        match_score = weights.max(dim=-1).values.mean(dim=1).clamp(min=0.0, max=1.0)
-        return baseline, match_score
-
-    def _compute_weak_timestamp_baseline(self, timestamp_baseline, observed_data, target_mask, match_score, use_training_target):
-        if (not self.timestamp_prior) or timestamp_baseline is None:
-            return torch.zeros_like(observed_data)
-        segments = self._segment_slices()
-        if not segments:
-            return torch.zeros_like(observed_data)
-        running_q = self._segment_running_mean(self.timestamp_segment_q_sum, self.timestamp_segment_q_count).to(
-            device=observed_data.device,
-            dtype=observed_data.dtype,
-        )
-        segment_reliability = self.multi_res_segment_reliability.detach().to(device=observed_data.device, dtype=observed_data.dtype).clamp(0.0, 1.0)
-        scaled = torch.zeros_like(timestamp_baseline)
-        alpha_values = []
-        max_segments = int(self.timestamp_segment_q_sum.numel())
-        for segment_idx, (_, start, end) in enumerate(segments):
-            if segment_idx >= max_segments:
-                continue
-            end = min(end, observed_data.shape[-1])
-            if end <= start:
-                continue
-            future_baseline = timestamp_baseline[:, :, start:end]
-            if use_training_target:
-                future_mask = target_mask[:, :, start:end].float()
-                future_target = observed_data[:, :, start:end]
-                if future_mask.sum() > 0:
-                    denom = future_mask.sum().clamp(min=1.0)
-                    baseline_mse = (((future_baseline - future_target) * future_mask) ** 2).sum() / denom
-                    target_mean = (future_target * future_mask).sum() / denom
-                    target_var = (((future_target - target_mean) * future_mask) ** 2).sum() / denom
-                    q_t = (1.0 - baseline_mse / target_var.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
-                    with torch.no_grad():
-                        self.timestamp_segment_q_sum[segment_idx].add_(q_t.detach().float())
-                        self.timestamp_segment_q_count[segment_idx].add_(1.0)
-                        self.diag_timestamp_baseline_mse_sum[segment_idx].add_(baseline_mse.detach().float())
-                        self.diag_timestamp_baseline_mse_count[segment_idx].add_(1.0)
-                else:
-                    q_t = running_q[segment_idx] if segment_idx < running_q.numel() else torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
-            else:
-                q_t = running_q[segment_idx] if segment_idx < running_q.numel() else torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
-            rel_s = segment_reliability[segment_idx] if segment_idx < segment_reliability.numel() else torch.ones((), device=observed_data.device, dtype=observed_data.dtype)
-            alpha_s = (q_t.detach() * rel_s * match_score.reshape(-1)).clamp(min=0.0, max=max(float(self.timestamp_prior_max_alpha), 0.0))
-            scaled[:, :, start:end] = future_baseline * alpha_s.reshape(-1, 1, 1)
-            alpha_values.append(alpha_s)
-            with torch.no_grad():
-                self.diag_timestamp_alpha_sum[segment_idx].add_(alpha_s.detach().float().mean())
-                self.diag_timestamp_alpha_sq_sum[segment_idx].add_((alpha_s.detach().float() ** 2).mean())
-                self.diag_timestamp_alpha_count[segment_idx].add_(1.0)
-        if alpha_values:
-            self._add_diag_scalar("diag_timestamp_budget_sum", "diag_timestamp_budget_count", torch.stack(alpha_values, dim=1), count=None)
-        return scaled
 
     def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0):
         B, K, L = observed_data.shape
@@ -1292,7 +1091,6 @@ class CSDI_base(nn.Module):
         target_mask = observed_mask - cond_mask
         pattern = None
         pattern_baseline = None
-        timestamp_baseline = None
         diffusion_target = observed_data
         if self.pattern_residual_diffusion and not self.noise_esti:
             pattern = self._compute_pattern_outputs(
@@ -1313,16 +1111,6 @@ class CSDI_base(nn.Module):
             else:
                 pattern_baseline = pattern["baseline"]
             diffusion_target = observed_data - pattern_baseline
-        if self.timestamp_prior and self.timestamp_prior_residual and not self.noise_esti:
-            timestamp_raw, timestamp_match = self._build_timestamp_prior_baseline(observed_data, cond_mask, timesteps)
-            timestamp_baseline = self._compute_weak_timestamp_baseline(
-                timestamp_raw,
-                observed_data,
-                target_mask,
-                timestamp_match,
-                use_training_target=(is_train == 1),
-            )
-            diffusion_target = diffusion_target - timestamp_baseline
 
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
@@ -1371,8 +1159,6 @@ class CSDI_base(nn.Module):
         else:
             pattern_aux = torch.zeros((), device=observed_data.device)
             pattern_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
-        if timestamp_baseline is not None:
-            predicted_series = predicted_series + timestamp_baseline
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.multi_res_horizons) > 0:
             aux_loss = self._calc_multi_res_loss(observed_data, predicted_series, target_mask, t=t, trend_prior=trend_prior)
             if self.final_method:
@@ -1720,7 +1506,6 @@ class CSDI_base(nn.Module):
             observed_data = (observed_data - means) / stdev
 
         pattern_baseline = None
-        timestamp_baseline = None
         diffusion_observed_data = observed_data
         if self.pattern_residual_diffusion and not self.noise_esti:
             pattern_guidance_scale = self.guide_w_default if guide_w is None else float(guide_w)
@@ -1742,16 +1527,6 @@ class CSDI_base(nn.Module):
             else:
                 pattern_baseline = pattern["baseline"]
             diffusion_observed_data = observed_data - pattern_baseline
-        if self.timestamp_prior and self.timestamp_prior_residual and not self.noise_esti:
-            timestamp_raw, timestamp_match = self._build_timestamp_prior_baseline(observed_data, cond_mask, timesteps)
-            timestamp_baseline = self._compute_weak_timestamp_baseline(
-                timestamp_raw,
-                observed_data,
-                torch.zeros_like(cond_mask),
-                timestamp_match,
-                use_training_target=False,
-            )
-            diffusion_observed_data = diffusion_observed_data - timestamp_baseline
         
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
         cfg_mask = None
@@ -1838,8 +1613,6 @@ class CSDI_base(nn.Module):
             sample = current_sample.detach()
             if pattern_baseline is not None:
                 sample = sample + pattern_baseline.detach()
-            if timestamp_baseline is not None:
-                sample = sample + timestamp_baseline.detach()
             imputed_samples[:, i] = sample
             if self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
@@ -1917,31 +1690,6 @@ class CSDI_Forecasting(CSDI_base):
             text_quality_raw = text_quality_raw.to(self.device).float().reshape(-1)
         else:
             text_quality_raw = text_mask
-        text_quality_ret = batch.get("text_quality_ret")
-        if text_quality_ret is not None:
-            text_quality_ret = text_quality_ret.to(self.device).float().reshape(-1)
-        else:
-            text_quality_ret = torch.zeros_like(text_quality_raw)
-        text_quality_cot = batch.get("text_quality_cot")
-        if text_quality_cot is not None:
-            text_quality_cot = text_quality_cot.to(self.device).float().reshape(-1)
-        else:
-            text_quality_cot = torch.zeros_like(text_quality_raw)
-        text_gate_raw = batch.get("text_gate_raw")
-        if text_gate_raw is not None:
-            text_gate_raw = text_gate_raw.to(self.device).float().reshape(-1)
-        else:
-            text_gate_raw = text_quality_raw
-        text_gate_ret = batch.get("text_gate_ret")
-        if text_gate_ret is not None:
-            text_gate_ret = text_gate_ret.to(self.device).float().reshape(-1)
-        else:
-            text_gate_ret = torch.minimum(text_quality_ret, text_gate_raw)
-        text_gate_cot = batch.get("text_gate_cot")
-        if text_gate_cot is not None:
-            text_gate_cot = text_gate_cot.to(self.device).float().reshape(-1)
-        else:
-            text_gate_cot = torch.minimum(text_quality_cot, text_gate_ret)
         trend_prior_num = batch.get("trend_prior_num", batch.get("trend_prior"))
         if trend_prior_num is None:
             trend_prior_num = torch.zeros((observed_data.shape[0], 3), device=self.device)
@@ -1959,24 +1707,15 @@ class CSDI_Forecasting(CSDI_base):
             text_evidence_vec = torch.stack(
                 [
                     text_quality_raw,
-                    text_gate_raw,
-                    text_gate_ret,
-                    text_gate_cot,
-                    torch.minimum(text_quality_ret, text_quality_raw),
-                    torch.minimum(text_quality_cot, torch.minimum(text_quality_ret, text_quality_raw)),
-                    text_mask,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
+                    text_quality_raw,
                 ],
                 dim=1,
             )
-        source_quality_vec = torch.stack(
-            [
-                text_gate_raw.clamp(0.0, 1.0),
-                torch.minimum(text_gate_ret, text_gate_raw).clamp(0.0, 1.0),
-                torch.minimum(text_gate_cot, torch.minimum(text_gate_ret, text_gate_raw)).clamp(0.0, 1.0),
-            ],
-            dim=1,
-        )
-        text_evidence_vec = torch.cat([text_evidence_vec, source_quality_vec], dim=1)
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)

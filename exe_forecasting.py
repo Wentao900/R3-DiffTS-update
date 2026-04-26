@@ -10,7 +10,7 @@ import math
 
 from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
-from utils.utils import train, evaluate
+from utils.utils import train, evaluate, fit_forecast_calibrator
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
@@ -513,6 +513,12 @@ if "multi_res_difficulty_gamma" in config["train"]:
     config["train"]["multi_res_difficulty_gamma"] = float(config["train"]["multi_res_difficulty_gamma"])
 config["train"]["multi_res_acf_reliability_threshold"] = float(config["train"].get("multi_res_acf_reliability_threshold", 0.2))
 config["train"]["multi_res_acf_reliability_temperature"] = float(config["train"].get("multi_res_acf_reliability_temperature", 0.05))
+config["train"]["forecast_point_estimator"] = str(config["train"].get("forecast_point_estimator", "mean")).lower()
+config["train"]["forecast_calibrator"] = bool(config["train"].get("forecast_calibrator", False))
+config["train"]["forecast_calibrator_ridge"] = float(config["train"].get("forecast_calibrator_ridge", 1e-3))
+config["train"]["forecast_calibrator_min_gain"] = float(config["train"].get("forecast_calibrator_min_gain", 0.0))
+config["train"]["forecast_calibrator_max_strength"] = float(config["train"].get("forecast_calibrator_max_strength", 1.0))
+config["train"]["forecast_calibrator_max_batches"] = int(config["train"].get("forecast_calibrator_max_batches", 0))
 legacy_model_keys = [
     "pattern_adaptive",
     "pattern_disable_legacy_text_gates",
@@ -682,6 +688,24 @@ else:
     model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth"))
 model.target_dim = target_dim
 guide_sweep_metrics = []
+forecast_calibrator = None
+if config["train"].get("forecast_calibrator", False):
+    forecast_calibrator = fit_forecast_calibrator(
+        model,
+        valid_loader,
+        nsample=args.nsample,
+        foldername=foldername,
+        guide_w=0,
+        ridge_alpha=config["train"].get("forecast_calibrator_ridge", 1e-3),
+        min_gain=config["train"].get("forecast_calibrator_min_gain", 0.0),
+        max_strength=config["train"].get("forecast_calibrator_max_strength", 1.0),
+        max_batches=config["train"].get("forecast_calibrator_max_batches", 0),
+    )
+    if forecast_calibrator is not None:
+        printable_calibrator = {k: v for k, v in forecast_calibrator.items() if k != "coefficients"}
+        print("forecast calibrator:", json.dumps(printable_calibrator, indent=4))
+    else:
+        print("forecast calibrator: unavailable")
 if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
     best_mse = 10e10
     best_metrics = None
@@ -703,7 +727,9 @@ if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
             guide_w=guide_w,
             save_attn=args.save_attn,
             save_token=args.save_token,
-            save_trend_prior=args.save_trend_prior
+            save_trend_prior=args.save_trend_prior,
+            point_estimator=config["train"].get("forecast_point_estimator", "mean"),
+            forecast_calibrator=forecast_calibrator,
         )
         guide_sweep_metrics.append(metrics)
         if metrics["MSE"] < best_mse:
@@ -720,7 +746,9 @@ else:
             window_lens=[args.seq_len, args.pred_len],
             save_attn=args.save_attn,
             save_token=args.save_token,
-            save_trend_prior=args.save_trend_prior
+            save_trend_prior=args.save_trend_prior,
+            point_estimator=config["train"].get("forecast_point_estimator", "mean"),
+            forecast_calibrator=forecast_calibrator,
         )
     guide_sweep_metrics.append(best_metrics)
 

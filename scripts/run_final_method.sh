@@ -43,6 +43,12 @@ cfg["model"]["pattern_text_evidence"] = True
 cfg["train"]["multi_res_segment_loss"] = True
 cfg["train"]["multi_res_use_stat_horizons"] = True
 cfg["train"].pop("multi_res_difficulty_gamma", None)
+cfg["train"]["forecast_point_estimator"] = "auto"
+cfg["train"]["forecast_calibrator"] = True
+cfg["train"]["forecast_calibrator_ridge"] = 0.001
+cfg["train"]["forecast_calibrator_min_gain"] = 0.0
+cfg["train"]["forecast_calibrator_max_strength"] = 1.0
+cfg["train"]["forecast_calibrator_max_batches"] = 0
 os.makedirs(os.path.dirname(final_path), exist_ok=True)
 with open(final_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)

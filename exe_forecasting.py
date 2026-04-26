@@ -519,6 +519,9 @@ config["train"]["forecast_calibrator_ridge"] = float(config["train"].get("foreca
 config["train"]["forecast_calibrator_min_gain"] = float(config["train"].get("forecast_calibrator_min_gain", 0.0))
 config["train"]["forecast_calibrator_max_strength"] = float(config["train"].get("forecast_calibrator_max_strength", 1.0))
 config["train"]["forecast_calibrator_max_batches"] = int(config["train"].get("forecast_calibrator_max_batches", 0))
+config["train"]["forecast_calibrator_holdout_fraction"] = float(config["train"].get("forecast_calibrator_holdout_fraction", 0.35))
+config["train"]["forecast_calibrator_residual_clip_quantile"] = float(config["train"].get("forecast_calibrator_residual_clip_quantile", 0.95))
+config["train"]["forecast_calibrator_include_timestamp"] = bool(config["train"].get("forecast_calibrator_include_timestamp", False))
 legacy_model_keys = [
     "pattern_adaptive",
     "pattern_disable_legacy_text_gates",
@@ -700,6 +703,9 @@ if config["train"].get("forecast_calibrator", False):
         min_gain=config["train"].get("forecast_calibrator_min_gain", 0.0),
         max_strength=config["train"].get("forecast_calibrator_max_strength", 1.0),
         max_batches=config["train"].get("forecast_calibrator_max_batches", 0),
+        holdout_fraction=config["train"].get("forecast_calibrator_holdout_fraction", 0.35),
+        residual_clip_quantile=config["train"].get("forecast_calibrator_residual_clip_quantile", 0.95),
+        include_timestamp=config["train"].get("forecast_calibrator_include_timestamp", False),
     )
     if forecast_calibrator is not None:
         printable_calibrator = {k: v for k, v in forecast_calibrator.items() if k != "coefficients"}

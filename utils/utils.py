@@ -4,6 +4,7 @@ from torch.optim import Adam, AdamW
 from tqdm import tqdm
 import os
 import json
+import math
 
 
 FORECAST_CANDIDATE_NAMES = [
@@ -222,8 +223,10 @@ def build_forecast_candidates(samples, target, eval_points, observed_points):
     return torch.stack(candidates, dim=-1)
 
 
-def _append_model_side_candidates(model, batch, candidates, target, eval_points, observed_points):
+def _append_model_side_candidates(model, batch, candidates, target, eval_points, observed_points, include_timestamp=False):
     candidate_names = list(FORECAST_CANDIDATE_NAMES)
+    if not include_timestamp:
+        return candidates, candidate_names
     if not getattr(model, "timestep_branch", False):
         return candidates, candidate_names
     if not isinstance(batch, dict) or "timesteps" not in batch or not hasattr(model, "timestep_pred"):
@@ -272,6 +275,7 @@ def _apply_forecast_calibrator(candidates, eval_points, calibrator, base_predict
     if coeffs.ndim != 2 or coeffs.shape[1] != candidates.shape[-1] + 1:
         return base_prediction
     strength = float(min(max(calibrator.get("apply_strength", 1.0), 0.0), 1.0))
+    residual_clip = float(calibrator.get("residual_clip", 0.0) or 0.0)
     base = candidates[..., 0] if base_prediction is None else base_prediction
     calibrated = base.clone()
     future_rank = eval_points.cumsum(dim=1).long() - 1
@@ -281,6 +285,8 @@ def _apply_forecast_calibrator(candidates, eval_points, calibrator, base_predict
         if not mask.any():
             continue
         pred_h = coeffs[h, 0] + (candidates * coeffs[h, 1:].view(1, 1, 1, -1)).sum(dim=-1)
+        if residual_clip > 0:
+            pred_h = base + (pred_h - base).clamp(min=-residual_clip, max=residual_clip)
         calibrated = torch.where(mask, pred_h, calibrated)
     return strength * calibrated + (1.0 - strength) * base
 
@@ -300,6 +306,9 @@ def fit_forecast_calibrator(
     min_gain=0.0,
     max_strength=1.0,
     max_batches=0,
+    holdout_fraction=0.35,
+    residual_clip_quantile=0.95,
+    include_timestamp=False,
 ):
     if valid_loader is None:
         return None
@@ -330,6 +339,7 @@ def fit_forecast_calibrator(
                     c_target,
                     eval_points,
                     observed_points,
+                    include_timestamp=include_timestamp,
                 )
                 sample_mean = candidates[..., 0]
                 sample_median = candidates[..., 1]
@@ -351,49 +361,87 @@ def fit_forecast_calibrator(
     max_horizon = max(rows_by_horizon) + 1
     coeffs = np.zeros((max_horizon, len(candidate_names) + 1), dtype=np.float64)
     coeffs[:, 1] = 1.0
+    holdout_rows = {}
+    holdout_targets = {}
+    fit_mse_calibrated_num = fit_count = 0.0
     for h in range(max_horizon):
         if h not in rows_by_horizon:
             continue
         X = np.concatenate(rows_by_horizon[h], axis=0)
         y = np.concatenate(target_by_horizon[h], axis=0)
-        if X.shape[0] < max(8, X.shape[1] + 2):
+        min_fit = max(8, X.shape[1] + 2)
+        if X.shape[0] < min_fit + 4:
             continue
-        coef = _fit_ridge(X, y, ridge_alpha)
+        holdout_size = int(math.ceil(X.shape[0] * min(max(float(holdout_fraction), 0.1), 0.5)))
+        holdout_size = min(max(holdout_size, 4), max(X.shape[0] - min_fit, 0))
+        if holdout_size <= 0:
+            continue
+        split = X.shape[0] - holdout_size
+        X_fit, y_fit = X[:split], y[:split]
+        X_hold, y_hold = X[split:], y[split:]
+        coef = _fit_ridge(X_fit, y_fit, ridge_alpha)
         if coef is not None and np.all(np.isfinite(coef)):
             coeffs[h] = coef
+            X_fit_aug = np.concatenate([np.ones((X_fit.shape[0], 1), dtype=np.float64), X_fit], axis=1)
+            fit_pred = X_fit_aug @ coeffs[h]
+            fit_mse_calibrated_num += float(np.square(fit_pred - y_fit).sum())
+            fit_count += float(y_fit.shape[0])
+        holdout_rows[h] = X_hold
+        holdout_targets[h] = y_hold
 
     valid_mse_mean = mse_mean_num / max(mse_base_count, 1.0)
     valid_mse_median = mse_median_num / max(mse_base_count, 1.0)
-    cal_num = cal_count = 0.0
-    for h, rows in rows_by_horizon.items():
-        X = np.concatenate(rows, axis=0)
-        y = np.concatenate(target_by_horizon[h], axis=0)
+    holdout_mean_num = holdout_median_num = holdout_cal_num = holdout_count = 0.0
+    residual_pool = []
+    for h, X in holdout_rows.items():
+        y = holdout_targets[h]
         X_aug = np.concatenate([np.ones((X.shape[0], 1), dtype=np.float64), X], axis=1)
         pred = X_aug @ coeffs[h]
-        cal_num += float(np.square(pred - y).sum())
-        cal_count += float(y.shape[0])
-    valid_mse_calibrated = cal_num / max(cal_count, 1.0)
-    if valid_mse_mean <= valid_mse_median:
-        base_mse = valid_mse_mean
+        holdout_mean_num += float(np.square(X[:, 0] - y).sum())
+        holdout_median_num += float(np.square(X[:, 1] - y).sum())
+        holdout_cal_num += float(np.square(pred - y).sum())
+        holdout_count += float(y.shape[0])
+    holdout_mse_mean = holdout_mean_num / max(holdout_count, 1.0)
+    holdout_mse_median = holdout_median_num / max(holdout_count, 1.0)
+    valid_mse_calibrated = holdout_cal_num / max(holdout_count, 1.0)
+    fit_mse_calibrated = fit_mse_calibrated_num / max(fit_count, 1.0)
+    if holdout_mse_mean <= holdout_mse_median:
+        base_mse = holdout_mse_mean
         base_estimator = "mean"
     else:
-        base_mse = valid_mse_median
+        base_mse = holdout_mse_median
         base_estimator = "median"
+    for h, X in holdout_rows.items():
+        y = holdout_targets[h]
+        base = X[:, 0] if base_estimator == "mean" else X[:, 1]
+        residual_pool.append(np.abs(y - base))
+    if residual_pool:
+        residual_clip = float(np.quantile(np.concatenate(residual_pool), min(max(float(residual_clip_quantile), 0.5), 1.0)))
+    else:
+        residual_clip = 0.0
     gain = max((base_mse - valid_mse_calibrated) / max(base_mse, 1e-8), 0.0)
     if gain <= float(max(min_gain, 0.0)):
         strength = 0.0
     else:
-        strength = float(min(max(max_strength, 0.0), 1.0))
+        strength = float(min(max(max_strength, 0.0), 1.0, gain))
     return {
         "enabled": True,
+        "guarded": True,
         "candidate_names": list(candidate_names),
         "ridge_alpha": float(ridge_alpha),
+        "holdout_fraction": float(holdout_fraction),
         "valid_mse_mean": float(valid_mse_mean),
         "valid_mse_median": float(valid_mse_median),
         "valid_mse_calibrated": float(valid_mse_calibrated),
+        "fit_mse_calibrated": float(fit_mse_calibrated),
+        "holdout_mse_mean": float(holdout_mse_mean),
+        "holdout_mse_median": float(holdout_mse_median),
         "valid_gain": float(gain),
         "base_estimator": base_estimator,
         "apply_strength": strength,
+        "residual_clip": float(residual_clip),
+        "residual_clip_quantile": float(residual_clip_quantile),
+        "include_timestamp": bool(include_timestamp),
         "coefficients": coeffs.tolist(),
     }
 
@@ -450,6 +498,11 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     c_target,
                     eval_points.float(),
                     observed_points.float(),
+                    include_timestamp=bool(
+                        forecast_calibrator
+                        and forecast_calibrator.get("include_timestamp", False)
+                        and "timestamp_branch" in forecast_calibrator.get("candidate_names", [])
+                    ),
                 )
                 samples_mean = candidates[..., 0]
                 samples_median = candidates[..., 1]

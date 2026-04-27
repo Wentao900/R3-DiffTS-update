@@ -47,6 +47,7 @@ def train(
     )
 
     best_valid_loss = 1e10
+    saved_best_model = False
     max_train_batches = min(len(train_loader), int(config["itr_per_epoch"]))
     print(f"[train] batches per epoch: {max_train_batches} (loader={len(train_loader)}, itr_per_epoch={config['itr_per_epoch']})")
     for epoch_no in range(config["epochs"]):
@@ -88,11 +89,13 @@ def train(
         if valid_loader is not None and (epoch_no + 1) % valid_epoch_interval == 0:
             model.eval()
             avg_loss_valid = 0
+            valid_batch_count = 0
             with torch.no_grad():
                 with tqdm(valid_loader, mininterval=5.0, maxinterval=50.0) as it:
                     for batch_no, valid_batch in enumerate(it, start=1):
                         loss = model(valid_batch, is_train=0)
                         avg_loss_valid += loss.item()
+                        valid_batch_count = batch_no
                         it.set_postfix(
                             ordered_dict={
                                 "valid_avg_epoch_loss": avg_loss_valid / batch_no,
@@ -100,17 +103,22 @@ def train(
                             },
                             refresh=False,
                         )
-            if best_valid_loss > avg_loss_valid:
-                best_valid_loss = avg_loss_valid
+            current_valid_loss = avg_loss_valid / max(valid_batch_count, 1)
+            if best_valid_loss > current_valid_loss:
+                best_valid_loss = current_valid_loss
+                if foldername != "":
+                    torch.save(model.state_dict(), output_path)
+                    saved_best_model = True
                 print(
                     "\n best loss is updated to ",
-                    avg_loss_valid / batch_no,
+                    current_valid_loss,
                     "at",
                     epoch_no,
                 )
 
     if foldername != "":
-        torch.save(model.state_dict(), output_path)
+        if valid_loader is None or not saved_best_model:
+            torch.save(model.state_dict(), output_path)
 
 
 def quantile_loss(target, forecast, q: float, eval_points) -> float:

@@ -52,6 +52,16 @@ cfg["train"]["forecast_calibrator_max_batches"] = 0
 cfg["train"]["forecast_calibrator_holdout_fraction"] = 0.35
 cfg["train"]["forecast_calibrator_residual_clip_quantile"] = 0.95
 cfg["train"]["forecast_calibrator_include_timestamp"] = False
+cfg["train"]["forecast_calibrator_season_acf_threshold"] = 0.3
+cfg["train"]["forecast_calibrator_season_max_periods"] = 8
+cfg["train"]["forecast_calibrator_block_count"] = 4
+cfg["train"]["forecast_calibrator_block_min_pos_ratio"] = 0.5
+cfg["train"]["forecast_calibrator_reliability_floor"] = 0.5
+cfg["train"]["forecast_calibrator_reliability_threshold"] = 0.4
+cfg["train"]["forecast_calibrator_reliability_temperature"] = 0.15
+cfg["train"]["forecast_calibrator_solver"] = "nnls"
+cfg["train"]["forecast_calibrator_fused_smoothing"] = 0.25
+cfg["train"]["forecast_calibrator_force_mean_when_off"] = True
 os.makedirs(os.path.dirname(final_path), exist_ok=True)
 with open(final_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)

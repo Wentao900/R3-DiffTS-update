@@ -715,6 +715,9 @@ if config["train"].get("forecast_calibrator", False):
 if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
     best_mse = 10e10
     best_metrics = None
+    best_guide_w = None
+    selection_loader = valid_loader if valid_loader is not None else test_loader
+    selection_split = "valid" if valid_loader is not None else "test"
     if args.guide_w >= 0:
         guide_list = [args.guide_w]
     elif args.guide_list.strip():
@@ -724,7 +727,7 @@ if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
     for guide_w in guide_list:
         metrics = evaluate(
             model,
-            test_loader,
+            selection_loader,
             nsample=args.nsample,
             scaler=scaler,
             mean_scaler=mean_scaler,
@@ -737,10 +740,30 @@ if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
             point_estimator=config["train"].get("forecast_point_estimator", "mean"),
             forecast_calibrator=forecast_calibrator,
         )
+        metrics = {**metrics, "selection_split": selection_split}
         guide_sweep_metrics.append(metrics)
         if metrics["MSE"] < best_mse:
             best_mse = metrics["MSE"]
             best_metrics = metrics
+            best_guide_w = guide_w
+    if best_guide_w is not None:
+        best_metrics = evaluate(
+            model,
+            test_loader,
+            nsample=args.nsample,
+            scaler=scaler,
+            mean_scaler=mean_scaler,
+            foldername=foldername,
+            window_lens=[args.seq_len, args.pred_len],
+            guide_w=best_guide_w,
+            save_attn=args.save_attn,
+            save_token=args.save_token,
+            save_trend_prior=args.save_trend_prior,
+            point_estimator=config["train"].get("forecast_point_estimator", "mean"),
+            forecast_calibrator=forecast_calibrator,
+        )
+        best_metrics["selected_guide_w"] = best_guide_w
+        best_metrics["selection_split"] = selection_split
 else:
     best_metrics = evaluate(
             model,

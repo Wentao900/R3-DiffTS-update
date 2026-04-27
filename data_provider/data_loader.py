@@ -816,11 +816,50 @@ class Dataset_Custom(Dataset):
 
         self.data_stamp = data_stamp
         self.num_dates = df_num[['start_date', 'end_date']][border1:border2].reset_index(drop=True)
-        self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[(df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)]
-        self.search_df = df_search[['start_date', 'end_date', 'fact']]
+        self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[
+            (df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)
+        ].reset_index(drop=True)
+        self.search_df = df_search[['start_date', 'end_date', 'fact']].loc[
+            df_search.end_date <= final_end_date
+        ].reset_index(drop=True)
 
     def _collect_window_reports(self, start_date, end_date):
         return self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
+
+    def _truncate_recent_text(self, segments):
+        cleaned_segments = [str(segment).strip() for segment in segments if str(segment).strip()]
+        if not cleaned_segments:
+            return "NA"
+
+        token_budget = max(int(self.max_text_tokens), 1)
+        desc = cleaned_segments[0] if cleaned_segments and cleaned_segments[0] == self.desc else None
+        desc_tokens = desc.split() if desc else []
+        if len(desc_tokens) >= token_budget:
+            return " ".join(desc_tokens[:token_budget])
+
+        remaining_budget = token_budget - len(desc_tokens)
+        source_segments = cleaned_segments[1:] if desc else cleaned_segments
+        selected_recent = []
+        used_tokens = 0
+        for segment in reversed(source_segments):
+            segment_tokens = segment.split()
+            if not segment_tokens:
+                continue
+            if used_tokens + len(segment_tokens) > remaining_budget:
+                if not selected_recent and remaining_budget > 0:
+                    selected_recent.append(" ".join(segment_tokens[-remaining_budget:]))
+                break
+            selected_recent.append(segment)
+            used_tokens += len(segment_tokens)
+
+        selected_recent.reverse()
+        final_segments = []
+        if desc:
+            final_segments.append(desc)
+        final_segments.extend(selected_recent)
+        if not final_segments:
+            return " ".join(desc_tokens[:token_budget]) if desc_tokens else "NA"
+        return " ".join(final_segments)
 
     def collect_text(self, start_date, end_date):
         report = self._collect_window_reports(start_date, end_date)
@@ -861,12 +900,7 @@ class Dataset_Custom(Dataset):
             if segment not in seen:
                 filtered_report.append(segment)
                 seen.add(segment)
-        all_txt = ' '.join(filtered_report)
-        # basic cleanup and truncation for robustness
-        tokens = all_txt.split()
-        if len(tokens) > self.max_text_tokens:
-            tokens = tokens[:self.max_text_tokens]
-        all_txt = ' '.join(tokens)
+        all_txt = self._truncate_recent_text(filtered_report)
         return all_txt, text_mark, meta
     
     def __getitem__(self, index):
@@ -884,10 +918,12 @@ class Dataset_Custom(Dataset):
         seq_x_stamp = self.data_stamp[s_begin:s_end]
         seq_y_stamp = self.data_stamp[r_begin:r_end]
 
-        text_begin = s_end - self.text_len
-        text_end = s_end
+        text_begin = max(s_end - self.text_len, 0)
+        text_end = s_end - 1
+        history_start_date = self.num_dates.start_date[text_begin]
+        history_end_date = self.num_dates.end_date[text_end]
 
-        raw_text, txt_mark, text_meta = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
+        raw_text, txt_mark, text_meta = self.collect_text(history_start_date, history_end_date)
         text_dropped = False
         if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
             raw_text, txt_mark = 'NA', 0
@@ -900,8 +936,8 @@ class Dataset_Custom(Dataset):
             if cached is None:
                 guidance = self.rag_cot.build_guidance_text(
                     numeric_history=seq_x,
-                    start_date=self.num_dates.start_date[text_begin],
-                    end_date=self.num_dates.end_date[text_end - 1],
+                    start_date=history_start_date,
+                    end_date=history_end_date,
                     base_text=raw_text,
                 )
                 composed_text = guidance["composed_text"]
@@ -922,6 +958,23 @@ class Dataset_Custom(Dataset):
         ) else 0
 
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
+        quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
+        trend_prior_text, source_priors = self._build_text_trend_components(
+            raw_text,
+            rag_retrieved,
+            cot_text,
+            quality_pkg,
+            seq_x,
+        )
+        text_evidence_vec = self._build_window_evidence(
+            raw_text,
+            rag_retrieved,
+            cot_text,
+            quality_pkg,
+            source_priors,
+            text_meta,
+            seq_x,
+        )
         text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
             raw_events=text_meta.get("raw_events", []),
             retrieved_records=retrieved_records,
@@ -958,6 +1011,12 @@ class Dataset_Custom(Dataset):
             'retrieved_text': rag_retrieved,
             'trend_prior': trend_prior_num,
             'trend_prior_num': trend_prior_num,
+            'trend_prior_text': trend_prior_text,
+            'text_evidence_vec': text_evidence_vec,
+            'text_quality_raw': np.asarray(quality_pkg["quality_raw"], dtype=np.float32),
+            'text_quality_ret': np.asarray(quality_pkg["quality_ret"], dtype=np.float32),
+            'text_quality_cot': np.asarray(quality_pkg["quality_cot"], dtype=np.float32),
+            'text_quality_total': np.asarray(quality_pkg["quality_total"], dtype=np.float32),
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
 

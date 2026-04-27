@@ -617,6 +617,9 @@ dataset_cfg.update(config.get("dataset", {}))
 args.aug_noise_std = float(dataset_cfg.get("aug_noise_std", 0.0))
 args.aug_time_warp_prob = float(dataset_cfg.get("aug_time_warp_prob", 0.0))
 args.aug_segment_scale_std = float(dataset_cfg.get("aug_segment_scale_std", 0.1))
+args.use_all_numeric_features = bool(dataset_cfg.get("use_all_numeric_features", False))
+args.covariate_columns = dataset_cfg.get("covariate_columns", None)
+args.exclude_numeric_features = dataset_cfg.get("exclude_numeric_features", None)
 args.adaptive_noise_scale = float(config.get("train", {}).get("adaptive_noise_scale", 0.0))
 args.text_quality_coverage_mix = float(config["model"].get("text_quality_coverage_mix", 0.5))
 args.text_recency_tau_days = float(dataset_cfg.get("text_recency_tau_days", 14.0))
@@ -642,6 +645,12 @@ train_loader, valid_loader, test_loader, scaler, mean_scaler = get_dataloader(
     batch_size=config["train"]["batch_size"],
     args=args
 )
+
+if hasattr(train_loader, "dataset"):
+    dataset_feature_dim = int(getattr(train_loader.dataset, "feature_dim", target_dim))
+    target_dim = dataset_feature_dim
+    config["model"]["target_feature_index"] = int(getattr(train_loader.dataset, "target_index", 0))
+    config["model"]["feature_dim"] = dataset_feature_dim
 
 horizon_info = resolve_multi_res_horizons(
     config["train"],

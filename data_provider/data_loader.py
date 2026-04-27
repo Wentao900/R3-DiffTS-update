@@ -53,6 +53,7 @@ class Dataset_Custom(Dataset):
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h',
                  text_len=1, scaler_type='standard',
+                 use_all_numeric_features=False, covariate_columns=None, exclude_numeric_features=None,
                  max_text_tokens=256, text_drop_prob=0.0,
                  use_rag_cot=False, rag_topk=3, cot_model=None,
                  cot_max_new_tokens=96, cot_temperature=0.7,
@@ -94,6 +95,9 @@ class Dataset_Custom(Dataset):
         self.scale = scale
         self.timeenc = timeenc
         self.freq = freq
+        self.use_all_numeric_features = bool(use_all_numeric_features)
+        self.covariate_columns = list(covariate_columns) if covariate_columns else None
+        self.exclude_numeric_features = set(exclude_numeric_features or [])
         self.text_len = text_len
         self.max_text_tokens = max_text_tokens
         self.text_drop_prob = text_drop_prob
@@ -192,6 +196,17 @@ class Dataset_Custom(Dataset):
             )
         else:
             self.rag_cot = None
+
+    def _impute_numeric_frame(self, df_data, train_end_index):
+        observed_mask = (~df_data.isna()).astype(np.float32)
+        train_slice = df_data.iloc[:train_end_index].copy()
+        train_fill_values = train_slice.mean(axis=0, skipna=True)
+        train_fill_values = train_fill_values.fillna(0.0)
+        imputed = df_data.copy()
+        imputed = imputed.ffill()
+        imputed = imputed.fillna(train_fill_values)
+        imputed = imputed.fillna(0.0)
+        return imputed.astype(np.float32), observed_mask.values.astype(np.float32)
 
     def _sample_training_windows(self, num_samples):
         total = len(self)
@@ -783,16 +798,40 @@ class Dataset_Custom(Dataset):
         first_start_date = df_num.start_date[border1]
         final_end_date = df_num.end_date[border2-1]
 
-        df_data = df_num[[self.target]]
+        if self.use_all_numeric_features:
+            numeric_candidates = df_num.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_candidates = [col for col in numeric_candidates if col not in self.exclude_numeric_features]
+            if self.covariate_columns:
+                aux_cols = [col for col in self.covariate_columns if col in numeric_candidates and col != self.target]
+            else:
+                aux_cols = [col for col in numeric_candidates if col != self.target]
+            feature_cols = [self.target] + aux_cols if self.target in df_num.columns else aux_cols
+            if len(feature_cols) == 0:
+                feature_cols = [self.target]
+            # Keep target first so its index is stable across datasets.
+            dedup_feature_cols = []
+            for col in feature_cols:
+                if col not in dedup_feature_cols:
+                    dedup_feature_cols.append(col)
+            feature_cols = dedup_feature_cols
+            df_data = df_num[feature_cols]
+            self.feature_names = feature_cols
+            self.target_index = feature_cols.index(self.target) if self.target in feature_cols else 0
+        else:
+            df_data = df_num[[self.target]]
+            self.feature_names = [self.target]
+            self.target_index = 0
+
+        imputed_df_data, observed_mask_all = self._impute_numeric_frame(df_data, border2s[0])
 
         if self.scale:
-            train_data = df_data[border1s[0]:border2s[0]]
+            train_data = imputed_df_data[border1s[0]:border2s[0]]
             self.scaler.fit(train_data.values)
-            data = self.scaler.transform(df_data.values).astype(np.float32)
+            data = self.scaler.transform(imputed_df_data.values).astype(np.float32)
             self.mean_data = self.scaler.mean_
             self.std_data = self.scaler.scale_
         else:
-            data = df_data.values.astype(np.float32)
+            data = imputed_df_data.values.astype(np.float32)
 
         df_stamp = df_num[['date']][border1:border2]
         if self.timeenc == 0:
@@ -812,6 +851,8 @@ class Dataset_Custom(Dataset):
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
+        self.data_observed_mask = observed_mask_all[border1:border2].astype(np.float32)
+        self.feature_dim = int(self.data_x.shape[1])
 
 
         self.data_stamp = data_stamp
@@ -911,6 +952,7 @@ class Dataset_Custom(Dataset):
         r_end = r_begin + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end, :]
+        seq_x_observed_mask = self.data_observed_mask[s_begin:s_end, :]
         if self.set_type == 0 and (self.aug_noise_std > 0 or self.aug_time_warp_prob > 0):
             seq_x = self._apply_lookback_augmentation(seq_x)
         seq_y = self.data_y[r_begin:r_end, :]
@@ -985,9 +1027,15 @@ class Dataset_Custom(Dataset):
         )
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
+        if observed_data.shape[1] > 1:
+            aux_feature_mask = np.ones((observed_data.shape[1],), dtype=bool)
+            aux_feature_mask[self.target_index] = False
+            observed_data[self.seq_len:, aux_feature_mask] = 0.0
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
-        observed_mask = np.ones_like(observed_data)
-        gt_mask = np.concatenate([np.ones_like(seq_x), np.zeros_like(seq_y)], axis=0)
+        future_observed_mask = np.zeros_like(seq_y, dtype=np.float32)
+        future_observed_mask[:, self.target_index] = 1.0
+        observed_mask = np.concatenate([seq_x_observed_mask.astype(np.float32), future_observed_mask], axis=0)
+        gt_mask = np.concatenate([seq_x_observed_mask.astype(np.float32), np.zeros_like(future_observed_mask, dtype=np.float32)], axis=0)
 
         s = {
             'observed_data': observed_data,
@@ -1017,6 +1065,9 @@ class Dataset_Custom(Dataset):
             'text_quality_ret': np.asarray(quality_pkg["quality_ret"], dtype=np.float32),
             'text_quality_cot': np.asarray(quality_pkg["quality_cot"], dtype=np.float32),
             'text_quality_total': np.asarray(quality_pkg["quality_total"], dtype=np.float32),
+            'text_ret_mark': np.asarray(float(len(self._normalize_text(rag_retrieved)) > 0), dtype=np.float32),
+            'text_cot_mark': np.asarray(float(len(self._normalize_text(cot_text)) > 0), dtype=np.float32),
+            'target_feature_index': np.asarray(self.target_index, dtype=np.int64),
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
 

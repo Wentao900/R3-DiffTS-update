@@ -21,6 +21,9 @@ def data_provider(args, flag):
     freq = args.freq
     extra_kwargs = {'text_len': args.text_len}
     if args.data == 'custom':
+        extra_kwargs['use_all_numeric_features'] = getattr(args, "use_all_numeric_features", False)
+        extra_kwargs['covariate_columns'] = getattr(args, "covariate_columns", None)
+        extra_kwargs['exclude_numeric_features'] = getattr(args, "exclude_numeric_features", None)
         extra_kwargs['max_text_tokens'] = args.max_text_tokens
         extra_kwargs['text_drop_prob'] = args.text_drop_prob
         extra_kwargs['use_rag_cot'] = args.use_rag_cot

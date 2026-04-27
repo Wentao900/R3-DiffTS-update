@@ -36,13 +36,35 @@ with open(base_path, "r") as f:
     cfg = yaml.safe_load(f)
 cfg.setdefault("model", {})
 cfg.setdefault("train", {})
+cfg.setdefault("dataset", {})
 cfg["model"]["guide_mode"] = "auto"
 cfg["model"]["final_method"] = True
 cfg["model"]["pattern_residual_diffusion"] = True
 cfg["model"]["pattern_text_evidence"] = True
+cfg["model"]["use_forecast_policy_controller"] = True
+cfg["model"]["use_aux_forecast_heads"] = True
+cfg["model"]["use_coarse_forecast_head"] = True
+cfg["model"]["use_uncertainty_head"] = True
+cfg["model"]["coarse_forecast_blend"] = 0.15
+cfg["model"]["coarse_forecast_factor"] = 4
+cfg["model"]["aux_forecast_hidden_dim"] = 128
+cfg["model"]["forecast_policy_controller"] = {
+    "enabled": True,
+    "fine_topk_ratio": 0.35,
+    "max_fine_ratio": 0.6,
+    "min_fine_points": 1,
+    "rag_invalid_scale": 0.25,
+    "unclear_trend_scale": 0.5,
+    "sample_budget_floor": 0.5,
+    "sample_budget_ceiling": 1.0,
+    "turning_center": 0.35,
+    "turning_width": 0.18,
+}
 cfg["train"]["multi_res_segment_loss"] = True
 cfg["train"]["multi_res_use_stat_horizons"] = True
 cfg["train"].pop("multi_res_difficulty_gamma", None)
+cfg["train"]["coarse_forecast_weight"] = 0.05
+cfg["train"]["uncertainty_forecast_weight"] = 0.02
 cfg["train"]["forecast_point_estimator"] = "auto"
 cfg["train"]["forecast_calibrator"] = True
 cfg["train"]["forecast_calibrator_ridge"] = 1.0
@@ -62,6 +84,9 @@ cfg["train"]["forecast_calibrator_reliability_temperature"] = 0.15
 cfg["train"]["forecast_calibrator_solver"] = "nnls"
 cfg["train"]["forecast_calibrator_fused_smoothing"] = 0.25
 cfg["train"]["forecast_calibrator_force_mean_when_off"] = True
+domain = os.path.basename(base_path).split("_")[0].lower()
+if domain in {"economy", "energy", "agriculture"}:
+    cfg["dataset"]["use_all_numeric_features"] = True
 os.makedirs(os.path.dirname(final_path), exist_ok=True)
 with open(final_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)

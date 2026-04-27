@@ -6,6 +6,8 @@ import math
 import warnings
 from diff_models import diff_CSDI
 from utils.prepare4llm import get_llm
+from utils.controller import ForecastPolicyController
+from utils.forecast_modules import CoarseForecastHead, UncertaintyHead
 
 class moving_avg(nn.Module):
     """
@@ -138,6 +140,25 @@ class CSDI_base(nn.Module):
         self.guide_w_default = float(config["model"].get("guide_w_default", 1.0))
         self.guide_mode = str(config["model"].get("guide_mode", "manual")).lower()
         self.final_method = bool(config["model"].get("final_method", self.guide_mode == "auto"))
+        self.target_feature_index = int(config["model"].get("target_feature_index", 0))
+        controller_cfg = dict(config["model"].get("forecast_policy_controller", {}) or {})
+        self.use_forecast_policy_controller = bool(
+            config["model"].get("use_forecast_policy_controller", controller_cfg.get("enabled", False))
+        )
+        if self.use_forecast_policy_controller:
+            controller_cfg["enabled"] = True
+            self.forecast_policy_controller = ForecastPolicyController(self.pred_len, controller_cfg)
+        else:
+            self.forecast_policy_controller = None
+        self.policy_cond_dim = int(config["model"].get("policy_cond_dim", 16))
+        self.use_aux_forecast_heads = bool(config["model"].get("use_aux_forecast_heads", self.final_method))
+        self.use_coarse_forecast_head = bool(config["model"].get("use_coarse_forecast_head", self.use_aux_forecast_heads))
+        self.use_uncertainty_head = bool(config["model"].get("use_uncertainty_head", self.use_aux_forecast_heads))
+        self.coarse_forecast_weight = float(train_cfg.get("coarse_forecast_weight", 0.05 if self.use_coarse_forecast_head else 0.0))
+        self.uncertainty_forecast_weight = float(train_cfg.get("uncertainty_forecast_weight", 0.02 if self.use_uncertainty_head else 0.0))
+        self.coarse_forecast_blend = float(config["model"].get("coarse_forecast_blend", 0.15))
+        self.coarse_forecast_factor = int(config["model"].get("coarse_forecast_factor", 4))
+        self.aux_forecast_hidden_dim = int(config["model"].get("aux_forecast_hidden_dim", 128))
         self.pattern_reliability = bool(config["model"].get("pattern_reliability", True))
         self.pattern_reliability_threshold = float(config["model"].get("pattern_reliability_threshold", 0.35))
         self.pattern_reliability_temperature = float(config["model"].get("pattern_reliability_temperature", 0.1))
@@ -200,6 +221,8 @@ class CSDI_base(nn.Module):
         self.register_buffer("diag_main_loss_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_aux_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_multi_res_aux_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_coarse_aux_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("diag_uncertainty_aux_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_budget_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_pattern_budget_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("diag_mr_budget_sum", torch.zeros((), dtype=torch.float32))
@@ -275,6 +298,27 @@ class CSDI_base(nn.Module):
             )
         else:
             self.pattern_text_head = None
+        if self.use_coarse_forecast_head:
+            self.coarse_forecast_head = CoarseForecastHead(
+                lookback_len=self.lookback_len,
+                pred_len=self.pred_len,
+                cond_dim=self.policy_cond_dim,
+                hidden_dim=self.aux_forecast_hidden_dim,
+                coarse_factor=self.coarse_forecast_factor,
+                dropout=float(config["diffusion"].get("dropout", 0.0)),
+            )
+        else:
+            self.coarse_forecast_head = None
+        if self.use_uncertainty_head:
+            self.uncertainty_head = UncertaintyHead(
+                lookback_len=self.lookback_len,
+                pred_len=self.pred_len,
+                cond_dim=self.policy_cond_dim,
+                hidden_dim=self.aux_forecast_hidden_dim,
+                dropout=float(config["diffusion"].get("dropout", 0.0)),
+            )
+        else:
+            self.uncertainty_head = None
 
         config_diff = config["diffusion"]
         config_diff["side_dim"] = self.emb_total_dim
@@ -473,6 +517,8 @@ class CSDI_base(nn.Module):
         main_loss_mean = float(self.diag_main_loss_sum.detach().cpu().item() / max(loss_count, 1.0))
         pattern_aux_mean = float(self.diag_pattern_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         multi_res_aux_mean = float(self.diag_multi_res_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
+        coarse_aux_mean = float(self.diag_coarse_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
+        uncertainty_aux_mean = float(self.diag_uncertainty_aux_sum.detach().cpu().item() / max(loss_count, 1.0))
         segment_q_b = self._segment_running_mean(self.pattern_segment_q_b_sum, self.pattern_segment_q_b_count).detach().cpu().tolist()
         segment_alpha_count = self.diag_segment_alpha_count.detach().cpu().clamp(min=1.0)
         segment_alpha_mean_tensor = self.diag_segment_alpha_sum.detach().cpu() / segment_alpha_count
@@ -519,10 +565,14 @@ class CSDI_base(nn.Module):
                 "main_loss": main_loss_mean,
                 "pattern_aux": pattern_aux_mean,
                 "multi_res_aux": multi_res_aux_mean,
+                "coarse_aux": coarse_aux_mean,
+                "uncertainty_aux": uncertainty_aux_mean,
             },
             "loss_ratios": {
                 "pattern_aux_to_main": float(pattern_aux_mean / max(main_loss_mean, 1e-8)),
                 "multi_res_aux_to_main": float(multi_res_aux_mean / max(main_loss_mean, 1e-8)),
+                "coarse_aux_to_main": float(coarse_aux_mean / max(main_loss_mean, 1e-8)),
+                "uncertainty_aux_to_main": float(uncertainty_aux_mean / max(main_loss_mean, 1e-8)),
             },
         }
 
@@ -640,6 +690,10 @@ class CSDI_base(nn.Module):
         hist_len = min(max(int(self.lookback_len), 1), L)
         hist = observed_data[:, :, :hist_len]
         hist_mask = cond_mask[:, :, :hist_len].float()
+        if hist.shape[1] > 1:
+            target_idx = int(min(max(self.target_feature_index, 0), hist.shape[1] - 1))
+            hist = hist[:, target_idx:target_idx + 1, :]
+            hist_mask = hist_mask[:, target_idx:target_idx + 1, :]
         time_mask = (hist_mask.sum(dim=1) > 0).float()
         series = (hist * hist_mask).sum(dim=1) / hist_mask.sum(dim=1).clamp(min=1.0)
         series_mean = self._masked_mean(series, time_mask, dim=1, keepdim=True)
@@ -890,7 +944,7 @@ class CSDI_base(nn.Module):
         expert_futures = self._build_expert_futures_from_history(hist, hist_mask, future_len)
         return baseline, expert_futures
 
-    def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0):
+    def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0, controller_state=None):
         B, K, L = observed_data.shape
         stats = self._compute_pattern_stats(observed_data, cond_mask)
         text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
@@ -900,6 +954,15 @@ class CSDI_base(nn.Module):
         text_router_input = torch.cat([stats, text_pattern], dim=1)
         numeric_logits = self.pattern_router(numeric_router_input) / temperature
         text_logits = self.pattern_router(text_router_input) / temperature
+        controller_scale = None
+        controller_residual_scale = None
+        if controller_state is not None:
+            controller_scale = controller_state.get("guidance_scale")
+            controller_residual_scale = controller_state.get("residual_scale")
+        if controller_scale is None:
+            controller_scale = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
+        else:
+            controller_scale = controller_scale.to(device=observed_data.device, dtype=observed_data.dtype).reshape(-1)
         if self.guide_mode == "auto":
             scale, text_quality, router_agreement, pi_numeric, pi_text, text_gain = self._compute_auto_guidance(
                 numeric_logits,
@@ -910,8 +973,9 @@ class CSDI_base(nn.Module):
                 observed_data=observed_data,
                 cond_mask=cond_mask,
             )
+            scale = scale * controller_scale
         else:
-            scale = torch.full((B,), float(guidance_scale), device=observed_data.device, dtype=observed_data.dtype)
+            scale = torch.full((B,), float(guidance_scale), device=observed_data.device, dtype=observed_data.dtype) * controller_scale
             text_quality = self._compute_text_quality(text_evidence_vec, text_mask, B, observed_data.device, observed_data.dtype)
             router_agreement = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
             pi_numeric = F.softmax(numeric_logits, dim=-1)
@@ -926,6 +990,11 @@ class CSDI_base(nn.Module):
             mixed_future = (pi.view(B, self.pattern_num_experts, 1, 1) * expert_futures).sum(dim=1)
             safe_future = expert_futures[:, 2]
             mixed_future = reliability.view(B, 1, 1) * mixed_future + (1.0 - reliability).view(B, 1, 1) * safe_future
+            if controller_residual_scale is not None:
+                mixed_future = mixed_future * controller_residual_scale.to(
+                    device=observed_data.device,
+                    dtype=observed_data.dtype,
+                ).reshape(B, 1, 1)
             baseline[:, :, self.lookback_len:self.lookback_len + future_len] = mixed_future
         pseudo = torch.stack(
             [stats[:, 1], stats[:, 3], stats[:, 4], stats[:, 5], stats[:, 6]],
@@ -1068,18 +1137,18 @@ class CSDI_base(nn.Module):
         return aux
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, pattern_text_pooled=pattern_text_pooled, pattern_text_mask=pattern_text_mask, pattern_text_evidence_vec=pattern_text_evidence_vec
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, pattern_text_pooled=pattern_text_pooled, pattern_text_mask=pattern_text_mask, pattern_text_evidence_vec=pattern_text_evidence_vec, controller_state=controller_state
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, set_t=-1
     ):
 
         B, K, L = observed_data.shape
@@ -1091,7 +1160,17 @@ class CSDI_base(nn.Module):
         target_mask = observed_mask - cond_mask
         pattern = None
         pattern_baseline = None
+        aux_outputs = None
         diffusion_target = observed_data
+        if not self.noise_esti:
+            aux_outputs = self._compute_aux_head_outputs(
+                observed_data,
+                cond_mask,
+                trend_prior=trend_prior,
+                controller_state=controller_state,
+                text_mask=pattern_text_mask,
+                text_evidence_vec=pattern_text_evidence_vec,
+            )
         if self.pattern_residual_diffusion and not self.noise_esti:
             pattern = self._compute_pattern_outputs(
                 observed_data,
@@ -1100,6 +1179,7 @@ class CSDI_base(nn.Module):
                 text_mask=pattern_text_mask,
                 text_evidence_vec=pattern_text_evidence_vec,
                 guidance_scale=1.0,
+                controller_state=controller_state,
             )
             if self.final_method:
                 pattern_baseline = self._compute_weak_pattern_baseline(
@@ -1110,7 +1190,27 @@ class CSDI_base(nn.Module):
                 )
             else:
                 pattern_baseline = pattern["baseline"]
+            aux_future_baseline = self._build_aux_future_baseline(
+                aux_outputs,
+                controller_state,
+                observed_data.device,
+                observed_data.dtype,
+                observed_data.shape[-1],
+            )
+            if aux_future_baseline is not None:
+                pattern_baseline = aux_future_baseline if pattern_baseline is None else pattern_baseline + aux_future_baseline
             diffusion_target = observed_data - pattern_baseline
+        elif not self.noise_esti:
+            aux_future_baseline = self._build_aux_future_baseline(
+                aux_outputs,
+                controller_state,
+                observed_data.device,
+                observed_data.dtype,
+                observed_data.shape[-1],
+            )
+            if aux_future_baseline is not None:
+                pattern_baseline = aux_future_baseline
+                diffusion_target = observed_data - pattern_baseline
 
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
@@ -1171,6 +1271,11 @@ class CSDI_base(nn.Module):
         else:
             multi_res_aux = torch.zeros((), device=observed_data.device)
             mr_budget = torch.zeros((), device=observed_data.device, dtype=observed_data.dtype)
+        coarse_aux_loss = self._calc_coarse_aux_loss(aux_outputs, observed_data, target_mask, controller_state=controller_state)
+        uncertainty_aux_loss = self._calc_uncertainty_aux_loss(aux_outputs, observed_data, target_mask, controller_state=controller_state)
+        coarse_aux = self.coarse_forecast_weight * coarse_aux_loss if self.coarse_forecast_weight > 0 else torch.zeros((), device=observed_data.device)
+        uncertainty_aux = self.uncertainty_forecast_weight * uncertainty_aux_loss if self.uncertainty_forecast_weight > 0 else torch.zeros((), device=observed_data.device)
+        auxiliary_loss = auxiliary_loss + coarse_aux + uncertainty_aux
         aux_diag_scale = torch.ones((), device=observed_data.device)
         if self.auxiliary_loss_max_ratio > 0:
             aux_cap = max(self.auxiliary_loss_max_ratio, 0.0) * main_loss.detach()
@@ -1181,6 +1286,8 @@ class CSDI_base(nn.Module):
             self.diag_main_loss_sum.add_(main_loss.detach().float())
             self.diag_pattern_aux_sum.add_((pattern_aux.detach() * aux_diag_scale).float())
             self.diag_multi_res_aux_sum.add_((multi_res_aux.detach() * aux_diag_scale).float())
+            self.diag_coarse_aux_sum.add_((coarse_aux.detach() * aux_diag_scale).float())
+            self.diag_uncertainty_aux_sum.add_((uncertainty_aux.detach() * aux_diag_scale).float())
             self.diag_loss_count.add_(1.0)
         return main_loss + auxiliary_loss
 
@@ -1486,7 +1593,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -1516,6 +1623,7 @@ class CSDI_base(nn.Module):
                 text_mask=pattern_text_mask,
                 text_evidence_vec=pattern_text_evidence_vec,
                 guidance_scale=pattern_guidance_scale,
+                controller_state=controller_state,
             )
             if self.final_method:
                 pattern_baseline = self._compute_weak_pattern_baseline(
@@ -1685,6 +1793,16 @@ class CSDI_Forecasting(CSDI_base):
         gt_mask = batch["gt_mask"].to(self.device).float()
         batch_size = observed_data.shape[0]
         text_mask = batch["text_mark"].to(self.device).float().reshape(-1).clamp(0.0, 1.0)
+        text_ret_mask = batch.get("text_ret_mark")
+        if text_ret_mask is not None:
+            text_ret_mask = text_ret_mask.to(self.device).float().reshape(-1).clamp(0.0, 1.0)
+        else:
+            text_ret_mask = text_mask.clone()
+        text_cot_mask = batch.get("text_cot_mark")
+        if text_cot_mask is not None:
+            text_cot_mask = text_cot_mask.to(self.device).float().reshape(-1).clamp(0.0, 1.0)
+        else:
+            text_cot_mask = text_mask.clone()
         text_quality_raw = batch.get("text_quality_raw")
         if text_quality_raw is not None:
             text_quality_raw = text_quality_raw.to(self.device).float().reshape(-1)
@@ -1747,11 +1865,21 @@ class CSDI_Forecasting(CSDI_base):
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
         gt_mask = gt_mask.permute(0, 2, 1)
-        
+
         cut_length = torch.zeros(len(observed_data)).long().to(self.device)
         for_pattern_mask = observed_mask
 
         feature_id=torch.arange(self.target_dim_base).unsqueeze(0).expand(observed_data.shape[0],-1).to(self.device)
+        target_feature_index = batch.get("target_feature_index")
+        if target_feature_index is not None:
+            target_feature_index = target_feature_index.to(self.device).long().reshape(-1)
+        else:
+            target_feature_index = torch.full(
+                (observed_data.shape[0],),
+                int(self.target_feature_index),
+                device=self.device,
+                dtype=torch.long,
+            )
 
         return (
             observed_data,
@@ -1764,6 +1892,8 @@ class CSDI_Forecasting(CSDI_base):
             timesteps,
             texts,
             text_mask,
+            text_ret_mask,
+            text_cot_mask,
             trend_prior_num,
             trend_prior_text,
             text_evidence_vec,
@@ -1772,6 +1902,7 @@ class CSDI_Forecasting(CSDI_base):
             text_event_time_deltas,
             text_event_quality_feats,
             text_event_mask,
+            target_feature_index,
         )        
 
     def _unpack_forecasting_batch(self, data):
@@ -1780,6 +1911,8 @@ class CSDI_Forecasting(CSDI_base):
             "timesteps": None,
             "texts": None,
             "text_mask": None,
+            "text_ret_mask": None,
+            "text_cot_mask": None,
             "trend_prior_num": None,
             "trend_prior_text": None,
             "text_evidence_vec": None,
@@ -1788,8 +1921,33 @@ class CSDI_Forecasting(CSDI_base):
             "text_event_time_deltas": None,
             "text_event_quality_feats": None,
             "text_event_mask": None,
+            "target_feature_index": None,
         }
-        if len(data) >= 18:
+        if len(data) >= 21:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["text_ret_mask"],
+                defaults["text_cot_mask"],
+                defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+                defaults["text_evidence_vec"],
+                defaults["text_event_texts"],
+                defaults["text_event_source_ids"],
+                defaults["text_event_time_deltas"],
+                defaults["text_event_quality_feats"],
+                defaults["text_event_mask"],
+                defaults["target_feature_index"],
+            ) = data
+        elif len(data) >= 18:
             (
                 observed_data,
                 observed_mask,
@@ -1880,26 +2038,38 @@ class CSDI_Forecasting(CSDI_base):
             ) = data
         return observed_data, observed_mask, observed_tp, gt_mask, defaults
 
-    def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
+    def sample_features(self,observed_data, observed_mask,feature_id,gt_mask, target_feature_index=None):
         size = self.num_sample_features
         self.target_dim = size
         extracted_data = []
         extracted_mask = []
         extracted_feature_id = []
         extracted_gt_mask = []
+        extracted_target_feature_index = []
         
         for k in range(len(observed_data)):
             ind = np.arange(self.target_dim_base)
-            np.random.shuffle(ind)
-            extracted_data.append(observed_data[k,ind[:size]])
-            extracted_mask.append(observed_mask[k,ind[:size]])
-            extracted_feature_id.append(feature_id[k,ind[:size]])
-            extracted_gt_mask.append(gt_mask[k,ind[:size]])
+            if target_feature_index is not None:
+                target_idx = int(target_feature_index[k].item()) if torch.is_tensor(target_feature_index) else int(target_feature_index)
+                remaining = ind[ind != target_idx]
+                np.random.shuffle(remaining)
+                chosen = np.concatenate([[target_idx], remaining[: max(size - 1, 0)]])
+                new_target_idx = 0
+            else:
+                np.random.shuffle(ind)
+                chosen = ind[:size]
+                new_target_idx = 0
+            extracted_data.append(observed_data[k,chosen])
+            extracted_mask.append(observed_mask[k,chosen])
+            extracted_feature_id.append(feature_id[k,chosen])
+            extracted_gt_mask.append(gt_mask[k,chosen])
+            extracted_target_feature_index.append(new_target_idx)
         extracted_data = torch.stack(extracted_data,0)
         extracted_mask = torch.stack(extracted_mask,0)
         extracted_feature_id = torch.stack(extracted_feature_id,0)
         extracted_gt_mask = torch.stack(extracted_gt_mask,0)
-        return extracted_data, extracted_mask,extracted_feature_id, extracted_gt_mask
+        extracted_target_feature_index = torch.as_tensor(extracted_target_feature_index, device=observed_data.device, dtype=torch.long)
+        return extracted_data, extracted_mask,extracted_feature_id, extracted_gt_mask, extracted_target_feature_index
     
     def get_timestep_info(self, timesteps):
         timestep_emb = self.timestep_emb(timesteps.transpose(1, 2)).transpose(1, 2)
@@ -1994,6 +2164,160 @@ class CSDI_Forecasting(CSDI_base):
         }
         return encoded_text, pooled_text, token_input
 
+    def _build_forecast_policy_state(self, observed_data, trend_prior, text_mask, retrieval_mask, reasoning_mask):
+        if self.forecast_policy_controller is None or trend_prior is None:
+            return None
+        history_len = min(max(int(self.lookback_len), 1), observed_data.shape[-1])
+        if observed_data.shape[1] > 1:
+            target_idx = int(min(max(self.target_feature_index, 0), observed_data.shape[1] - 1))
+            history = observed_data[:, target_idx:target_idx + 1, :history_len]
+        else:
+            history = observed_data[:, :, :history_len]
+        prior = trend_prior.mean(dim=1) if trend_prior.dim() == 3 else trend_prior
+        return self.forecast_policy_controller(
+            history,
+            prior,
+            text_mask=text_mask,
+            retrieval_mask=retrieval_mask,
+            reasoning_mask=reasoning_mask,
+        )
+
+    def _fill_history_for_aux(self, observed_data, cond_mask):
+        history = observed_data[:, :, : self.lookback_len]
+        history_mask = cond_mask[:, :, : self.lookback_len].float()
+        denom = history_mask.sum(dim=2, keepdim=True).clamp(min=1.0)
+        hist_mean = (history * history_mask).sum(dim=2, keepdim=True) / denom
+        return torch.where(history_mask > 0, history, hist_mean.expand_as(history))
+
+    def _build_policy_condition_vector(self, trend_prior, controller_state, text_mask, text_evidence_vec):
+        if trend_prior is None:
+            batch_size = text_mask.shape[0] if text_mask is not None else 1
+            trend = torch.zeros((batch_size, 3), device=self.device)
+        else:
+            trend = trend_prior.mean(dim=1) if trend_prior.dim() == 3 else trend_prior
+        batch_size = trend.shape[0]
+        device = trend.device
+        dtype = trend.dtype
+
+        if controller_state is None:
+            regime_probs = torch.zeros((batch_size, 5), device=device, dtype=dtype)
+            uncertainty_score = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+            clarity_score = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+            guidance_scale = torch.ones((batch_size, 1), device=device, dtype=dtype)
+            residual_scale = torch.ones((batch_size, 1), device=device, dtype=dtype)
+            sample_budget_scale = torch.ones((batch_size, 1), device=device, dtype=dtype)
+            evidence_conflict = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        else:
+            regime_probs = controller_state.get("regime_probs", torch.zeros((batch_size, 5), device=device, dtype=dtype)).to(device=device, dtype=dtype)
+            uncertainty_score = controller_state.get("uncertainty_score", torch.zeros((batch_size,), device=device, dtype=dtype)).reshape(batch_size, 1).to(device=device, dtype=dtype)
+            clarity_score = controller_state.get("clarity_score", torch.zeros((batch_size,), device=device, dtype=dtype)).reshape(batch_size, 1).to(device=device, dtype=dtype)
+            guidance_scale = controller_state.get("guidance_scale", torch.ones((batch_size,), device=device, dtype=dtype)).reshape(batch_size, 1).to(device=device, dtype=dtype)
+            residual_scale = controller_state.get("residual_scale", torch.ones((batch_size,), device=device, dtype=dtype)).reshape(batch_size, 1).to(device=device, dtype=dtype)
+            sample_budget_scale = controller_state.get("sample_budget_scale", torch.ones((batch_size,), device=device, dtype=dtype)).reshape(batch_size, 1).to(device=device, dtype=dtype)
+            evidence_conflict = controller_state.get("evidence_conflict", torch.zeros((batch_size,), device=device, dtype=dtype)).reshape(batch_size, 1).to(device=device, dtype=dtype)
+
+        if text_mask is None:
+            text_availability = torch.ones((batch_size, 1), device=device, dtype=dtype)
+        else:
+            text_availability = text_mask.reshape(batch_size, 1).to(device=device, dtype=dtype)
+        if text_evidence_vec is not None:
+            evidence = text_evidence_vec.to(device=device, dtype=dtype)
+            if evidence.dim() == 1:
+                evidence = evidence.reshape(batch_size, -1)
+            text_quality = evidence[:, :1]
+        else:
+            text_quality = text_availability
+
+        cond_vec = torch.cat(
+            [
+                trend.to(device=device, dtype=dtype),
+                regime_probs,
+                uncertainty_score,
+                clarity_score,
+                guidance_scale,
+                residual_scale,
+                sample_budget_scale,
+                evidence_conflict,
+                text_quality,
+                text_availability,
+            ],
+            dim=1,
+        )
+        if cond_vec.shape[1] < self.policy_cond_dim:
+            cond_vec = F.pad(cond_vec, (0, self.policy_cond_dim - cond_vec.shape[1]))
+        elif cond_vec.shape[1] > self.policy_cond_dim:
+            cond_vec = cond_vec[:, : self.policy_cond_dim]
+        return cond_vec
+
+    def _compute_aux_head_outputs(self, observed_data, cond_mask, trend_prior=None, controller_state=None, text_mask=None, text_evidence_vec=None):
+        if (self.coarse_forecast_head is None) and (self.uncertainty_head is None):
+            return None
+        history = self._fill_history_for_aux(observed_data, cond_mask)
+        cond_vec = self._build_policy_condition_vector(trend_prior, controller_state, text_mask, text_evidence_vec)
+        outputs = {"cond_vec": cond_vec}
+        if self.coarse_forecast_head is not None:
+            outputs["coarse_future"] = self.coarse_forecast_head(history, cond_vec=cond_vec)
+        if self.uncertainty_head is not None:
+            loc, logvar = self.uncertainty_head(history, cond_vec=cond_vec)
+            outputs["uncertainty_loc"] = loc
+            outputs["uncertainty_logvar"] = logvar
+        return outputs
+
+    def _build_aux_future_baseline(self, aux_outputs, controller_state, device, dtype, total_length):
+        if aux_outputs is None or "coarse_future" not in aux_outputs or self.coarse_forecast_blend <= 0:
+            return None
+        coarse_future = aux_outputs["coarse_future"].to(device=device, dtype=dtype)
+        batch_size = coarse_future.shape[0]
+        future_weight = torch.ones((batch_size, self.pred_len), device=device, dtype=dtype)
+        if controller_state is not None and controller_state.get("fine_mask") is not None:
+            fine_mask = controller_state["fine_mask"].to(device=device, dtype=dtype)
+            future_weight = 1.0 - 0.5 * fine_mask
+        coarse_future = coarse_future * future_weight.unsqueeze(1)
+        if "uncertainty_logvar" in aux_outputs:
+            confidence = torch.exp(-0.5 * aux_outputs["uncertainty_logvar"].to(device=device, dtype=dtype)).clamp(min=0.25, max=2.0)
+            coarse_future = coarse_future * confidence
+        aux_baseline = torch.zeros((batch_size, coarse_future.shape[1], total_length), device=device, dtype=dtype)
+        aux_baseline[:, :, self.lookback_len:self.lookback_len + self.pred_len] = coarse_future
+        return self.coarse_forecast_blend * aux_baseline
+
+    def _calc_coarse_aux_loss(self, aux_outputs, observed_data, target_mask, controller_state=None):
+        if aux_outputs is None or "coarse_future" not in aux_outputs or self.coarse_forecast_weight <= 0:
+            return torch.zeros((), device=observed_data.device)
+        future_target = observed_data[:, :, self.lookback_len:self.lookback_len + self.pred_len]
+        future_mask = target_mask[:, :, self.lookback_len:self.lookback_len + self.pred_len].float()
+        if future_mask.sum() <= 0:
+            return torch.zeros((), device=observed_data.device)
+        weights = torch.ones_like(future_mask)
+        if controller_state is not None and controller_state.get("risk_scores") is not None:
+            risk = controller_state["risk_scores"].to(device=observed_data.device, dtype=observed_data.dtype)
+            weights = weights * (1.0 + 0.5 * risk.unsqueeze(1))
+        residual = aux_outputs["coarse_future"].to(device=observed_data.device, dtype=observed_data.dtype) - future_target
+        delta = float(max(self.multi_res_huber_delta, 1e-6))
+        abs_res = residual.abs()
+        huber = torch.where(abs_res <= delta, 0.5 * residual ** 2, delta * abs_res - 0.5 * (delta ** 2))
+        weighted_mask = future_mask * weights
+        denom = weighted_mask.sum().clamp(min=1.0)
+        return (huber * weighted_mask).sum() / denom
+
+    def _calc_uncertainty_aux_loss(self, aux_outputs, observed_data, target_mask, controller_state=None):
+        if aux_outputs is None or "uncertainty_loc" not in aux_outputs or self.uncertainty_forecast_weight <= 0:
+            return torch.zeros((), device=observed_data.device)
+        future_target = observed_data[:, :, self.lookback_len:self.lookback_len + self.pred_len]
+        future_mask = target_mask[:, :, self.lookback_len:self.lookback_len + self.pred_len].float()
+        if future_mask.sum() <= 0:
+            return torch.zeros((), device=observed_data.device)
+        loc = aux_outputs["uncertainty_loc"].to(device=observed_data.device, dtype=observed_data.dtype)
+        logvar = aux_outputs["uncertainty_logvar"].to(device=observed_data.device, dtype=observed_data.dtype)
+        precision = torch.exp(-logvar)
+        nll = 0.5 * (precision * (future_target - loc) ** 2 + logvar)
+        weights = torch.ones_like(future_mask)
+        if controller_state is not None and controller_state.get("risk_scores") is not None:
+            risk = controller_state["risk_scores"].to(device=observed_data.device, dtype=observed_data.dtype)
+            weights = weights * (1.0 + 0.5 * risk.unsqueeze(1))
+        weighted_mask = future_mask * weights
+        denom = weighted_mask.sum().clamp(min=1.0)
+        return (nll * weighted_mask).sum() / denom
+
     def get_side_info(self, observed_tp, cond_mask, feature_id=None, timesteps=None, texts=None):
         B, K, L = cond_mask.shape
 
@@ -2025,6 +2349,8 @@ class CSDI_Forecasting(CSDI_base):
         timesteps = unpacked["timesteps"]
         texts = unpacked["texts"]
         text_mask = unpacked["text_mask"]
+        text_ret_mask = unpacked["text_ret_mask"]
+        text_cot_mask = unpacked["text_cot_mask"]
         trend_prior_num = unpacked["trend_prior_num"]
         trend_prior_text = unpacked["trend_prior_text"]
         text_evidence_vec = unpacked["text_evidence_vec"]
@@ -2033,9 +2359,10 @@ class CSDI_Forecasting(CSDI_base):
         text_event_time_deltas = unpacked["text_event_time_deltas"]
         text_event_quality_feats = unpacked["text_event_quality_feats"]
         text_event_mask = unpacked["text_event_mask"]
+        target_feature_index = unpacked["target_feature_index"]
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
-            observed_data, observed_mask,feature_id,gt_mask = \
-                    self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
+            observed_data, observed_mask,feature_id,gt_mask,target_feature_index = \
+                    self.sample_features(observed_data, observed_mask,feature_id,gt_mask,target_feature_index=target_feature_index)
         else:
             self.target_dim = self.target_dim_base
             feature_id = None
@@ -2063,6 +2390,13 @@ class CSDI_Forecasting(CSDI_base):
             _, text_pooled, _ = self._encode_text_source(texts)
         else:
             text_pooled = None
+        controller_state = self._build_forecast_policy_state(
+            observed_data,
+            trend_prior_text,
+            text_mask,
+            text_ret_mask,
+            text_cot_mask,
+        )
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
@@ -2080,6 +2414,7 @@ class CSDI_Forecasting(CSDI_base):
             pattern_text_pooled=text_pooled,
             pattern_text_mask=text_mask,
             pattern_text_evidence_vec=text_evidence_vec,
+            controller_state=controller_state,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -2089,6 +2424,8 @@ class CSDI_Forecasting(CSDI_base):
         timesteps = unpacked["timesteps"]
         texts = unpacked["texts"]
         text_mask = unpacked["text_mask"]
+        text_ret_mask = unpacked["text_ret_mask"]
+        text_cot_mask = unpacked["text_cot_mask"]
         trend_prior_num = unpacked["trend_prior_num"]
         trend_prior_text = unpacked["trend_prior_text"]
         text_evidence_vec = unpacked["text_evidence_vec"]
@@ -2121,10 +2458,17 @@ class CSDI_Forecasting(CSDI_base):
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
                 text_pooled = None
+            controller_state = self._build_forecast_policy_state(
+                observed_data,
+                trend_prior_text,
+                text_mask,
+                text_ret_mask,
+                text_cot_mask,
+            )
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state)
 
         if self.save_attn:
             if self.save_token:

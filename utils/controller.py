@@ -15,6 +15,9 @@ class ForecastPolicyController(nn.Module):
         self.max_fine_ratio = float(cfg.get('max_fine_ratio', 0.6))
         self.min_fine_points = int(cfg.get('min_fine_points', 1))
         self.rag_invalid_scale = float(cfg.get('rag_invalid_scale', 0.25))
+        self.cov_invalid_scale = float(cfg.get('cov_invalid_scale', 0.1))
+        self.coarse_invalid_scale = float(cfg.get('coarse_invalid_scale', 0.2))
+        self.uncertainty_invalid_scale = float(cfg.get('uncertainty_invalid_scale', 0.2))
         self.unclear_trend_scale = float(cfg.get('unclear_trend_scale', 0.5))
         self.sample_budget_floor = float(cfg.get('sample_budget_floor', 0.5))
         self.sample_budget_ceiling = float(cfg.get('sample_budget_ceiling', 1.0))
@@ -38,12 +41,23 @@ class ForecastPolicyController(nn.Module):
         turning_score = torch.maximum(turning_score, (early_slope - late_slope).abs() / (local_vol + 1e-6))
         turning_score = turning_score.clamp(0.0, 1.0)
         volatile_score = (local_vol / level).clamp(0.0, 1.0)
+        seasonality_score = torch.zeros_like(volatile_score)
+        for lag in (2, 3, 4, 6, 7, 12, 24, 52):
+            if history_len > lag:
+                x0 = series[:, :-lag]
+                x1 = series[:, lag:]
+                x0 = x0 - x0.mean(dim=1, keepdim=True)
+                x1 = x1 - x1.mean(dim=1, keepdim=True)
+                denom = torch.sqrt((x0.pow(2).sum(dim=1) * x1.pow(2).sum(dim=1)).clamp(min=1e-6))
+                corr = (x0 * x1).sum(dim=1) / denom
+                seasonality_score = torch.maximum(seasonality_score, corr.clamp(min=0.0, max=1.0))
         return {
             'slope': slope,
             'local_vol': local_vol,
             'flat_score': flat_score.clamp(0.0, 1.0),
             'turning_score': turning_score,
             'volatile_score': volatile_score,
+            'seasonality_score': seasonality_score,
             'tail_diffs': diffs[:, -min(diffs.shape[-1], 8):] if diffs.shape[-1] > 0 else diffs,
         }
 
@@ -81,7 +95,7 @@ class ForecastPolicyController(nn.Module):
         risk = (risk + 0.25 * local_curve).clamp(0.0, 1.0)
         return risk
 
-    def forward(self, history, trend_prior, text_mask=None, retrieval_mask=None, reasoning_mask=None):
+    def forward(self, history, trend_prior, text_mask=None, retrieval_mask=None, reasoning_mask=None, source_utilities=None):
         batch_size = history.shape[0]
         device = history.device
         stats = self._history_stats(history)
@@ -100,6 +114,23 @@ class ForecastPolicyController(nn.Module):
             retrieval_mask = text_mask.clone()
         if reasoning_mask is None:
             reasoning_mask = text_mask.clone()
+        source_utilities = source_utilities or {}
+        text_utility = source_utilities.get('text')
+        covariate_utility = source_utilities.get('covariate')
+        coarse_utility = source_utilities.get('coarse')
+        uncertainty_utility = source_utilities.get('uncertainty')
+        if text_utility is None:
+            text_utility = text_mask.float()
+        if covariate_utility is None:
+            covariate_utility = torch.zeros((batch_size,), device=device)
+        if coarse_utility is None:
+            coarse_utility = stats['seasonality_score']
+        if uncertainty_utility is None:
+            uncertainty_utility = uncertainty_score
+        text_utility = text_utility.to(device).float().reshape(-1).clamp(0.0, 1.0)
+        covariate_utility = covariate_utility.to(device).float().reshape(-1).clamp(0.0, 1.0)
+        coarse_utility = coarse_utility.to(device).float().reshape(-1).clamp(0.0, 1.0)
+        uncertainty_utility = uncertainty_utility.to(device).float().reshape(-1).clamp(0.0, 1.0)
 
         rag_gate = retrieval_mask.float() * (1.0 - evidence_conflict)
         if not self.enabled:
@@ -110,10 +141,30 @@ class ForecastPolicyController(nn.Module):
         cot_gate = reasoning_mask.float() * (0.5 + 0.5 * clarity)
         cot_gate = cot_gate.clamp(0.0, 1.0)
         trend_gate = clarity + (1.0 - clarity) * (1.0 - self.unclear_trend_scale)
-        guidance_scale = (0.5 * rag_gate + 0.5 * cot_gate) * trend_gate
-        guidance_scale = guidance_scale.clamp(0.05, 1.0)
+        text_gate = ((0.5 * rag_gate + 0.5 * cot_gate) * trend_gate * text_utility).clamp(0.0, 1.0)
+        guidance_scale = text_gate.clamp(0.05, 1.0)
+
+        covariate_gate = (
+            covariate_utility
+            * (0.5 + 0.5 * (1.0 - evidence_conflict))
+            * (0.5 + 0.5 * (1.0 - stats['volatile_score']))
+        )
+        covariate_gate = torch.maximum(covariate_gate, self.cov_invalid_scale * (covariate_utility > 0).float()).clamp(0.0, 1.0)
+
+        coarse_gate = (
+            coarse_utility
+            * (0.5 + 0.5 * torch.maximum(stats['seasonality_score'], stats['turning_score']))
+        )
+        coarse_gate = torch.maximum(coarse_gate, self.coarse_invalid_scale * (coarse_utility > 0).float()).clamp(0.0, 1.0)
+
+        uncertainty_gate = (
+            uncertainty_utility
+            * (0.5 + 0.5 * uncertainty_score)
+        )
+        uncertainty_gate = torch.maximum(uncertainty_gate, self.uncertainty_invalid_scale * (uncertainty_utility > 0).float()).clamp(0.0, 1.0)
 
         risk_scores = self._build_horizon_risk(stats, evidence_conflict, uncertainty_score)
+        risk_scores = (risk_scores + 0.2 * coarse_gate.unsqueeze(1) * stats['seasonality_score'].unsqueeze(1)).clamp(0.0, 1.0)
         risk_mean = risk_scores.mean(dim=1)
         fine_ratio = (self.fine_topk_ratio * (0.5 + 0.5 * risk_mean)).clamp(0.05, self.max_fine_ratio)
         num_fine = torch.clamp((fine_ratio * self.pred_len).round().long(), min=self.min_fine_points, max=self.pred_len)
@@ -125,6 +176,8 @@ class ForecastPolicyController(nn.Module):
         residual_scale = (1.0 + 0.30 * uncertainty_score + 0.20 * regime_probs[:, 4]).clamp(0.75, 1.75)
         sample_budget_scale = self.sample_budget_floor + (self.sample_budget_ceiling - self.sample_budget_floor) * risk_mean
         sample_budget_scale = sample_budget_scale.clamp(self.sample_budget_floor, self.sample_budget_ceiling)
+        pattern_aux_scale = (0.5 + 0.5 * torch.maximum(covariate_gate, text_gate)).clamp(0.25, 1.0)
+        multi_res_aux_scale = (0.5 + 0.5 * torch.maximum(coarse_gate, uncertainty_gate)).clamp(0.25, 1.0)
 
         return {
             'regime_probs': regime_probs,
@@ -132,16 +185,29 @@ class ForecastPolicyController(nn.Module):
             'regime_token': regime_token,
             'turning_score': stats['turning_score'],
             'volatile_score': stats['volatile_score'],
+            'seasonality_score': stats['seasonality_score'],
             'evidence_conflict': evidence_conflict,
             'uncertainty_score': uncertainty_score,
             'clarity_score': clarity,
             'rag_gate': rag_gate,
             'cot_gate': cot_gate,
             'trend_gate': trend_gate,
+            'text_gate': text_gate,
+            'covariate_gate': covariate_gate,
+            'coarse_gate': coarse_gate,
+            'uncertainty_gate': uncertainty_gate,
             'guidance_scale': guidance_scale,
             'residual_scale': residual_scale,
             'sample_budget_scale': sample_budget_scale,
+            'pattern_aux_scale': pattern_aux_scale,
+            'multi_res_aux_scale': multi_res_aux_scale,
             'fine_ratio': fine_ratio,
             'fine_mask': fine_mask,
             'risk_scores': risk_scores,
+            'source_utilities': {
+                'text': text_utility,
+                'covariate': covariate_utility,
+                'coarse': coarse_utility,
+                'uncertainty': uncertainty_utility,
+            },
         }

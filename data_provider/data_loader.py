@@ -197,6 +197,54 @@ class Dataset_Custom(Dataset):
         else:
             self.rag_cot = None
 
+    def _normalize_feature_name(self, name):
+        return str(name).strip().lower().replace("_", " ")
+
+    def _is_metadata_like_numeric(self, name):
+        normalized = self._normalize_feature_name(name)
+        metadata_patterns = (
+            "date", "start", "end", "code", "id", "cbsa", "areaofinterest",
+            "statisticformat", "validstart", "validend", "mapdate", "defining",
+            "category", "region type", "region", "year week", "year_week",
+        )
+        if normalized == self._normalize_feature_name(self.target):
+            return False
+        return any(pattern in normalized for pattern in metadata_patterns)
+
+    def _is_calendar_like_numeric(self, name):
+        normalized = self._normalize_feature_name(name)
+        calendar_tokens = {"year", "week", "month", "quarter"}
+        return normalized in calendar_tokens
+
+    def _resolve_numeric_feature_columns(self, df_num):
+        numeric_candidates = df_num.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_candidates = [col for col in numeric_candidates if col not in self.exclude_numeric_features]
+        if self.target not in numeric_candidates:
+            numeric_candidates = [self.target] + numeric_candidates
+        if self.covariate_columns:
+            aux_cols = [
+                col for col in self.covariate_columns
+                if col in numeric_candidates and col != self.target
+            ]
+        else:
+            aux_cols = []
+            for col in numeric_candidates:
+                if col == self.target:
+                    continue
+                if self._is_metadata_like_numeric(col):
+                    continue
+                if self._is_calendar_like_numeric(col):
+                    continue
+                aux_cols.append(col)
+        feature_cols = [self.target] + aux_cols
+        dedup_feature_cols = []
+        for col in feature_cols:
+            if col not in dedup_feature_cols and col in df_num.columns:
+                dedup_feature_cols.append(col)
+        feature_cols = dedup_feature_cols or [self.target]
+        feature_roles = ["target"] + ["covariate"] * max(len(feature_cols) - 1, 0)
+        return feature_cols, feature_roles
+
     def _impute_numeric_frame(self, df_data, train_end_index):
         observed_mask = (~df_data.isna()).astype(np.float32)
         train_slice = df_data.iloc[:train_end_index].copy()
@@ -799,28 +847,17 @@ class Dataset_Custom(Dataset):
         final_end_date = df_num.end_date[border2-1]
 
         if self.use_all_numeric_features:
-            numeric_candidates = df_num.select_dtypes(include=[np.number]).columns.tolist()
-            numeric_candidates = [col for col in numeric_candidates if col not in self.exclude_numeric_features]
-            if self.covariate_columns:
-                aux_cols = [col for col in self.covariate_columns if col in numeric_candidates and col != self.target]
-            else:
-                aux_cols = [col for col in numeric_candidates if col != self.target]
-            feature_cols = [self.target] + aux_cols if self.target in df_num.columns else aux_cols
-            if len(feature_cols) == 0:
-                feature_cols = [self.target]
-            # Keep target first so its index is stable across datasets.
-            dedup_feature_cols = []
-            for col in feature_cols:
-                if col not in dedup_feature_cols:
-                    dedup_feature_cols.append(col)
-            feature_cols = dedup_feature_cols
+            feature_cols, feature_roles = self._resolve_numeric_feature_columns(df_num)
             df_data = df_num[feature_cols]
             self.feature_names = feature_cols
+            self.feature_roles = feature_roles
             self.target_index = feature_cols.index(self.target) if self.target in feature_cols else 0
         else:
             df_data = df_num[[self.target]]
             self.feature_names = [self.target]
+            self.feature_roles = ["target"]
             self.target_index = 0
+        self.covariate_indices = [idx for idx, role in enumerate(self.feature_roles) if role == "covariate"]
 
         imputed_df_data, observed_mask_all = self._impute_numeric_frame(df_data, border2s[0])
 

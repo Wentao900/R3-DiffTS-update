@@ -35,6 +35,8 @@ train:
   max_grad_norm: 1.0
   adaptive_noise_scale: 0.0
   auxiliary_loss_max_ratio: 0.5
+  coarse_forecast_weight: 0.05
+  uncertainty_forecast_weight: 0.02
 diffusion:
   layers: 6
   channels: 64
@@ -86,7 +88,29 @@ model:
   text_quality_mid_threshold: 0.6
   text_max_length: 160
   text_encode_batch_size: 4
+  use_forecast_policy_controller: true
+  use_aux_forecast_heads: true
+  use_coarse_forecast_head: true
+  use_uncertainty_head: true
+  coarse_forecast_blend: 0.15
+  coarse_forecast_factor: 4
+  aux_forecast_hidden_dim: 128
+  forecast_policy_controller:
+    enabled: true
+    fine_topk_ratio: 0.35
+    max_fine_ratio: 0.6
+    min_fine_points: 1
+    rag_invalid_scale: 0.25
+    cov_invalid_scale: 0.1
+    coarse_invalid_scale: 0.2
+    uncertainty_invalid_scale: 0.2
+    unclear_trend_scale: 0.5
+    sample_budget_floor: 0.5
+    sample_budget_ceiling: 1.0
+    turning_center: 0.35
+    turning_width: 0.18
 dataset:
+  use_all_numeric_features: true
   aug_noise_std: 0.01
   aug_time_warp_prob: 0.3
   aug_segment_scale_std: 0.1

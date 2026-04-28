@@ -54,6 +54,9 @@ cfg["model"]["forecast_policy_controller"] = {
     "max_fine_ratio": 0.6,
     "min_fine_points": 1,
     "rag_invalid_scale": 0.25,
+    "cov_invalid_scale": 0.1,
+    "coarse_invalid_scale": 0.2,
+    "uncertainty_invalid_scale": 0.2,
     "unclear_trend_scale": 0.5,
     "sample_budget_floor": 0.5,
     "sample_budget_ceiling": 1.0,
@@ -84,9 +87,7 @@ cfg["train"]["forecast_calibrator_reliability_temperature"] = 0.15
 cfg["train"]["forecast_calibrator_solver"] = "nnls"
 cfg["train"]["forecast_calibrator_fused_smoothing"] = 0.25
 cfg["train"]["forecast_calibrator_force_mean_when_off"] = True
-domain = os.path.basename(base_path).split("_")[0].lower()
-if domain in {"economy", "energy", "agriculture"}:
-    cfg["dataset"]["use_all_numeric_features"] = True
+cfg["dataset"]["use_all_numeric_features"] = True
 os.makedirs(os.path.dirname(final_path), exist_ok=True)
 with open(final_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)

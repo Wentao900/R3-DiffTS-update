@@ -1,0 +1,53 @@
+flowchart LR
+    A1[Raw Text]:::txt
+    A2[Numeric History Summary]:::num
+
+    subgraph S1[阶段一：原始文本与数值摘要对齐]
+        B1[窗口文本收集]:::txt
+        B2[基础查询构造]:::txt
+        B3[Stage-1 Retrieval]:::txt
+        B4[候选证据 E0]:::txt
+    end
+
+    subgraph S2[阶段二：趋势假设与再检索]
+        C1[Trend Hypothesis\n(CoT / template)]:::core
+        C2[Stage-2 Query Rewrite]:::core
+        C3[Stage-2 Retrieval]:::txt
+        C4[Refined Evidence E1]:::txt
+    end
+
+    subgraph S3[结构化证据压缩]
+        D1[文本质量评估\navailability / informativeness / alignment / trust]:::core
+        D2[趋势字段抽取\ndirection / strength / volatility]:::core
+        D3[窗口证据向量\ntext_evidence_vec]:::diff
+        D4[文本趋势先验\ntrend_prior_text]:::diff
+        D5[事件级证据包\ntext events]:::diff
+    end
+
+    A1 --> B1
+    B1 --> B2
+    A2 --> B2
+    B2 --> B3
+    B3 --> B4
+
+    A2 --> C1
+    B4 --> C1
+    C1 --> C2
+    C2 --> C3
+    C3 --> C4
+
+    A1 --> D1
+    B4 --> D1
+    C4 --> D1
+    A1 --> D2
+    B4 --> D2
+    C4 --> D2
+    D1 --> D3
+    D2 --> D4
+    A1 --> D5
+    C4 --> D5
+
+    classDef num fill:#DCEBFA,stroke:#4C78A8,stroke-width:1.2px,color:#1F1F1F;
+    classDef txt fill:#FDE6D2,stroke:#E68613,stroke-width:1.2px,color:#1F1F1F;
+    classDef core fill:#E3F2E1,stroke:#54A24B,stroke-width:1.4px,color:#1F1F1F;
+    classDef diff fill:#E6F0FA,stroke:#2F7E9E,stroke-width:1.4px,color:#1F1F1F;

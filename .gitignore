@@ -7,6 +7,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 
@@ -23,6 +24,8 @@ config/_tmp*.yaml
 config/_planb_quick_tmp*.yaml
 config/_four_cfg_tmp.yaml
 config/_final_method/
+config/_eval_trained_models/
+config/_tmp_reliability_ablation/
 
 # Weights/checkpoints
 *.pt
@@ -33,6 +36,15 @@ config/_final_method/
 .msc
 *.pdf
 plan*.md
+plan/
 *PPT大纲*.md
+PPT_outline_*.md
 Codex *.md
+CLAUDE.md
 Evidence Consistency Score*.md
+
+# Exported manuscript / office artifacts
+export/
+*.docx
+*_summary.xlsx
+paper_baseline_comparison_except_environment_socialgood.xlsx

@@ -2537,6 +2537,13 @@ class CSDI_Forecasting(CSDI_base):
             _, text_pooled, _ = self._encode_text_source(texts)
         else:
             text_pooled = None
+            if text_mask is not None:
+                text_mask = torch.zeros_like(text_mask)
+            if text_ret_mask is not None:
+                text_ret_mask = torch.zeros_like(text_ret_mask)
+            if text_cot_mask is not None:
+                text_cot_mask = torch.zeros_like(text_cot_mask)
+            text_evidence_vec = None
 
         if is_train == 0:
             cond_mask = gt_mask
@@ -2621,6 +2628,13 @@ class CSDI_Forecasting(CSDI_base):
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
                 text_pooled = None
+                if text_mask is not None:
+                    text_mask = torch.zeros_like(text_mask)
+                if text_ret_mask is not None:
+                    text_ret_mask = torch.zeros_like(text_ret_mask)
+                if text_cot_mask is not None:
+                    text_cot_mask = torch.zeros_like(text_cot_mask)
+                text_evidence_vec = None
             controller_state = self._build_forecast_policy_state(
                 observed_data,
                 cond_mask,

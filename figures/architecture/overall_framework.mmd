@@ -1,0 +1,51 @@
+flowchart LR
+    A1[历史数值窗口 X]:::num
+    A2[时间特征 T]:::num
+    A3[历史文本窗口 W]:::txt
+
+    subgraph S1[结构化文本证据构建]
+        B1[窗口文本收集\ncollect_text]:::txt
+        B2[RAG/CoT 证据生成\nRAGCoTPipeline]:::txt
+        B3[文本质量评估\nquality package]:::txt
+        B4[趋势先验与窗口证据\ntrend prior + evidence vector]:::txt
+    end
+
+    subgraph S2[结构化残差扩散预测]
+        C1[模式统计提取\npattern statistics]:::core
+        C2[模式路由与专家未来\npattern routing + experts]:::core
+        C3[模式基线 B]:::core
+        C4[残差目标 R = Y - B]:::core
+        C5[条件扩散残差生成\nresidual diffusion]:::diff
+        C6[最终预测\nY_hat = B + R_hat]:::diff
+    end
+
+    subgraph S3[训练与推理支持]
+        D1[多分辨率监督]:::support
+        D2[guide weight / auto guidance]:::support
+        D3[候选点预测与校准]:::support
+    end
+
+    A3 --> B1
+    A1 --> B2
+    B1 --> B2
+    B2 --> B3
+    B3 --> B4
+
+    A1 --> C1
+    B4 --> C2
+    C1 --> C2
+    C2 --> C3
+    C3 --> C4
+    C4 --> C5
+    C3 --> C6
+    C5 --> C6
+
+    D1 -.约束训练.-> C5
+    D2 -.调节文本引导.-> C2
+    D3 -.后处理.-> C6
+
+    classDef num fill:#DCEBFA,stroke:#4C78A8,stroke-width:1.2px,color:#1F1F1F;
+    classDef txt fill:#FDE6D2,stroke:#E68613,stroke-width:1.2px,color:#1F1F1F;
+    classDef core fill:#E3F2E1,stroke:#54A24B,stroke-width:1.4px,color:#1F1F1F;
+    classDef diff fill:#E6F0FA,stroke:#2F7E9E,stroke-width:1.4px,color:#1F1F1F;
+    classDef support fill:#F2F2F2,stroke:#808080,stroke-width:1.0px,color:#1F1F1F;

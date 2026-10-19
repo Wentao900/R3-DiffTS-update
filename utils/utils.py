@@ -454,6 +454,36 @@ def fit_forecast_calibrator(
     }
 
 
+def _write_text_validity_log(model, foldername, guide_w):
+    rows = list(getattr(model, "_validity_log_rows", []) or [])
+    if not rows or not foldername:
+        return
+    columns = [
+        "sample_index",
+        "mode",
+        "guidance_scale",
+        "applied_gate",
+        "sample_gate",
+        "source_gate_raw",
+        "source_gate_ret",
+        "source_gate_cot",
+        "aux_target",
+        "rule_text_gate",
+    ]
+    guide_tag = str(guide_w).replace(" ", "")
+    paths = [
+        os.path.join(foldername, "text_validity_gates.csv"),
+        os.path.join(foldername, f"text_validity_gates_guide{guide_tag}.csv"),
+    ]
+    lines = [",".join(columns)]
+    for row in rows:
+        lines.append(",".join(str(row.get(column, "")) for column in columns))
+    payload = "\n".join(lines) + "\n"
+    for path in paths:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+
+
 def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", window_lens=[1, 1], guide_w=0, save_attn=False, save_token=False, save_trend_prior=False, point_estimator="mean", forecast_calibrator=None):
     model.load_state_dict(torch.load(foldername + "/model.pth"))
     with torch.no_grad():
@@ -477,6 +507,8 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
         all_tokens = []
         all_trend_priors = []
         all_text_marks = []
+        model._validity_log_rows = []
+        model._validity_log_cursor = 0
         with tqdm(test_loader, mininterval=1.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample, guide_w)
@@ -633,6 +665,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 }
             with open(foldername + "metrics.json", "w") as f:
                 json.dump(results, f, indent=4)
+            _write_text_validity_log(model, foldername, guide_w)
             print("CRPS:", crps)
             print("MSE:", nmse_total / evalpoints_total)
             print("MAE:", nmae_total / evalpoints_total)

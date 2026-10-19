@@ -31,6 +31,10 @@ _VOLATILITY_VALUE = {"low": 0.0, "medium": 0.5, "high": 1.0}
 _DIRECTION_VALUE = {"down": -1.0, "flat": 0.0, "up": 1.0}
 
 
+def _alias_pattern(alias: str) -> re.Pattern:
+    return re.compile(r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])")
+
+
 def _normalize_label(value: Optional[str], mapping: Dict[str, Sequence[str]], default: str) -> str:
     if value is None:
         return default
@@ -38,9 +42,16 @@ def _normalize_label(value: Optional[str], mapping: Dict[str, Sequence[str]], de
     if text in mapping:
         return text
     for key, aliases in mapping.items():
-        if text == key:
+        if text == key or text in aliases:
             return key
-        if any(alias in text for alias in aliases):
+    # Longer aliases first so "upward" wins over a bare "up" token.
+    ranked = []
+    for key, aliases in mapping.items():
+        for alias in aliases:
+            ranked.append((len(alias), key, alias))
+    ranked.sort(reverse=True)
+    for _, key, alias in ranked:
+        if _alias_pattern(alias).search(text):
             return key
     return default
 

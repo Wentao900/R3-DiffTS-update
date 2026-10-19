@@ -6,7 +6,15 @@ from torch.utils.data import Dataset
 import warnings
 from utils.timefeatures import time_features
 from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
-from utils.trend_prior import build_trend_fields, trend_fields_to_vector
+from utils.text_signals import (
+    build_raw_validity_features,
+    contains_term,
+    infer_text_trend_fields,
+    numeric_trend_fields_from_series,
+    order_recent_segments,
+    target_series,
+)
+from utils.trend_prior import trend_fields_to_vector
 from utils.prepare4llm import get_desc
 
 try:
@@ -76,7 +84,9 @@ class Dataset_Custom(Dataset):
                  text_trend_raw_weight=1.0,
                  text_trend_ret_weight=0.35,
                  text_trend_cot_weight=0.15,
-                 max_text_events=12):
+                 max_text_events=12,
+                 text_shuffle=False,
+                 text_shuffle_seed=0):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -142,6 +152,8 @@ class Dataset_Custom(Dataset):
         self.text_trend_ret_weight = float(max(text_trend_ret_weight, 0.0))
         self.text_trend_cot_weight = float(max(text_trend_cot_weight, 0.0))
         self.max_text_events = int(max(max_text_events, 4))
+        self.text_shuffle = bool(text_shuffle)
+        self.text_shuffle_seed = int(text_shuffle_seed)
 
         self.root_path = root_path
         self.data_path = data_path
@@ -162,6 +174,11 @@ class Dataset_Custom(Dataset):
         self.domain = data_path.split('/')[0]
         self.desc = get_desc(self.domain, self.seq_len, self.pred_len)
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+        if self.text_shuffle and self.tot_len > 0:
+            rng = np.random.RandomState(self.text_shuffle_seed + int(self.set_type) * 1009)
+            self._text_perm = rng.permutation(self.tot_len)
+        else:
+            self._text_perm = None
         self.domain_text_coverage = 0.0
         if len(self.num_dates) > 0:
             self.domain_text_coverage = float(min(len(self.txt_report) / float(len(self.num_dates)), 1.0))
@@ -426,57 +443,13 @@ class Dataset_Custom(Dataset):
         return float(np.clip(score, 0.0, 1.0))
 
     def _infer_numeric_trend_fields(self, seq_x):
-        arr = np.asarray(seq_x, dtype=np.float32)
-        if arr.ndim == 2:
-            arr = arr.mean(axis=1)
-        arr = arr.reshape(-1)
-        if arr.size < 2:
-            return {"direction": "flat", "strength": "moderate", "volatility": "medium"}
-        slope = float((arr[-1] - arr[0]) / max(arr.size - 1, 1))
-        std = float(np.std(arr))
-        mean_abs = float(np.mean(np.abs(arr))) + 1e-6
-        if slope > 1e-6:
-            direction = "up"
-        elif slope < -1e-6:
-            direction = "down"
-        else:
-            direction = "flat"
-        norm_slope = abs(slope) / (std + 1e-6)
-        if norm_slope < 0.1:
-            strength = "weak"
-        elif norm_slope < 0.5:
-            strength = "moderate"
-        else:
-            strength = "strong"
-        vol_ratio = std / mean_abs
-        if vol_ratio < 0.1:
-            volatility = "low"
-        elif vol_ratio < 0.3:
-            volatility = "medium"
-        else:
-            volatility = "high"
-        return {"direction": direction, "strength": strength, "volatility": volatility}
+        # Target column only. Averaging covariates into the slope mixed other
+        # series into the "history direction" used by alignment and the controller.
+        series = target_series(seq_x, target_index=getattr(self, "target_index", 0))
+        return numeric_trend_fields_from_series(series)
 
     def _infer_text_trend_fields(self, text):
-        normalized = self._normalize_text(text).lower()
-        if not normalized:
-            return None
-        direction = "flat"
-        if any(keyword in normalized for keyword in ("increase", "rise", "rising", "upward", "higher", "bull")):
-            direction = "up"
-        elif any(keyword in normalized for keyword in ("decrease", "decline", "fall", "falling", "downward", "lower", "bear")):
-            direction = "down"
-        strength = "moderate"
-        if any(keyword in normalized for keyword in ("slight", "mild", "small", "weak")):
-            strength = "weak"
-        elif any(keyword in normalized for keyword in ("sharp", "strong", "steep", "large")):
-            strength = "strong"
-        volatility = "medium"
-        if any(keyword in normalized for keyword in ("stable", "steady", "smooth", "quiet", "low volatility")):
-            volatility = "low"
-        elif any(keyword in normalized for keyword in ("volatile", "volatility", "turbulent", "noisy", "uncertain")):
-            volatility = "high"
-        return {"direction": direction, "strength": strength, "volatility": volatility}
+        return infer_text_trend_fields(text)
 
     def _score_text_alignment(self, text, seq_x):
         numeric_fields = self._infer_numeric_trend_fields(seq_x)
@@ -543,7 +516,7 @@ class Dataset_Custom(Dataset):
             "surge", "plunge", "jump", "slump", "shock", "risk", "policy",
             "recover", "recovery", "rebound", "slowdown", "acceleration", "volatile",
         )
-        match_count = sum(1 for keyword in event_keywords if keyword in combined)
+        match_count = sum(1 for keyword in event_keywords if contains_term(combined, keyword))
         score = match_count / 4.0
         return float(np.clip(score, 0.0, 1.0))
 
@@ -568,94 +541,16 @@ class Dataset_Custom(Dataset):
         score = 1.0 / (1.0 + np.exp(-(0.8 * mean_shift + 0.4 * std_shift - 1.0)))
         return float(np.clip(score, 0.0, 1.0))
 
-    def _build_event_quality_features(self, text, source_name, seq_x, time_delta_days, raw_reference_text):
-        q_src = float(np.clip(self._get_source_trust(source_name), 0.0, 1.0))
-        q_time = float(np.exp(-float(max(time_delta_days, 0.0)) / self.text_recency_tau_days))
-        q_info = float(np.clip(self._score_text_informativeness(text), 0.0, 1.0))
-        if source_name == "raw":
-            q_nov = 1.0
-        else:
-            q_nov = float(np.clip(self._text_jaccard_distance(raw_reference_text, text), 0.0, 1.0))
-        q_agree = float(np.clip(self._score_text_alignment(text, seq_x), 0.0, 1.0))
-        q_event = float(np.clip(self._score_event_trigger(text), 0.0, 1.0))
-        return [
-            q_src,
-            q_time,
-            q_info,
-            q_nov,
-            q_agree,
-            q_event,
-        ]
-
-    def _pad_text_events(self, event_entries):
-        padded_texts = ["NA"] * self.max_text_events
-        padded_source_ids = np.zeros((self.max_text_events,), dtype=np.int64)
-        padded_time_deltas = np.zeros((self.max_text_events,), dtype=np.float32)
-        padded_quality_feats = np.zeros((self.max_text_events, 6), dtype=np.float32)
-        padded_mask = np.zeros((self.max_text_events,), dtype=np.float32)
-        for idx, entry in enumerate(event_entries[: self.max_text_events]):
-            padded_texts[idx] = entry["text"]
-            padded_source_ids[idx] = int(entry["source_id"])
-            padded_time_deltas[idx] = float(entry["time_delta"])
-            padded_quality_feats[idx] = np.asarray(entry["quality_feats"], dtype=np.float32)
-            padded_mask[idx] = 1.0
-        return padded_texts, padded_source_ids, padded_time_deltas, padded_quality_feats, padded_mask
-
-    def _build_text_events(self, raw_events, retrieved_records, cot_text, seq_x, forecast_start_date, raw_text):
-        source_to_id = {"raw": 0, "ret": 1, "cot": 2}
-        forecast_anchor = pd.Timestamp(forecast_start_date)
-        raw_entries = []
-        for event in raw_events:
-            event_end = pd.Timestamp(event.get("end_date", forecast_anchor))
-            time_delta = float(max((forecast_anchor - event_end).days, 0))
-            text = self._normalize_text(event.get("text", ""))
-            if not text:
-                continue
-            raw_entries.append(
-                {
-                    "text": text,
-                    "source_id": source_to_id["raw"],
-                    "time_delta": time_delta,
-                    "quality_feats": self._build_event_quality_features(text, "raw", seq_x, time_delta, raw_text),
-                }
-            )
-        raw_entries = sorted(raw_entries, key=lambda item: item["time_delta"])[: self.max_text_events]
-
-        ret_entries = []
-        for record in retrieved_records:
-            text = self._normalize_text(record.get("fact", ""))
-            if not text:
-                continue
-            record_end = record.get("end_date", forecast_anchor)
-            if pd.isna(record_end):
-                record_end = forecast_anchor
-            time_delta = float(max((forecast_anchor - pd.Timestamp(record_end)).days, 0))
-            ret_entries.append(
-                {
-                    "text": text,
-                    "source_id": source_to_id["ret"],
-                    "time_delta": time_delta,
-                    "quality_feats": self._build_event_quality_features(text, "ret", seq_x, time_delta, raw_text),
-                }
-            )
-
-        cot_entries = []
-        normalized_cot = self._normalize_text(cot_text)
-        if normalized_cot:
-            cot_entries.append(
-                {
-                    "text": normalized_cot,
-                    "source_id": source_to_id["cot"],
-                    "time_delta": 0.0,
-                    "quality_feats": self._build_event_quality_features(normalized_cot, "cot", seq_x, 0.0, raw_text),
-                }
-            )
-
-        reserved_slots = len(ret_entries) + len(cot_entries)
-        raw_budget = max(self.max_text_events - reserved_slots, 0)
-        selected_entries = raw_entries[:raw_budget] + ret_entries + cot_entries
-        selected_entries = selected_entries[: self.max_text_events]
-        return self._pad_text_events(selected_entries)
+    def _empty_text_events(self):
+        # The event bundle was unpacked in the model and never read by forward
+        # or evaluate. Slots stay in the batch so the collate schema is stable.
+        return (
+            ["NA"] * self.max_text_events,
+            np.zeros((self.max_text_events,), dtype=np.int64),
+            np.zeros((self.max_text_events,), dtype=np.float32),
+            np.zeros((self.max_text_events, 6), dtype=np.float32),
+            np.zeros((self.max_text_events,), dtype=np.float32),
+        )
 
     def _build_text_quality_package(self, raw_text, ret_text, cot_text, seq_x):
         q_raw = self._compute_text_quality(raw_text, "raw", seq_x)
@@ -666,29 +561,14 @@ class Dataset_Custom(Dataset):
             + self.text_quality_weights[1] * q_ret
             + self.text_quality_weights[2] * q_cot
         )
-        g_raw = q_raw
-        g_ret = min(q_ret, g_raw)
-        g_cot = min(q_cot, g_ret)
-        if q_all >= self.text_quality_mid_threshold:
-            level = 2
-        elif q_all >= self.text_quality_drop_threshold:
-            level = 1
-        else:
-            level = 0
-        if level < 2:
-            g_cot = 0.0
-        if level < 1:
-            g_ret = 0.0
-            g_cot = 0.0
+        # gate_raw/ret/cot and level used to be computed here and were never read.
+        # text_quality_drop_threshold / text_quality_mid_threshold remain on the
+        # constructor so existing configs still load, but they no longer gate text.
         return {
             "quality_raw": float(np.clip(q_raw, 0.0, 1.0)),
             "quality_ret": float(np.clip(q_ret, 0.0, 1.0)),
             "quality_cot": float(np.clip(q_cot, 0.0, 1.0)),
             "quality_total": float(np.clip(q_all, 0.0, 1.0)),
-            "gate_raw": float(np.clip(g_raw, 0.0, 1.0)),
-            "gate_ret": float(np.clip(g_ret, 0.0, 1.0)),
-            "gate_cot": float(np.clip(g_cot, 0.0, 1.0)),
-            "level": int(level),
         }
 
     def _build_numeric_trend_prior(self, seq_x):
@@ -905,39 +785,7 @@ class Dataset_Custom(Dataset):
         return self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
 
     def _truncate_recent_text(self, segments):
-        cleaned_segments = [str(segment).strip() for segment in segments if str(segment).strip()]
-        if not cleaned_segments:
-            return "NA"
-
-        token_budget = max(int(self.max_text_tokens), 1)
-        desc = cleaned_segments[0] if cleaned_segments and cleaned_segments[0] == self.desc else None
-        desc_tokens = desc.split() if desc else []
-        if len(desc_tokens) >= token_budget:
-            return " ".join(desc_tokens[:token_budget])
-
-        remaining_budget = token_budget - len(desc_tokens)
-        source_segments = cleaned_segments[1:] if desc else cleaned_segments
-        selected_recent = []
-        used_tokens = 0
-        for segment in reversed(source_segments):
-            segment_tokens = segment.split()
-            if not segment_tokens:
-                continue
-            if used_tokens + len(segment_tokens) > remaining_budget:
-                if not selected_recent and remaining_budget > 0:
-                    selected_recent.append(" ".join(segment_tokens[-remaining_budget:]))
-                break
-            selected_recent.append(segment)
-            used_tokens += len(segment_tokens)
-
-        selected_recent.reverse()
-        final_segments = []
-        if desc:
-            final_segments.append(desc)
-        final_segments.extend(selected_recent)
-        if not final_segments:
-            return " ".join(desc_tokens[:token_budget]) if desc_tokens else "NA"
-        return " ".join(final_segments)
+        return order_recent_segments(getattr(self, "desc", None), segments, self.max_text_tokens)
 
     def collect_text(self, start_date, end_date):
         report = self._collect_window_reports(start_date, end_date)
@@ -980,37 +828,25 @@ class Dataset_Custom(Dataset):
                 seen.add(segment)
         all_txt = self._truncate_recent_text(filtered_report)
         return all_txt, text_mark, meta
-    
-    def __getitem__(self, index):
-        s_begin = index
-        s_end = s_begin + self.seq_len
 
-        r_begin = s_end
-        r_end = r_begin + self.pred_len
-
-        seq_x = self.data_x[s_begin:s_end, :]
-        seq_x_observed_mask = self.data_observed_mask[s_begin:s_end, :]
-        if self.set_type == 0 and (self.aug_noise_std > 0 or self.aug_time_warp_prob > 0):
-            seq_x = self._apply_lookback_augmentation(seq_x)
-        seq_y = self.data_y[r_begin:r_end, :]
-    
-        seq_x_stamp = self.data_stamp[s_begin:s_end]
-        seq_y_stamp = self.data_stamp[r_begin:r_end]
-
+    def _load_window_text(self, index, seq_x, text_dropped=False):
+        s_end = index + self.seq_len
         text_begin = max(s_end - self.text_len, 0)
         text_end = s_end - 1
         history_start_date = self.num_dates.start_date[text_begin]
         history_end_date = self.num_dates.end_date[text_end]
-
-        raw_text, txt_mark, text_meta = self.collect_text(history_start_date, history_end_date)
-        text_dropped = False
-        if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
-            raw_text, txt_mark = 'NA', 0
-            text_dropped = True
+        raw_text, _txt_mark, text_meta = self.collect_text(history_start_date, history_end_date)
+        if text_dropped:
+            empty_meta = {
+                "report_count": 0,
+                "recent_report_count": 0,
+                "recency_days": None,
+                "raw_events": [],
+            }
+            return "NA", empty_meta, "NA", "", ""
         composed_text = raw_text
-        rag_retrieved, cot_text = '', ''
-        retrieved_records = []
-        if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
+        rag_retrieved, cot_text = "", ""
+        if self.use_rag_cot and self.rag_cot is not None:
             cached = self.guidance_cache.get(index, None)
             if cached is None:
                 guidance = self.rag_cot.build_guidance_text(
@@ -1027,15 +863,49 @@ class Dataset_Custom(Dataset):
                 self.guidance_cache[index] = (composed_text, txt_mark, cot_text, rag_retrieved, retrieved_records)
             else:
                 if len(cached) >= 5:
-                    composed_text, txt_mark, cot_text, rag_retrieved, retrieved_records = cached[:5]
+                    composed_text, _txt_mark, cot_text, rag_retrieved, _records = cached[:5]
                 else:
-                    composed_text, txt_mark, cot_text, rag_retrieved = cached
-                    retrieved_records = []
+                    composed_text, _txt_mark, cot_text, rag_retrieved = cached
+        return raw_text, text_meta, composed_text, cot_text, rag_retrieved
+
+    def __getitem__(self, index):
+        s_begin = index
+        s_end = s_begin + self.seq_len
+
+        r_begin = s_end
+        r_end = r_begin + self.pred_len
+
+        seq_x = self.data_x[s_begin:s_end, :]
+        seq_x_observed_mask = self.data_observed_mask[s_begin:s_end, :]
+        if self.set_type == 0 and (self.aug_noise_std > 0 or self.aug_time_warp_prob > 0):
+            seq_x = self._apply_lookback_augmentation(seq_x)
+        seq_y = self.data_y[r_begin:r_end, :]
+    
+        seq_x_stamp = self.data_stamp[s_begin:s_end]
+        seq_y_stamp = self.data_stamp[r_begin:r_end]
+
+        text_dropped = (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob)
+        text_index = index
+        seq_for_text = seq_x
+        if self._text_perm is not None:
+            text_index = int(self._text_perm[index])
+            if text_index != index:
+                donor_begin = text_index
+                donor_end = donor_begin + self.seq_len
+                seq_for_text = self.data_x[donor_begin:donor_end, :]
+        raw_text, text_meta, composed_text, cot_text, rag_retrieved = self._load_window_text(
+            text_index,
+            seq_for_text,
+            text_dropped=text_dropped,
+        )
         txt_mark = 1 if any(
             len(self._normalize_text(text_value)) > 0
             for text_value in (raw_text, rag_retrieved, cot_text, composed_text)
         ) else 0
 
+        # Quality, evidence, and the learned-gate features are scored against the
+        # series being forecast. Shuffled text keeps the donor strings but is
+        # re-described relative to this series.
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
         quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
         trend_prior_text, source_priors = self._build_text_trend_components(
@@ -1054,14 +924,17 @@ class Dataset_Custom(Dataset):
             text_meta,
             seq_x,
         )
-        text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
-            raw_events=text_meta.get("raw_events", []),
-            retrieved_records=retrieved_records,
-            cot_text=cot_text,
-            seq_x=seq_x,
-            forecast_start_date=self.num_dates.start_date[r_begin],
-            raw_text=raw_text,
+        text_validity_features = build_raw_validity_features(
+            raw_text,
+            rag_retrieved,
+            cot_text,
+            seq_x,
+            recency_days=text_meta.get("recency_days"),
+            report_count=float(text_meta.get("report_count", 0)),
+            recent_report_count=float(text_meta.get("recent_report_count", 0)),
+            target_index=int(getattr(self, "target_index", 0)),
         )
+        text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._empty_text_events()
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         if observed_data.shape[1] > 1:
@@ -1098,6 +971,7 @@ class Dataset_Custom(Dataset):
             'trend_prior_num': trend_prior_num,
             'trend_prior_text': trend_prior_text,
             'text_evidence_vec': text_evidence_vec,
+            'text_validity_features': text_validity_features,
             'text_quality_raw': np.asarray(quality_pkg["quality_raw"], dtype=np.float32),
             'text_quality_ret': np.asarray(quality_pkg["quality_ret"], dtype=np.float32),
             'text_quality_cot': np.asarray(quality_pkg["quality_cot"], dtype=np.float32),

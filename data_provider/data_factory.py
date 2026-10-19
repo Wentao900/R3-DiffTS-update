@@ -56,6 +56,8 @@ def data_provider(args, flag):
         extra_kwargs['text_quality_drop_threshold'] = getattr(args, "text_quality_drop_threshold", 0.3)
         extra_kwargs['text_quality_mid_threshold'] = getattr(args, "text_quality_mid_threshold", 0.6)
         extra_kwargs['max_text_events'] = getattr(args, "max_text_events", 12)
+        extra_kwargs['text_shuffle'] = getattr(args, "text_shuffle", False)
+        extra_kwargs['text_shuffle_seed'] = getattr(args, "text_shuffle_seed", 0)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

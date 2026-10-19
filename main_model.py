@@ -8,6 +8,13 @@ from diff_models import diff_CSDI
 from utils.prepare4llm import get_llm
 from utils.controller import ForecastPolicyController
 from utils.forecast_modules import CoarseForecastHead, UncertaintyHead
+from utils.text_signals import VALIDITY_FEATURE_DIM
+from utils.text_validity import (
+    POLICY_CONDITION_BASE_DIM,
+    VALIDITY_CONDITION_EXTRA_DIM,
+    TextValidityModule,
+    benefit_gate_target,
+)
 
 class moving_avg(nn.Module):
     """
@@ -150,7 +157,22 @@ class CSDI_base(nn.Module):
             self.forecast_policy_controller = ForecastPolicyController(self.pred_len, controller_cfg)
         else:
             self.forecast_policy_controller = None
-        self.policy_cond_dim = int(config["model"].get("policy_cond_dim", 16))
+        self.text_validity_mode = str(config["model"].get("text_validity_mode", "rule")).lower()
+        if self.text_validity_mode not in ("rule", "learned", "fixed", "fixed_mean"):
+            raise ValueError(f"Unknown text_validity_mode '{self.text_validity_mode}'")
+        self.text_validity_fixed_value = float(config["model"].get("text_validity_fixed_value", 1.0))
+        self.text_validity_loss_weight = float(train_cfg.get("text_validity_loss_weight", 0.0))
+        self.text_validity_proj_dim = int(config["model"].get("text_validity_proj_dim", 32))
+        self.text_validity_hidden_dim = int(config["model"].get("text_validity_hidden_dim", 64))
+        configured_policy_dim = config["model"].get("policy_cond_dim", None)
+        if self.text_validity_mode != "rule" and configured_policy_dim is None:
+            self.policy_cond_dim = POLICY_CONDITION_BASE_DIM + VALIDITY_CONDITION_EXTRA_DIM
+        else:
+            self.policy_cond_dim = int(16 if configured_policy_dim is None else configured_policy_dim)
+        self._text_pack = None
+        self._validity_log_rows = []
+        self._collect_validity_log = False
+        self._validity_log_cursor = 0
         self.use_aux_forecast_heads = bool(config["model"].get("use_aux_forecast_heads", self.final_method))
         self.use_coarse_forecast_head = bool(config["model"].get("use_coarse_forecast_head", self.use_aux_forecast_heads))
         self.use_uncertainty_head = bool(config["model"].get("use_uncertainty_head", self.use_aux_forecast_heads))
@@ -266,7 +288,7 @@ class CSDI_base(nn.Module):
             self.text_encoder, self.tokenizer = get_llm(self.llm, config["model"]["llm_layers"])
             for param in self.text_encoder.parameters():
                 param.requires_grad = False
-            if self.llm != 'bert':
+            if self.llm not in ('bert', 'stub'):
                 if self.tokenizer.eos_token:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                 else:
@@ -298,6 +320,16 @@ class CSDI_base(nn.Module):
             )
         else:
             self.pattern_text_head = None
+        if self.text_validity_mode != "rule" and self.with_texts:
+            self.text_validity = TextValidityModule(
+                text_dim=self.text_hidden_dim,
+                proj_dim=self.text_validity_proj_dim,
+                hidden_dim=self.text_validity_hidden_dim,
+                evidence_dim=VALIDITY_FEATURE_DIM,
+                stats_dim=self.pattern_stats_dim,
+            )
+        else:
+            self.text_validity = None
         if self.use_coarse_forecast_head:
             self.coarse_forecast_head = CoarseForecastHead(
                 lookback_len=self.lookback_len,
@@ -1029,43 +1061,268 @@ class CSDI_base(nn.Module):
         expert_futures = self._build_expert_futures_from_history(hist, hist_mask, future_len)
         return baseline, expert_futures
 
+    def _is_blank_text(self, text):
+        if text is None:
+            return True
+        stripped = str(text).strip()
+        return stripped == "" or stripped.upper() == "NA"
+
+    def _as_text_list(self, value, batch_size, fallback):
+        if value is None:
+            return list(fallback)
+        if isinstance(value, str):
+            return [value] * batch_size
+        values = [str(item) if item is not None else "NA" for item in list(value)]
+        if len(values) < batch_size:
+            values = values + ["NA"] * (batch_size - len(values))
+        return values[:batch_size]
+
+    def _text_head_pattern(self, pooled):
+        if self.pattern_text_head is None or pooled is None:
+            batch = 1 if pooled is None else pooled.shape[0]
+            device = self.device if pooled is None else pooled.device
+            dtype = torch.float32 if pooled is None else pooled.dtype
+            return torch.zeros((batch, self.pattern_num_experts), device=device, dtype=dtype)
+        return F.softmax(self.pattern_text_head(pooled.float()), dim=-1)
+
+    def _router_kl_pair(self, logits_a, logits_b):
+        pa = F.softmax(logits_a, dim=-1).clamp(min=1e-6)
+        pb = F.softmax(logits_b, dim=-1).clamp(min=1e-6)
+        kl_ab = (pa * (pa.log() - pb.log())).sum(dim=-1)
+        kl_ba = (pb * (pb.log() - pa.log())).sum(dim=-1)
+        return torch.stack([kl_ab, kl_ba], dim=-1)
+
+    def _expert_future_mse(self, expert_futures, pi, observed_data):
+        future_len = expert_futures.shape[-1]
+        batch = pi.shape[0]
+        if future_len <= 0:
+            return torch.zeros((batch,), device=pi.device, dtype=pi.dtype)
+        mixed = (pi.view(batch, self.pattern_num_experts, 1, 1) * expert_futures).sum(dim=1)
+        start = self.lookback_len
+        target = observed_data[:, :, start:start + future_len]
+        feature_index = int(min(max(self.target_feature_index, 0), mixed.shape[1] - 1))
+        residual = mixed[:, feature_index, :] - target[:, feature_index, :]
+        return residual.pow(2).mean(dim=-1)
+
+    def _resolve_applied_gate(self, sample_gate):
+        if self.text_validity_mode == "fixed":
+            return torch.full_like(sample_gate, float(self.text_validity_fixed_value))
+        if self.text_validity_mode == "fixed_mean":
+            if self.training:
+                self.text_validity.update_running_mean(sample_gate)
+            mean = self.text_validity.running_mean(sample_gate.detach().mean())
+            return mean.detach().reshape(()).expand_as(sample_gate)
+        return sample_gate
+
+    def _prepare_text_encoding(self, composed):
+        """Encode text for the pattern router.
+
+        Rule mode keeps the single composed string. Learned modes encode raw,
+        retrieved, and CoT separately so each source gets the full token budget.
+        """
+        if not self.with_texts:
+            self._text_pack = None
+            return None, None
+        if isinstance(composed, str):
+            composed_list = [composed]
+        elif isinstance(composed, (list, tuple)):
+            composed_list = [str(item) if item is not None else "NA" for item in composed]
+        else:
+            composed_list = ["NA"]
+        if self.text_validity is None:
+            self._text_pack = None
+            _, pooled, token_input = self._encode_text_source(composed_list)
+            return pooled, token_input
+        batch_size = len(composed_list)
+        raw_list = self._as_text_list(getattr(self, "_pending_text_raw", None), batch_size, composed_list)
+        ret_list = self._as_text_list(getattr(self, "_pending_text_ret", None), batch_size, ["NA"] * batch_size)
+        cot_list = self._as_text_list(getattr(self, "_pending_text_cot", None), batch_size, ["NA"] * batch_size)
+        _, raw_pooled, _ = self._encode_text_source(raw_list)
+        _, ret_pooled, _ = self._encode_text_source(ret_list)
+        _, cot_pooled, token_input = self._encode_text_source(cot_list)
+        source_emb = torch.stack([raw_pooled, ret_pooled, cot_pooled], dim=1)
+        source_mask = torch.tensor(
+            [
+                [
+                    0.0 if self._is_blank_text(raw_list[idx]) else 1.0,
+                    0.0 if self._is_blank_text(ret_list[idx]) else 1.0,
+                    0.0 if self._is_blank_text(cot_list[idx]) else 1.0,
+                ]
+                for idx in range(batch_size)
+            ],
+            device=source_emb.device,
+            dtype=source_emb.dtype,
+        )
+        features = getattr(self, "_pending_validity_features", None)
+        self._text_pack = {
+            "source_emb": source_emb,
+            "source_mask": source_mask,
+            "validity_features": features,
+        }
+        denom = source_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        pooled = (source_emb * source_mask.unsqueeze(-1)).sum(dim=1) / denom
+        return pooled, token_input
+
+    def _route_with_learned_validity(self, stats, temperature):
+        pack = self._text_pack
+        source_emb = pack["source_emb"]
+        source_mask = pack["source_mask"].to(device=stats.device, dtype=stats.dtype)
+        features = pack.get("validity_features")
+        batch = stats.shape[0]
+        if features is None:
+            features = torch.zeros((batch, VALIDITY_FEATURE_DIM), device=stats.device, dtype=stats.dtype)
+        else:
+            features = features.to(device=stats.device, dtype=stats.dtype).reshape(batch, -1)
+            if features.shape[1] < VALIDITY_FEATURE_DIM:
+                features = F.pad(features, (0, VALIDITY_FEATURE_DIM - features.shape[1]))
+            features = features[:, :VALIDITY_FEATURE_DIM]
+        zeros = torch.zeros((batch, self.pattern_num_experts), device=stats.device, dtype=stats.dtype)
+        numeric_logits = self.pattern_router(torch.cat([stats, zeros], dim=1)) / temperature
+        present = (source_mask.sum(dim=1, keepdim=True) > 0).to(dtype=stats.dtype)
+        denom = source_mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        ungated = (source_emb * source_mask.unsqueeze(-1)).sum(dim=1) / denom
+        ungated_pattern = self._text_head_pattern(ungated) * present
+        ungated_logits = self.pattern_router(torch.cat([stats, ungated_pattern], dim=1)) / temperature
+        disagreement = self._router_kl_pair(numeric_logits, ungated_logits)
+        sample_gate, source_gates = self.text_validity(
+            source_emb,
+            source_mask,
+            stats,
+            features,
+            disagreement,
+        )
+        mix_denom = source_gates.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        mixed = (source_emb * source_gates.unsqueeze(-1)).sum(dim=1) / mix_denom
+        text_pattern = self._text_head_pattern(mixed) * present
+        text_logits_full = self.pattern_router(torch.cat([stats, text_pattern], dim=1)) / temperature
+        text_pattern_used = self._maybe_drop_pattern_text(text_pattern)
+        text_logits = self.pattern_router(torch.cat([stats, text_pattern_used], dim=1)) / temperature
+        return text_pattern_used, numeric_logits, text_logits, text_logits_full, sample_gate, source_gates
+
+    def _validity_supervision(self, stats, numeric_logits, text_logits_full, sample_gate, source_gates, expert_futures, observed_data, temperature):
+        """Auxiliary gate label from numeric-only vs text-guided baseline error.
+
+        The future target is used only as this label. It is not a gate input.
+        """
+        with torch.no_grad():
+            pi_numeric = F.softmax(numeric_logits, dim=-1)
+            pi_text = F.softmax(text_logits_full, dim=-1)
+            err_numeric = self._expert_future_mse(expert_futures, pi_numeric, observed_data)
+            err_text = self._expert_future_mse(expert_futures, pi_text, observed_data)
+            sample_target = benefit_gate_target(err_numeric, err_text)
+            source_emb = self._text_pack["source_emb"]
+            source_mask = self._text_pack["source_mask"].to(device=stats.device, dtype=stats.dtype)
+            source_targets = []
+            for source_index in range(3):
+                pattern_s = self._text_head_pattern(source_emb[:, source_index, :])
+                pattern_s = pattern_s * source_mask[:, source_index:source_index + 1]
+                logits_s = self.pattern_router(torch.cat([stats, pattern_s], dim=1)) / temperature
+                err_s = self._expert_future_mse(expert_futures, F.softmax(logits_s, dim=-1), observed_data)
+                target_s = benefit_gate_target(err_numeric, err_s)
+                target_s = torch.where(source_mask[:, source_index] > 0, target_s, torch.zeros_like(target_s))
+                source_targets.append(target_s)
+            source_target = torch.stack(source_targets, dim=1)
+        sample_loss = F.binary_cross_entropy(sample_gate.clamp(1e-6, 1.0 - 1e-6), sample_target)
+        source_loss = F.binary_cross_entropy(source_gates.clamp(1e-6, 1.0 - 1e-6), source_target)
+        return sample_loss + source_loss, sample_target
+
+    def _append_validity_log(self, applied_gate, sample_gate, source_gates, aux_target, scale, controller_state):
+        batch = int(applied_gate.shape[0]) if applied_gate is not None else int(scale.shape[0])
+        for idx in range(batch):
+            row = {
+                "sample_index": int(self._validity_log_cursor),
+                "mode": self.text_validity_mode,
+                "guidance_scale": float(scale[idx].detach().cpu()),
+                "aux_target": float(aux_target[idx].detach().cpu()) if aux_target is not None else "",
+            }
+            if controller_state is not None and controller_state.get("text_gate") is not None:
+                row["rule_text_gate"] = float(controller_state["text_gate"][idx].detach().cpu())
+            else:
+                row["rule_text_gate"] = ""
+            if sample_gate is None:
+                row["sample_gate"] = ""
+                row["applied_gate"] = float(scale[idx].detach().cpu())
+                row["source_gate_raw"] = ""
+                row["source_gate_ret"] = ""
+                row["source_gate_cot"] = ""
+            else:
+                row["sample_gate"] = float(sample_gate[idx].detach().cpu())
+                row["applied_gate"] = float(applied_gate[idx].detach().cpu())
+                row["source_gate_raw"] = float(source_gates[idx, 0].detach().cpu())
+                row["source_gate_ret"] = float(source_gates[idx, 1].detach().cpu())
+                row["source_gate_cot"] = float(source_gates[idx, 2].detach().cpu())
+            self._validity_log_rows.append(row)
+            self._validity_log_cursor += 1
+
     def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0, controller_state=None):
         B, K, L = observed_data.shape
         stats = self._compute_pattern_stats(observed_data, cond_mask)
-        text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
-        text_pattern = self._maybe_drop_pattern_text(text_pattern)
         temperature = max(float(self.pattern_router_temperature), 1e-3)
-        numeric_router_input = torch.cat([stats, torch.zeros_like(text_pattern)], dim=1)
-        text_router_input = torch.cat([stats, text_pattern], dim=1)
-        numeric_logits = self.pattern_router(numeric_router_input) / temperature
-        text_logits = self.pattern_router(text_router_input) / temperature
-        controller_scale = None
-        controller_residual_scale = None
-        if controller_state is not None:
-            controller_scale = controller_state.get("guidance_scale")
-            controller_residual_scale = controller_state.get("residual_scale")
-        if controller_scale is None:
-            controller_scale = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
-        else:
-            controller_scale = controller_scale.to(device=observed_data.device, dtype=observed_data.dtype).reshape(-1)
-        if self.guide_mode == "auto":
-            scale, text_quality, router_agreement, pi_numeric, pi_text, text_gain = self._compute_auto_guidance(
+        use_learned = self.text_validity is not None and self._text_pack is not None and self._text_pack.get("source_emb") is not None
+        sample_gate = None
+        source_gates = None
+        applied_gate = None
+        validity_loss = None
+        validity_extra = None
+        text_logits_full = None
+        if use_learned:
+            (
+                text_pattern,
                 numeric_logits,
                 text_logits,
-                text_evidence_vec,
-                text_mask,
-                B,
-                observed_data=observed_data,
-                cond_mask=cond_mask,
-            )
-            scale = scale * controller_scale
-        else:
-            scale = torch.full((B,), float(guidance_scale), device=observed_data.device, dtype=observed_data.dtype) * controller_scale
+                text_logits_full,
+                sample_gate,
+                source_gates,
+            ) = self._route_with_learned_validity(stats, temperature)
+            applied_gate = self._resolve_applied_gate(sample_gate)
+            # Manual mode: `guidance_scale` is guide_w, chosen on the validation
+            # sweep. Auto mode ignores the evaluate() argument (it is 0) and
+            # keeps guide_w_default as the only global multiplier. The per-sample
+            # factor is the learned gate, not the rule controller and not w_auto.
+            if self.guide_mode == "auto":
+                global_weight = float(self.guide_w_default)
+            else:
+                global_weight = float(guidance_scale)
+            scale = torch.full((B,), global_weight, device=observed_data.device, dtype=observed_data.dtype) * applied_gate
             text_quality = self._compute_text_quality(text_evidence_vec, text_mask, B, observed_data.device, observed_data.dtype)
-            router_agreement = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
             pi_numeric = F.softmax(numeric_logits, dim=-1)
-            pi_text = F.softmax(text_logits, dim=-1)
+            pi_text = F.softmax(text_logits_full, dim=-1)
+            router_agreement = torch.exp(-0.5 * self._router_kl_pair(numeric_logits, text_logits_full).sum(dim=-1)).clamp(0.0, 1.0)
             text_gain = torch.ones((), device=observed_data.device, dtype=observed_data.dtype)
+        else:
+            text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
+            text_pattern = self._maybe_drop_pattern_text(text_pattern)
+            numeric_router_input = torch.cat([stats, torch.zeros_like(text_pattern)], dim=1)
+            text_router_input = torch.cat([stats, text_pattern], dim=1)
+            numeric_logits = self.pattern_router(numeric_router_input) / temperature
+            text_logits = self.pattern_router(text_router_input) / temperature
+            text_logits_full = text_logits
+            controller_scale = None
+            if controller_state is not None:
+                controller_scale = controller_state.get("guidance_scale")
+            if controller_scale is None:
+                controller_scale = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
+            else:
+                controller_scale = controller_scale.to(device=observed_data.device, dtype=observed_data.dtype).reshape(-1)
+            if self.guide_mode == "auto":
+                scale, text_quality, router_agreement, pi_numeric, pi_text, text_gain = self._compute_auto_guidance(
+                    numeric_logits,
+                    text_logits,
+                    text_evidence_vec,
+                    text_mask,
+                    B,
+                    observed_data=observed_data,
+                    cond_mask=cond_mask,
+                )
+                scale = scale * controller_scale
+            else:
+                scale = torch.full((B,), float(guidance_scale), device=observed_data.device, dtype=observed_data.dtype) * controller_scale
+                text_quality = self._compute_text_quality(text_evidence_vec, text_mask, B, observed_data.device, observed_data.dtype)
+                router_agreement = torch.ones((B,), device=observed_data.device, dtype=observed_data.dtype)
+                pi_numeric = F.softmax(numeric_logits, dim=-1)
+                pi_text = F.softmax(text_logits, dim=-1)
+                text_gain = torch.ones((), device=observed_data.device, dtype=observed_data.dtype)
+        controller_residual_scale = None if controller_state is None else controller_state.get("residual_scale")
         guided_logits = numeric_logits + scale.reshape(B, 1) * (text_logits - numeric_logits)
         pi = F.softmax(guided_logits, dim=-1)
         baseline, expert_futures = self._build_pattern_baselines(observed_data, cond_mask, stats)
@@ -1081,6 +1338,38 @@ class CSDI_base(nn.Module):
                     dtype=observed_data.dtype,
                 ).reshape(B, 1, 1)
             baseline[:, :, self.lookback_len:self.lookback_len + future_len] = mixed_future
+        aux_target = None
+        if use_learned:
+            validity_loss, aux_target = self._validity_supervision(
+                stats,
+                numeric_logits,
+                text_logits_full,
+                sample_gate,
+                source_gates,
+                expert_futures,
+                observed_data,
+                temperature,
+            )
+            if self.training and self.text_validity_mode in ("learned", "fixed_mean") and self.text_validity_loss_weight > 0:
+                validity_loss = float(self.text_validity_loss_weight) * validity_loss
+            elif self.training and self.text_validity_mode == "fixed":
+                # Keep the unused gate parameters in the graph so the optimizer
+                # sees a defined gradient. The value is identically zero.
+                validity_loss = sample_gate.sum() * 0.0
+            else:
+                validity_loss = None
+            validity_extra = torch.cat(
+                [applied_gate.reshape(B, 1), source_gates.reshape(B, 3)],
+                dim=1,
+            )
+        elif self._collect_validity_log and future_len > 0:
+            with torch.no_grad():
+                err_numeric = self._expert_future_mse(expert_futures, pi_numeric, observed_data)
+                err_text = self._expert_future_mse(expert_futures, F.softmax(text_logits_full, dim=-1), observed_data)
+                aux_target = benefit_gate_target(err_numeric, err_text)
+        if self._collect_validity_log:
+            log_gate = applied_gate if applied_gate is not None else scale.detach()
+            self._append_validity_log(log_gate, sample_gate, source_gates, aux_target, scale, controller_state)
         pseudo = torch.stack(
             [stats[:, 1], stats[:, 3], stats[:, 4], stats[:, 5], stats[:, 6]],
             dim=1,
@@ -1102,6 +1391,12 @@ class CSDI_base(nn.Module):
             "router_agreement": router_agreement,
             "text_gain": text_gain,
             "guidance_scale": scale,
+            "sample_gate": sample_gate,
+            "applied_gate": applied_gate,
+            "source_gates": source_gates,
+            "aux_target": aux_target,
+            "validity_loss": validity_loss,
+            "validity_extra": validity_extra,
         }
 
     def _compute_weak_pattern_baseline(self, pattern, observed_data, target_mask, use_training_target):
@@ -1250,15 +1545,6 @@ class CSDI_base(nn.Module):
         pattern_baseline = None
         aux_outputs = None
         diffusion_target = observed_data
-        if not self.noise_esti:
-            aux_outputs = self._compute_aux_head_outputs(
-                observed_data,
-                cond_mask,
-                trend_prior=trend_prior,
-                controller_state=controller_state,
-                text_mask=pattern_text_mask,
-                text_evidence_vec=pattern_text_evidence_vec,
-            )
         if self.pattern_residual_diffusion and not self.noise_esti:
             pattern = self._compute_pattern_outputs(
                 observed_data,
@@ -1269,6 +1555,18 @@ class CSDI_base(nn.Module):
                 guidance_scale=1.0,
                 controller_state=controller_state,
             )
+        validity_extra = None if pattern is None else pattern.get("validity_extra")
+        if not self.noise_esti:
+            aux_outputs = self._compute_aux_head_outputs(
+                observed_data,
+                cond_mask,
+                trend_prior=trend_prior,
+                controller_state=controller_state,
+                text_mask=pattern_text_mask,
+                text_evidence_vec=pattern_text_evidence_vec,
+                validity_extra=validity_extra,
+            )
+        if self.pattern_residual_diffusion and not self.noise_esti and pattern is not None:
             if self.final_method:
                 pattern_baseline = self._compute_weak_pattern_baseline(
                     pattern,
@@ -1374,6 +1672,9 @@ class CSDI_base(nn.Module):
             capped_auxiliary_loss = torch.minimum(auxiliary_loss, aux_cap)
             aux_diag_scale = capped_auxiliary_loss.detach() / auxiliary_loss.detach().clamp(min=1e-6)
             auxiliary_loss = capped_auxiliary_loss
+        validity_loss = None if pattern is None else pattern.get("validity_loss")
+        if validity_loss is not None and is_train == 1:
+            auxiliary_loss = auxiliary_loss + validity_loss
         with torch.no_grad():
             self.diag_main_loss_sum.add_(main_loss.detach().float())
             self.diag_pattern_aux_sum.add_((pattern_aux.detach() * aux_diag_scale).float())
@@ -1692,7 +1993,7 @@ class CSDI_base(nn.Module):
                 a = self.num_steps // self.sample_steps
                 time_steps = np.asarray(list(range(0, self.num_steps, a)))
             elif self.sample_method == "quad":
-                time_steps = (np.linspace(0, np.sqrt(self.num_steps * 0.8), self.sample_steps) ** 2).astype(np.int)
+                time_steps = (np.linspace(0, np.sqrt(self.num_steps * 0.8), self.sample_steps) ** 2).astype(int)
             else:
                 raise NotImplementedError(f"sampling method {self.sample_method} is not implemented!")
             time_steps = time_steps + 1
@@ -1936,6 +2237,14 @@ class CSDI_Forecasting(CSDI_base):
             timesteps = None
         if self.with_texts:
             texts = batch.get("texts", batch.get("text_raw"))
+            self._pending_text_raw = batch.get("text_raw", texts)
+            self._pending_text_ret = batch.get("text_ret", batch.get("retrieved_text"))
+            self._pending_text_cot = batch.get("text_cot", batch.get("cot_text"))
+            validity_features = batch.get("text_validity_features")
+            if validity_features is not None:
+                self._pending_validity_features = validity_features.to(self.device).float()
+            else:
+                self._pending_validity_features = None
             text_event_texts = self._reshape_text_event_batch(batch.get("text_event_texts"), batch_size)
             text_event_source_ids = batch.get("text_event_source_ids")
             text_event_time_deltas = batch.get("text_event_time_deltas")
@@ -2314,7 +2623,7 @@ class CSDI_Forecasting(CSDI_base):
         hist_mean = (history * history_mask).sum(dim=2, keepdim=True) / denom
         return torch.where(history_mask > 0, history, hist_mean.expand_as(history))
 
-    def _build_policy_condition_vector(self, trend_prior, controller_state, text_mask, text_evidence_vec):
+    def _build_policy_condition_vector(self, trend_prior, controller_state, text_mask, text_evidence_vec, validity_extra=None):
         if trend_prior is None:
             batch_size = text_mask.shape[0] if text_mask is not None else 1
             trend = torch.zeros((batch_size, 3), device=self.device)
@@ -2397,17 +2706,36 @@ class CSDI_Forecasting(CSDI_base):
             ],
             dim=1,
         )
+        if cond_vec.shape[1] != POLICY_CONDITION_BASE_DIM:
+            raise RuntimeError(
+                f"policy condition base dim is {cond_vec.shape[1]}, expected {POLICY_CONDITION_BASE_DIM}"
+            )
+        if validity_extra is not None:
+            extra = validity_extra.to(device=device, dtype=dtype)
+            if extra.dim() == 1:
+                extra = extra.reshape(batch_size, -1)
+            if extra.shape[1] != VALIDITY_CONDITION_EXTRA_DIM:
+                raise RuntimeError(
+                    f"validity condition extra dim is {extra.shape[1]}, expected {VALIDITY_CONDITION_EXTRA_DIM}"
+                )
+            cond_vec = torch.cat([cond_vec, extra], dim=1)
         if cond_vec.shape[1] < self.policy_cond_dim:
             cond_vec = F.pad(cond_vec, (0, self.policy_cond_dim - cond_vec.shape[1]))
         elif cond_vec.shape[1] > self.policy_cond_dim:
             cond_vec = cond_vec[:, : self.policy_cond_dim]
         return cond_vec
 
-    def _compute_aux_head_outputs(self, observed_data, cond_mask, trend_prior=None, controller_state=None, text_mask=None, text_evidence_vec=None):
+    def _compute_aux_head_outputs(self, observed_data, cond_mask, trend_prior=None, controller_state=None, text_mask=None, text_evidence_vec=None, validity_extra=None):
         if (self.coarse_forecast_head is None) and (self.uncertainty_head is None):
             return None
         history = self._fill_history_for_aux(observed_data, cond_mask)
-        cond_vec = self._build_policy_condition_vector(trend_prior, controller_state, text_mask, text_evidence_vec)
+        cond_vec = self._build_policy_condition_vector(
+            trend_prior,
+            controller_state,
+            text_mask,
+            text_evidence_vec,
+            validity_extra=validity_extra,
+        )
         outputs = {"cond_vec": cond_vec}
         if self.coarse_forecast_head is not None:
             outputs["coarse_future"] = self.coarse_forecast_head(history, cond_vec=cond_vec)
@@ -2534,8 +2862,9 @@ class CSDI_Forecasting(CSDI_base):
             self.target_feature_index = int(target_feature_index[0].item())
 
         if self.with_texts:
-            _, text_pooled, _ = self._encode_text_source(texts)
+            text_pooled, _ = self._prepare_text_encoding(texts)
         else:
+            self._text_pack = None
             text_pooled = None
             if text_mask is not None:
                 text_mask = torch.zeros_like(text_mask)
@@ -2622,11 +2951,13 @@ class CSDI_Forecasting(CSDI_base):
             cond_mask = gt_mask
 
             tokens = None
+            self._collect_validity_log = True
             if self.with_texts:
-                _, text_pooled, token_input = self._encode_text_source(texts)
-                if self.save_token:
+                text_pooled, token_input = self._prepare_text_encoding(texts)
+                if self.save_token and token_input is not None:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
+                self._text_pack = None
                 text_pooled = None
                 if text_mask is not None:
                     text_mask = torch.zeros_like(text_mask)
@@ -2663,6 +2994,7 @@ class CSDI_Forecasting(CSDI_base):
                 samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state)
             else:
                 samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state)
+            self._collect_validity_log = False
 
         if self.save_attn:
             if self.save_token:

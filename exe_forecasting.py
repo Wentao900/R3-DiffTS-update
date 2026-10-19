@@ -411,7 +411,8 @@ extra_timestep_dims = 2 if args.data == 'custom' else 0
 context_dim_dict = {
     'bert': 768,
     'llama': 4096,
-    'gpt2': 768
+    'gpt2': 768,
+    'stub': 32,
 }
 path = "config/" + args.config
 with open(path, "r") as f:
@@ -631,6 +632,15 @@ args.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_
 args.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
 args.max_text_events = int(dataset_cfg.get("max_text_events", 12))
 args.num_workers = int(dataset_cfg.get("num_workers", args.num_workers))
+args.text_shuffle = bool(config["model"].get("text_shuffle", dataset_cfg.get("text_shuffle", False)))
+args.text_shuffle_seed = int(config["model"].get("text_shuffle_seed", dataset_cfg.get("text_shuffle_seed", args.seed)))
+if "text_drop_prob" in config["model"] or "text_drop_prob" in dataset_cfg:
+    args.text_drop_prob = float(config["model"].get("text_drop_prob", dataset_cfg.get("text_drop_prob", args.text_drop_prob)))
+config["model"]["text_validity_mode"] = str(config["model"].get("text_validity_mode", "rule")).lower()
+config["model"]["text_validity_fixed_value"] = float(config["model"].get("text_validity_fixed_value", 1.0))
+config["model"]["text_validity_proj_dim"] = int(config["model"].get("text_validity_proj_dim", 32))
+config["model"]["text_validity_hidden_dim"] = int(config["model"].get("text_validity_hidden_dim", 64))
+config["train"]["text_validity_loss_weight"] = float(config["train"].get("text_validity_loss_weight", 0.0))
 
 args.batch_size = config["train"]["batch_size"]
 

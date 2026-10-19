@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from utils.text_signals import compose_priority_text, numeric_endpoint_stats
 import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -297,13 +298,13 @@ class RAGCoTPipeline:
         return records
 
     def _summarize_numeric(self, numeric_history: Sequence[float]) -> str:
-        arr = np.asarray(numeric_history, dtype=float).flatten()
-        if arr.size == 0:
+        stats = self._compute_numeric_stats(numeric_history)
+        if float(stats.get("mean_abs", 0.0)) == 0.0 and float(stats.get("std", 0.0)) == 0.0 and float(stats.get("last", stats.get("mean", 0.0))) == 0.0 and np.asarray(numeric_history).size == 0:
             return "No numeric history available."
-        last = arr[-1]
-        mean = float(np.mean(arr))
-        std = float(np.std(arr))
-        slope = float(arr[-1] - arr[0]) / max(arr.size - 1, 1)
+        last = float(stats.get("last", stats.get("mean", 0.0)))
+        mean = float(stats["mean"])
+        std = float(stats["std"])
+        slope = float(stats["slope"])
         direction = "upward" if slope > 0 else "downward" if slope < 0 else "flat"
         return (
             f"last={last:.4f}, mean={mean:.4f}, std={std:.4f}, "
@@ -311,19 +312,9 @@ class RAGCoTPipeline:
         )
 
     def _compute_numeric_stats(self, numeric_history: Sequence[float]) -> Dict[str, float]:
-        arr = np.asarray(numeric_history, dtype=float).flatten()
-        if arr.size == 0:
-            return {
-                "slope": 0.0,
-                "std": 0.0,
-                "mean_abs": 0.0,
-                "mean": 0.0,
-            }
-        mean = float(np.mean(arr))
-        slope = float(arr[-1] - arr[0]) / max(arr.size - 1, 1)
-        std = float(np.std(arr))
-        mean_abs = float(np.mean(np.abs(arr)))
-        return {"slope": slope, "std": std, "mean_abs": mean_abs, "mean": mean}
+        # Target column only. Flattening a (time, feature) window subtracts the
+        # last covariate from the first target observation.
+        return numeric_endpoint_stats(numeric_history, target_index=0)
 
     def _format_prompt(
         self,
@@ -542,14 +533,14 @@ class RAGCoTPipeline:
         return cleaned[: max_chars - 3].rstrip() + "..."
 
     def _compose_text(self, base_text: str, retrieved: List[str], cot_text: str) -> str:
-        blocks = []
-        if base_text and base_text != "NA":
-            blocks.append(base_text)
-        if retrieved:
-            blocks.append("Retrieved evidence: " + " ".join(retrieved))
-        if cot_text and self.config.include_cot_in_text:
-            blocks.append("Intermediate trend reasoning: " + cot_text)
-        return "\n".join(blocks) if blocks else ""
+        # Reasoning and evidence come first so a left-truncating encoder sees them.
+        hypothesis = cot_text if self.config.include_cot_in_text else ""
+        return compose_priority_text(
+            raw_text=base_text,
+            numeric_summary="",
+            trend_hypothesis=hypothesis,
+            retrieved=retrieved,
+        )
 
     def _compose_two_stage_text(
         self,
@@ -558,25 +549,13 @@ class RAGCoTPipeline:
         trend_hypothesis: str,
         retrieved: List[str],
     ) -> str:
-        raw_text = base_text if not self._is_empty_text(base_text) else "NA"
-        lines = [
-            "[RAW TEXT]",
-            raw_text,
-            "",
-            "[NUMERICAL SUMMARY]",
-            numeric_summary,
-            "",
-            "[TREND HYPOTHESIS]",
-            trend_hypothesis,
-            "",
-            "[RETRIEVED EVIDENCE - REFINED]",
-        ]
-        if retrieved:
-            for idx, item in enumerate(retrieved, start=1):
-                lines.append(f"{idx}) {self._truncate_evidence(item)}")
-        else:
-            lines.append("1) NA")
-        return "\n".join(lines)
+        raw_text = "" if self._is_empty_text(base_text) else base_text
+        return compose_priority_text(
+            raw_text=raw_text,
+            numeric_summary=numeric_summary,
+            trend_hypothesis=trend_hypothesis,
+            retrieved=retrieved,
+        )
 
     def _build_one_shot_guidance(
         self,

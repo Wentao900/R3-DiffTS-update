@@ -38,6 +38,7 @@ class RAGCoTConfig:
     two_stage_gate: bool = True
     trend_slope_eps: float = 1e-3
     debug: bool = False
+    skip_cot_generation: bool = False
 
 
 class RAGCoTPipeline:
@@ -205,10 +206,20 @@ class RAGCoTPipeline:
             "rag_stage2_topk": int(self.config.rag_stage2_topk),
             "two_stage_gate": bool(self.config.two_stage_gate),
             "trend_slope_eps": float(self.config.trend_slope_eps),
+            "cache_version": 2,
+            "date_cutoff": True,
+            "skip_cot_generation": bool(getattr(self.config, "skip_cot_generation", False)),
         }
 
-    def _make_cache_key(self, numeric_history: Sequence[float], start_date, end_date, base_text: str) -> str:
-        numeric_arr = np.asarray(numeric_history, dtype=np.float32)
+    def _select_numeric_history(self, numeric_history: Sequence[float], target_index=None):
+        arr = np.asarray(numeric_history, dtype=float)
+        if target_index is None or arr.ndim < 2 or arr.shape[-1] <= 1:
+            return arr
+        index = int(np.clip(int(target_index), 0, arr.shape[-1] - 1))
+        return arr[..., index]
+
+    def _make_cache_key(self, numeric_history: Sequence[float], start_date, end_date, base_text: str, target_index=None) -> str:
+        numeric_arr = np.asarray(self._select_numeric_history(numeric_history, target_index), dtype=np.float32)
         numeric_digest = hashlib.sha1(numeric_arr.tobytes()).hexdigest()
         payload = {
             "signature": self._cache_signature(),
@@ -217,6 +228,7 @@ class RAGCoTPipeline:
             "base_text_digest": hashlib.sha1(str(base_text).encode("utf-8")).hexdigest(),
             "numeric_shape": list(numeric_arr.shape),
             "numeric_digest": numeric_digest,
+            "target_index": None if target_index is None else int(target_index),
         }
         raw_key = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
@@ -588,8 +600,11 @@ class RAGCoTPipeline:
         query = self._build_query(numeric_summary, base_text)
         retrieved_records = self._retrieve_records(query, cutoff_end_date=cutoff_end_date)
         retrieved = [record["fact"] for record in retrieved_records]
-        prompt = self._format_prompt(numeric_summary, retrieved)
-        cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
+        if bool(getattr(self.config, "skip_cot_generation", False)):
+            cot_text = ""
+        else:
+            prompt = self._format_prompt(numeric_summary, retrieved)
+            cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
         composed_text = self._compose_text(base_text, retrieved, cot_text)
         return {
             "cot_text": cot_text,
@@ -605,8 +620,11 @@ class RAGCoTPipeline:
         start_date,
         end_date,
         base_text: str,
+        target_index=None,
     ) -> Dict[str, str]:
-        cache_key = self._make_cache_key(numeric_history, start_date, end_date, base_text)
+        if target_index is not None:
+            numeric_history = self._select_numeric_history(numeric_history, target_index)
+        cache_key = self._make_cache_key(numeric_history, start_date, end_date, base_text, target_index=target_index)
         if cache_key in self.cache:
             return self.cache[cache_key]
         disk_cached = self._load_disk_cache(cache_key)

@@ -8,6 +8,7 @@ from diff_models import diff_CSDI
 from utils.prepare4llm import get_llm
 from utils.controller import ForecastPolicyController
 from utils.forecast_modules import CoarseForecastHead, UncertaintyHead
+from utils.text_gate import TextValidityGate, benefit_label
 
 class moving_avg(nn.Module):
     """
@@ -39,6 +40,28 @@ class series_decomp(nn.Module):
         res = x - moving_mean
         return res, moving_mean
     
+class DLinearBaseline(nn.Module):
+    """Shared-weight DLinear baseline (Zeng et al., 2023). One decomposition, two maps L→H."""
+
+    def __init__(self, seq_len, pred_len, kernel_size=25):
+        super().__init__()
+        kernel_size = int(kernel_size)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        if kernel_size > int(seq_len):
+            kernel_size = int(seq_len) if int(seq_len) % 2 == 1 else max(int(seq_len) - 1, 1)
+        kernel_size = max(kernel_size, 1)
+        self.decomposition = series_decomp(kernel_size)
+        self.linear_seasonal = nn.Linear(int(seq_len), int(pred_len))
+        self.linear_trend = nn.Linear(int(seq_len), int(pred_len))
+
+    def forward(self, history):
+        seasonal, trend = self.decomposition(history.permute(0, 2, 1))
+        seasonal = self.linear_seasonal(seasonal.permute(0, 2, 1))
+        trend = self.linear_trend(trend.permute(0, 2, 1))
+        return seasonal + trend
+
+
 class CSDI_series_decomp(nn.Module):
     def __init__(self, lookback_len, pred_len, kernel_size=25):
         super(CSDI_series_decomp, self).__init__()
@@ -132,7 +155,25 @@ class CSDI_base(nn.Module):
         self.pattern_text_evidence = bool(config["model"].get("pattern_text_evidence", True))
         self.pattern_hidden_dim = int(config["model"].get("pattern_hidden_dim", 64))
         self.pattern_stats_dim = 8
-        self.pattern_num_experts = 5
+        self.pattern_expert_set = str(config["model"].get("pattern_expert_set", "legacy5")).lower()
+        self.pattern_num_experts = 4 if self.pattern_expert_set == "fpp4" else 5
+        self.pattern_router_mode = str(config["model"].get("pattern_router_mode", "legacy")).lower()
+        self.baseline_form = str(config["model"].get("baseline_form", "router")).lower()
+        self.text_injection = str(config["model"].get("text_injection", "legacy")).lower()
+        self.timestep_outer_mix = str(config["model"].get("timestep_outer_mix", "legacy")).lower()
+        self.n_text_sources = int(config["model"].get("n_text_sources", 2))
+        self.cot_as_source = bool(config["model"].get("cot_as_source", False))
+        self.text_validity_gate = bool(config["model"].get("text_validity_gate", False))
+        self.text_gate_mode = str(config["model"].get("text_gate_mode", "learned")).lower()
+        self.text_validity_loss = bool(config["model"].get("text_validity_loss", self.text_validity_gate))
+        self.cfg_output_combine = bool(config["model"].get("cfg_output_combine", False))
+        self.shuffle_text_in_batch = bool(config["model"].get("shuffle_text_in_batch", False))
+        self.season_period = int(config["model"].get("season_period", 12))
+        self.benefit_eps = float(config["model"].get("benefit_eps", 1e-8))
+        self.mask_noisy_target = bool(config["diffusion"].get("mask_noisy_target", False))
+        self.valid_loss_main_only = bool(train_cfg.get("valid_loss_main_only", False))
+        if self.baseline_form == "none":
+            self.pattern_residual_diffusion = False
         self.pattern_consistency_weight = float(train_cfg.get("pattern_consistency_weight", 0.03))
         self.pattern_expert_weight = float(train_cfg.get("pattern_expert_weight", 0.05))
         self.pattern_baseline_detach = bool(train_cfg.get("pattern_baseline_detach", False))
@@ -263,41 +304,69 @@ class CSDI_base(nn.Module):
                                                    nn.ReLU(),)
 
         if self.with_texts:
-            self.text_encoder, self.tokenizer = get_llm(self.llm, config["model"]["llm_layers"])
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-            if self.llm != 'bert':
-                if self.tokenizer.eos_token:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                else:
-                    pad_token = '[PAD]'
-                    self.tokenizer.add_special_tokens({'pad_token': pad_token})
-                    self.tokenizer.pad_token = pad_token
-            text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
-            self.text_hidden_dim = int(text_hidden_dim)
+            if str(self.llm).lower() == "hash":
+                self.text_encoder = None
+                self.tokenizer = None
+                self.text_hidden_dim = int(self.context_dim)
+            else:
+                self.text_encoder, self.tokenizer = get_llm(self.llm, config["model"]["llm_layers"])
+                for param in self.text_encoder.parameters():
+                    param.requires_grad = False
+                if self.llm != 'bert':
+                    if self.tokenizer.eos_token:
+                        self.tokenizer.pad_token = self.tokenizer.eos_token
+                    else:
+                        pad_token = '[PAD]'
+                        self.tokenizer.add_special_tokens({'pad_token': pad_token})
+                        self.tokenizer.pad_token = pad_token
+                text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
+                self.text_hidden_dim = int(text_hidden_dim)
 
-        pattern_input_dim = self.pattern_stats_dim + self.pattern_num_experts
-        self.pattern_router = nn.Sequential(
-            nn.Linear(pattern_input_dim, self.pattern_hidden_dim),
-            nn.LayerNorm(self.pattern_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
-        )
-        self.pattern_evidence_head = nn.Sequential(
-            nn.Linear(7, self.pattern_hidden_dim),
-            nn.LayerNorm(self.pattern_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
-        )
-        if self.with_texts:
-            self.pattern_text_head = nn.Sequential(
-                nn.Linear(self.text_hidden_dim, self.pattern_hidden_dim),
+        self.pattern_router = None
+        self.pattern_evidence_head = None
+        self.pattern_text_head = None
+        self.pattern_router_linear = None
+        self.dlinear_baseline = None
+        self.text_gate = None
+        if self.pattern_router_mode == "legacy":
+            pattern_input_dim = self.pattern_stats_dim + self.pattern_num_experts
+            self.pattern_router = nn.Sequential(
+                nn.Linear(pattern_input_dim, self.pattern_hidden_dim),
                 nn.LayerNorm(self.pattern_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
             )
-        else:
-            self.pattern_text_head = None
+            self.pattern_evidence_head = nn.Sequential(
+                nn.Linear(7, self.pattern_hidden_dim),
+                nn.LayerNorm(self.pattern_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
+            )
+            if self.with_texts:
+                self.pattern_text_head = nn.Sequential(
+                    nn.Linear(self.text_hidden_dim, self.pattern_hidden_dim),
+                    nn.LayerNorm(self.pattern_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
+                )
+        elif (
+            self.pattern_router_mode in ("linear_history", "linear_history_text")
+            and self.baseline_form not in ("naive", "dlinear", "none")
+        ):
+            self.pattern_router_linear = nn.Linear(self.lookback_len, self.pattern_num_experts)
+            if self.pattern_router_mode == "linear_history_text" and self.with_texts:
+                self.pattern_text_head = nn.Sequential(
+                    nn.Linear(self.text_hidden_dim, self.pattern_hidden_dim),
+                    nn.LayerNorm(self.pattern_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.pattern_hidden_dim, self.pattern_num_experts),
+                )
+        if self.baseline_form == "dlinear":
+            self.dlinear_baseline = DLinearBaseline(self.lookback_len, self.pred_len)
+        if self.text_validity_gate and self.text_gate_mode == "learned":
+            self.text_gate = TextValidityGate(self.n_text_sources)
+        self.register_buffer("gate_label_sum", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("gate_label_count", torch.zeros((), dtype=torch.float32))
         if self.use_coarse_forecast_head:
             self.coarse_forecast_head = CoarseForecastHead(
                 lookback_len=self.lookback_len,
@@ -327,7 +396,12 @@ class CSDI_base(nn.Module):
         config_diff["pred_len"] = self.pred_len
         config_diff["with_timestep"] = True if self.timestep_emb_cat else False
         config_diff["context_dim"] = self.context_dim
-        config_diff["with_texts"] = self.with_texts
+        denoiser_with_text = bool(self.with_texts) and self.text_injection != "off"
+        if self.text_injection == "legacy":
+            denoiser_with_text = bool(self.with_texts)
+        config_diff["with_texts"] = denoiser_with_text
+        config_diff["text_mode"] = "legacy" if self.text_injection in ("legacy", "off") else self.text_injection
+        config_diff["n_text_sources"] = self.n_text_sources
         config_diff["time_weight"] = config["diffusion"]["time_weight"]
         config_diff["save_attn"] = config["model"]["save_attn"]
 
@@ -975,7 +1049,114 @@ class CSDI_base(nn.Module):
         self._add_diag_scalar("diag_router_agreement_sum", "diag_router_agreement_count", router_agreement, count=None)
         return w_auto, text_quality, router_agreement, pi_num, pi_text, text_gain
 
+    def _build_fpp4_expert_futures(self, hist, hist_mask, future_len):
+        """Mean, naive, seasonal naive, and drift on the normalized history."""
+        B, K, hist_len = hist.shape
+        if future_len <= 0:
+            return torch.zeros((B, 4, K, 0), device=hist.device, dtype=hist.dtype)
+        mean = self._masked_mean(hist, hist_mask, dim=2, keepdim=True)
+        filled_hist = torch.where(hist_mask > 0, hist, mean.expand_as(hist))
+        first = filled_hist[:, :, 0:1]
+        last = filled_hist[:, :, -1:]
+        steps = torch.arange(1, future_len + 1, device=hist.device, dtype=hist.dtype).view(1, 1, -1)
+        mean_future = mean.expand(-1, -1, future_len)
+        naive_future = last.expand(-1, -1, future_len)
+        period = int(self.season_period)
+        if hist_len > period > 0:
+            season_index = hist_len - period + (torch.arange(future_len, device=hist.device) % period)
+            seasonal_future = filled_hist[:, :, season_index]
+        else:
+            seasonal_future = naive_future
+        drift_future = last + steps * (last - first) / max(hist_len - 1, 1)
+        return torch.stack([mean_future, naive_future, seasonal_future, drift_future], dim=1)
+
+    def _linear_history_router(self, hist, hist_mask, text_pooled=None, text_mask=None):
+        target_idx = int(min(max(self.target_feature_index, 0), hist.shape[1] - 1))
+        series = hist[:, target_idx, :]
+        mask = hist_mask[:, target_idx, :]
+        series = torch.where(mask > 0, series, torch.zeros_like(series))
+        if series.shape[-1] < self.lookback_len:
+            series = F.pad(series, (0, self.lookback_len - series.shape[-1]))
+        elif series.shape[-1] > self.lookback_len:
+            series = series[:, : self.lookback_len]
+        logits = self.pattern_router_linear(series)
+        if (
+            self.pattern_router_mode == "linear_history_text"
+            and self.pattern_text_head is not None
+            and text_pooled is not None
+        ):
+            text_logits = self.pattern_text_head(text_pooled.float())
+            if text_mask is not None:
+                availability = text_mask.float().reshape(-1, 1).to(device=text_logits.device, dtype=text_logits.dtype)
+                text_logits = text_logits * availability
+            logits = logits + text_logits
+        temperature = max(float(self.pattern_router_temperature), 1e-3)
+        return F.softmax(logits / temperature, dim=-1)
+
+    def _empty_pattern_result(self, observed_data):
+        batch = observed_data.shape[0]
+        device = observed_data.device
+        dtype = observed_data.dtype
+        zeros_b = torch.zeros((batch,), device=device, dtype=dtype)
+        return {
+            "stats": torch.zeros((batch, self.pattern_stats_dim), device=device, dtype=dtype),
+            "text_pattern": torch.zeros((batch, self.pattern_num_experts), device=device, dtype=dtype),
+            "pi_numeric": torch.zeros((batch, self.pattern_num_experts), device=device, dtype=dtype),
+            "pi_text": torch.zeros((batch, self.pattern_num_experts), device=device, dtype=dtype),
+            "pi": torch.zeros((batch, self.pattern_num_experts), device=device, dtype=dtype),
+            "pseudo": torch.full((batch, self.pattern_num_experts), 1.0 / max(self.pattern_num_experts, 1), device=device, dtype=dtype),
+            "baseline": torch.zeros_like(observed_data),
+            "expert_futures": torch.zeros((batch, self.pattern_num_experts, observed_data.shape[1], 0), device=device, dtype=dtype),
+            "baseline_reliability": torch.ones_like(zeros_b),
+            "text_quality": zeros_b,
+            "router_agreement": torch.ones_like(zeros_b),
+            "text_gain": torch.ones((), device=device, dtype=dtype),
+            "guidance_scale": torch.ones_like(zeros_b),
+        }
+
+    def _compute_simple_baseline_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None):
+        result = self._empty_pattern_result(observed_data)
+        B, K, L = observed_data.shape
+        future_len = min(max(int(self.pred_len), 0), max(L - self.lookback_len, 0))
+        hist_len = min(max(int(self.lookback_len), 1), L)
+        hist = observed_data[:, :, :hist_len]
+        hist_mask = cond_mask[:, :, :hist_len].float()
+        baseline = torch.zeros_like(observed_data)
+        if future_len <= 0:
+            result["baseline"] = baseline
+            return result
+        if self.baseline_form == "dlinear" and self.dlinear_baseline is not None:
+            future = self.dlinear_baseline(hist)[:, :, :future_len]
+            baseline[:, :, self.lookback_len:self.lookback_len + future_len] = future
+            result["baseline"] = baseline.detach() if self.pattern_baseline_detach else baseline
+            # One deterministic expert so the same Huber term trains DLinear.
+            result["pi"] = torch.ones((B, 1), device=observed_data.device, dtype=observed_data.dtype)
+            result["expert_futures"] = future.unsqueeze(1)
+            return result
+        if self.pattern_expert_set == "fpp4" or self.pattern_router_mode != "legacy":
+            experts = self._build_fpp4_expert_futures(hist, hist_mask, future_len)
+        else:
+            experts = self._build_expert_futures_from_history(hist, hist_mask, future_len)
+        if self.baseline_form == "naive":
+            naive_index = 1 if experts.shape[1] == 4 else min(2, experts.shape[1] - 1)
+            pi = torch.zeros((B, experts.shape[1]), device=observed_data.device, dtype=observed_data.dtype)
+            pi[:, naive_index] = 1.0
+        else:
+            pi = self._linear_history_router(hist, hist_mask, text_pooled=text_pooled, text_mask=text_mask)
+        mixed = (pi.view(B, -1, 1, 1) * experts).sum(dim=1)
+        baseline[:, :, self.lookback_len:self.lookback_len + future_len] = mixed
+        if self.pattern_baseline_detach:
+            baseline = baseline.detach()
+        result["baseline"] = baseline
+        result["pi"] = pi
+        result["pi_numeric"] = pi
+        result["pi_text"] = pi
+        result["expert_futures"] = experts
+        return result
+
     def _build_expert_futures_from_history(self, hist, hist_mask, future_len):
+        if self.pattern_expert_set == "fpp4":
+            return self._build_fpp4_expert_futures(hist, hist_mask, future_len)
         B, K, hist_len = hist.shape
         if future_len <= 0:
             return torch.zeros((B, self.pattern_num_experts, K, 0), device=hist.device, dtype=hist.dtype)
@@ -1030,6 +1211,13 @@ class CSDI_base(nn.Module):
         return baseline, expert_futures
 
     def _compute_pattern_outputs(self, observed_data, cond_mask, text_pooled=None, text_mask=None, text_evidence_vec=None, guidance_scale=1.0, controller_state=None):
+        if self.pattern_router_mode != "legacy" or self.baseline_form in ("naive", "dlinear"):
+            return self._compute_simple_baseline_outputs(
+                observed_data,
+                cond_mask,
+                text_pooled=text_pooled,
+                text_mask=text_mask,
+            )
         B, K, L = observed_data.shape
         stats = self._compute_pattern_stats(observed_data, cond_mask)
         text_pattern = self._compute_pattern_text_evidence(text_pooled, text_mask, text_evidence_vec, B, observed_data.device)
@@ -1183,7 +1371,30 @@ class CSDI_base(nn.Module):
         self._add_diag_scalar("diag_alpha_b_sum", "diag_alpha_b_count", alpha_tensor if alpha_tensor.numel() > 0 else alpha, count=None, sq_sum_name="diag_alpha_b_sq_sum")
         return scaled
 
+    def _calc_simple_expert_loss(self, pattern, observed_data, target_mask):
+        aux = torch.zeros((), device=observed_data.device)
+        if pattern is None or self.pattern_expert_weight <= 0:
+            return aux
+        experts = pattern.get("expert_futures")
+        pi = pattern.get("pi")
+        if experts is None or pi is None or experts.numel() == 0 or pi.numel() == 0 or pi.shape[-1] == 0:
+            return aux
+        future_len = experts.shape[-1]
+        start = int(self.lookback_len)
+        end = start + future_len
+        future_mask = target_mask[:, :, start:end].unsqueeze(1)
+        future_target = observed_data[:, :, start:end].unsqueeze(1)
+        residual = (experts - future_target) * future_mask
+        abs_res = residual.abs()
+        huber = torch.where(abs_res <= 1.0, 0.5 * residual ** 2, abs_res - 0.5)
+        denom = future_mask.sum(dim=(2, 3)).clamp(min=1.0)
+        expert_loss = huber.sum(dim=(2, 3)) / denom
+        weighted = (pi * expert_loss).sum(dim=1).mean()
+        return self.pattern_expert_weight * weighted
+
     def _calc_pattern_aux_loss(self, pattern, observed_data, target_mask):
+        if self.pattern_router_mode != "legacy" or self.baseline_form in ("naive", "dlinear"):
+            return self._calc_simple_expert_loss(pattern, observed_data, target_mask)
         aux = torch.zeros((), device=observed_data.device)
         if pattern is None:
             return aux
@@ -1221,19 +1432,56 @@ class CSDI_base(nn.Module):
             return legacy_aux
         return aux
 
+    def _per_sample_target_mse(self, prediction, target, target_mask):
+        residual = (target - prediction) * target_mask
+        denom = target_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        return (residual ** 2).sum(dim=(1, 2)) / denom
+
+    def _current_gate_constant(self):
+        if float(self.gate_label_count.detach()) <= 0:
+            return self.gate_label_sum.new_tensor(0.5)
+        return (self.gate_label_sum / self.gate_label_count.clamp(min=1.0)).clamp(0.0, 1.0)
+
+    def _update_gate_label_mean(self, label, valid):
+        if not self.training or label is None or valid is None or not bool(valid.any()):
+            return
+        with torch.no_grad():
+            self.gate_label_sum.add_(label.detach()[valid].float().sum())
+            self.gate_label_count.add_(valid.float().sum())
+
+    def _text_gate_value(self, similarity, source_mask):
+        batch = int(similarity.shape[0])
+        if source_mask is None:
+            source_mask = similarity.new_zeros((batch, self.n_text_sources))
+        else:
+            source_mask = source_mask.to(device=similarity.device, dtype=similarity.dtype)
+            if source_mask.shape[-1] < self.n_text_sources:
+                source_mask = F.pad(source_mask, (0, self.n_text_sources - source_mask.shape[-1]))
+            elif source_mask.shape[-1] > self.n_text_sources:
+                source_mask = source_mask[:, : self.n_text_sources]
+        any_mask = (source_mask.sum(dim=-1) > 0).to(dtype=similarity.dtype)
+        if self.text_gate_mode == "one":
+            return any_mask
+        if self.text_gate_mode == "constant":
+            constant = self._current_gate_constant().to(device=similarity.device, dtype=similarity.dtype)
+            return any_mask * constant
+        if self.text_gate is None:
+            return any_mask
+        return self.text_gate(similarity.detach(), source_mask, any_mask)
+
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, text_pack=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, pattern_text_pooled=pattern_text_pooled, pattern_text_mask=pattern_text_mask, pattern_text_evidence_vec=pattern_text_evidence_vec, controller_state=controller_state
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, pattern_text_pooled=pattern_text_pooled, pattern_text_mask=pattern_text_mask, pattern_text_evidence_vec=pattern_text_evidence_vec, controller_state=controller_state, text_pack=text_pack
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, set_t=-1, text_pack=None
     ):
 
         B, K, L = observed_data.shape
@@ -1269,7 +1517,7 @@ class CSDI_base(nn.Module):
                 guidance_scale=1.0,
                 controller_state=controller_state,
             )
-            if self.final_method:
+            if self.final_method and self.pattern_router_mode == "legacy" and self.baseline_form not in ("naive", "dlinear"):
                 pattern_baseline = self._compute_weak_pattern_baseline(
                     pattern,
                     observed_data,
@@ -1315,7 +1563,13 @@ class CSDI_base(nn.Module):
         else:
             cfg_mask = None
 
-        predicted = self._run_diffusion_model(
+        want_similarity = (
+            self.text_injection == "gated"
+            and text_pack is not None
+            and is_train == 1
+            and self.text_gate_mode in ("learned", "constant")
+        )
+        predicted, text_similarity = self._run_diffusion_model(
             total_input,
             side_info,
             t,
@@ -1323,9 +1577,45 @@ class CSDI_base(nn.Module):
             timestep_emb=timestep_emb,
             size_emb=size_emb,
             context=context,
+            text_pack=text_pack,
+            return_text_stats=want_similarity,
         )
 
-        if self.timestep_branch and timesteps is not None:
+        validity_loss = torch.zeros((), device=observed_data.device)
+        if want_similarity and text_similarity is not None and cfg_mask is not None:
+            with torch.no_grad():
+                reference_mask = 1.0 - cfg_mask.reshape(-1)
+                reference, _ = self._run_diffusion_model(
+                    total_input,
+                    side_info,
+                    t,
+                    reference_mask,
+                    timestep_emb=timestep_emb,
+                    size_emb=size_emb,
+                    context=context,
+                    text_pack=text_pack,
+                    return_text_stats=False,
+                )
+            injected = cfg_mask.reshape(-1).float()
+            loss_main_b = self._per_sample_target_mse(predicted.detach(), diffusion_target, target_mask)
+            loss_ref_b = self._per_sample_target_mse(reference, diffusion_target, target_mask)
+            loss_cond = torch.where(injected > 0.5, loss_main_b, loss_ref_b)
+            loss_null = torch.where(injected > 0.5, loss_ref_b, loss_main_b)
+            label = benefit_label(loss_null, loss_cond, eps=self.benefit_eps)
+            source_mask = text_pack.get("source_mask")
+            if source_mask is None:
+                any_valid = torch.ones((observed_data.shape[0],), device=observed_data.device, dtype=torch.bool)
+            else:
+                any_valid = source_mask.reshape(observed_data.shape[0], -1).sum(dim=-1) > 0
+            self._update_gate_label_mean(label, any_valid)
+            if self.text_gate_mode == "learned" and self.text_validity_loss and self.text_gate is not None and bool(any_valid.any()):
+                gate = self._text_gate_value(text_similarity.detach(), source_mask)
+                validity_loss = F.binary_cross_entropy(
+                    gate[any_valid].clamp(1e-6, 1.0 - 1e-6),
+                    label[any_valid].clamp(0.0, 1.0),
+                )
+
+        if self.timestep_outer_mix != "none" and self.timestep_branch and timesteps is not None:
             predicted_from_timestep = self.timestep_pred(timesteps)
             predicted = 0.9 * predicted + 0.1 * predicted_from_timestep
 
@@ -1381,26 +1671,58 @@ class CSDI_base(nn.Module):
             self.diag_coarse_aux_sum.add_((coarse_aux.detach() * aux_diag_scale).float())
             self.diag_uncertainty_aux_sum.add_((uncertainty_aux.detach() * aux_diag_scale).float())
             self.diag_loss_count.add_(1.0)
-        return main_loss + auxiliary_loss
+        if is_train != 1 and self.valid_loss_main_only:
+            return main_loss
+        return main_loss + auxiliary_loss + validity_loss
 
     def _unwrap_diffmodel_output(self, output):
         if isinstance(output, tuple):
             return output[0]
         return output
 
-    def _run_diffusion_model(self, total_input, side_info, t, cfg_mask, timestep_emb=None, size_emb=None, context=None):
+    def _invoke_denoiser(self, model, total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context, text_pack, return_text_stats):
+        text_hidden = None if text_pack is None else text_pack.get("hidden")
+        text_token_mask = None if text_pack is None else text_pack.get("token_mask")
+        text_source_ids = None if text_pack is None else text_pack.get("source_ids")
+        output = model(
+            total_input,
+            side_info,
+            t,
+            cfg_mask,
+            timestep_emb,
+            size_emb,
+            context,
+            text_hidden=text_hidden,
+            text_token_mask=text_token_mask,
+            text_source_ids=text_source_ids,
+            return_text_stats=return_text_stats,
+        )
+        if return_text_stats:
+            if self.save_attn:
+                predicted, _, similarity = output
+            else:
+                predicted, similarity = output
+            return predicted, similarity
+        return self._unwrap_diffmodel_output(output), None
+
+    def _run_diffusion_model(self, total_input, side_info, t, cfg_mask, timestep_emb=None, size_emb=None, context=None, text_pack=None, return_text_stats=False):
         if self.decomp:
-            predicted_seasonal = self._unwrap_diffmodel_output(
-                self.diffmodel_sesonal(total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb, context)
+            predicted_seasonal, similarity_seasonal = self._invoke_denoiser(
+                self.diffmodel_sesonal, total_input[0], side_info, t, cfg_mask, timestep_emb, size_emb, context, text_pack, return_text_stats
             )
-            predicted_trend = self._unwrap_diffmodel_output(
-                self.diffmodel_trend(total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb, context)
+            predicted_trend, similarity_trend = self._invoke_denoiser(
+                self.diffmodel_trend, total_input[1], side_info, t, cfg_mask, timestep_emb, size_emb, context, text_pack, return_text_stats
             )
-            return predicted_seasonal + predicted_trend
-        if self.save_attn:
+            similarity = None
+            if return_text_stats and similarity_seasonal is not None and similarity_trend is not None:
+                similarity = 0.5 * (similarity_seasonal + similarity_trend)
+            return predicted_seasonal + predicted_trend, similarity
+        if self.save_attn and not return_text_stats:
             predicted, _ = self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
-            return predicted
-        return self.diffmodel(total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context)
+            return predicted, None
+        return self._invoke_denoiser(
+            self.diffmodel, total_input, side_info, t, cfg_mask, timestep_emb, size_emb, context, text_pack, return_text_stats
+        )
 
     def _get_multi_res_confidence(self, batch_size, t=None, trend_prior=None):
         components = []
@@ -1672,7 +1994,9 @@ class CSDI_base(nn.Module):
             total_input = noisy_data.unsqueeze(1)  
         else:
             cond_obs = cond_mask * observed_data
-            noisy_target = noisy_data.unsqueeze(1) 
+            noisy_target = noisy_data.unsqueeze(1)
+            if self.mask_noisy_target:
+                noisy_target = noisy_target * (1.0 - cond_mask).unsqueeze(1)
             if self.decomp:
                 res, moving_mean = self.decomposition(cond_obs) 
                 res, moving_mean = res.unsqueeze(1), moving_mean.unsqueeze(1) 
@@ -1685,14 +2009,58 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None):
+    def _repeat_leading(self, tensor, copies):
+        if tensor is None:
+            return None
+        return tensor.repeat(copies, *([1] * (tensor.dim() - 1)))
+
+    def _combine_cfg_prediction(self, total_input, side_info, step_index, timestep_emb, size_emb, text_pack, guide_weight):
+        batch = side_info.shape[0]
+
+        def double(value):
+            if isinstance(value, (list, tuple)):
+                return [self._repeat_leading(item, 2) for item in value]
+            return self._repeat_leading(value, 2)
+
+        inject = torch.cat(
+            [
+                torch.ones((batch,), device=side_info.device),
+                torch.zeros((batch,), device=side_info.device),
+            ],
+            dim=0,
+        )
+        doubled_pack = {
+            "hidden": double(text_pack["hidden"]),
+            "token_mask": double(text_pack["token_mask"]),
+            "source_ids": text_pack["source_ids"],
+            "source_mask": text_pack["source_mask"],
+        }
+        predicted, similarity = self._run_diffusion_model(
+            double(total_input),
+            double(side_info),
+            torch.tensor([step_index], device=side_info.device),
+            inject,
+            timestep_emb=double(timestep_emb),
+            size_emb=double(size_emb),
+            context=None,
+            text_pack=doubled_pack,
+            return_text_stats=True,
+        )
+        pred_cond = predicted[:batch]
+        pred_null = predicted[batch:]
+        sim_cond = similarity[:batch] if similarity is not None else predicted.new_zeros((batch,))
+        gate = self._text_gate_value(sim_cond, text_pack.get("source_mask"))
+        gate = gate.view(batch, 1, 1).to(dtype=predicted.dtype)
+        return pred_null + float(guide_weight) * gate * (pred_cond - pred_null)
+
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, text_pack=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
                 a = self.num_steps // self.sample_steps
                 time_steps = np.asarray(list(range(0, self.num_steps, a)))
             elif self.sample_method == "quad":
-                time_steps = (np.linspace(0, np.sqrt(self.num_steps * 0.8), self.sample_steps) ** 2).astype(np.int)
+                time_steps = (np.linspace(0, np.sqrt(self.num_steps * 0.8), self.sample_steps) ** 2).astype(int)
             else:
                 raise NotImplementedError(f"sampling method {self.sample_method} is not implemented!")
             time_steps = time_steps + 1
@@ -1710,7 +2078,10 @@ class CSDI_base(nn.Module):
         pattern_baseline = None
         diffusion_observed_data = observed_data
         if self.pattern_residual_diffusion and not self.noise_esti:
-            pattern_guidance_scale = self.guide_w_default if guide_w is None else float(guide_w)
+            if self.pattern_router_mode == "legacy" and self.baseline_form not in ("naive", "dlinear"):
+                pattern_guidance_scale = self.guide_w_default if guide_w is None else float(guide_w)
+            else:
+                pattern_guidance_scale = 1.0
             pattern = self._compute_pattern_outputs(
                 observed_data,
                 cond_mask,
@@ -1720,7 +2091,7 @@ class CSDI_base(nn.Module):
                 guidance_scale=pattern_guidance_scale,
                 controller_state=controller_state,
             )
-            if self.final_method:
+            if self.final_method and self.pattern_router_mode == "legacy" and self.baseline_form not in ("naive", "dlinear"):
                 pattern_baseline = self._compute_weak_pattern_baseline(
                     pattern,
                     observed_data,
@@ -1756,18 +2127,31 @@ class CSDI_base(nn.Module):
                         res, moving_mean = res.unsqueeze(1), moving_mean.unsqueeze(1) # (B, 1, K, L), (B, 1, K, L)
                         res_input = torch.cat([res, noisy_target], dim=1)  # (B,2,K,L)
                         moving_mean_input = torch.cat([moving_mean, noisy_target], dim=1)  # (B,2,K,L)
-                        predicted_seasonal = self._unwrap_diffmodel_output(
-                            self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
-                        ) # (2*B, K, L)
-                        predicted_trend = self._unwrap_diffmodel_output(
-                            self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
-                        ) # (2*B, K, L)
-                        predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
+                        use_cfg = self.text_injection == "gated" and self.cfg_output_combine and text_pack is not None
+                        if use_cfg:
+                            guide_weight = self.guide_w_default if guide_w is None else float(guide_w)
+                            predicted = self._combine_cfg_prediction(
+                                [res_input, moving_mean_input], side_info, t, timestep_emb, size_emb, text_pack, guide_weight
+                            )
+                        else:
+                            predicted_seasonal = self._unwrap_diffmodel_output(
+                                self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
+                            ) # (2*B, K, L)
+                            predicted_trend = self._unwrap_diffmodel_output(
+                                self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
+                            ) # (2*B, K, L)
+                            predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
                     else:
                         cond_obs = (cond_mask * diffusion_observed_data).unsqueeze(1) # (B, 1, K, L)
                         noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1) # (B, 1, K, L)
                         diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B, 2, K, L)
-                        if self.save_attn:
+                        use_cfg = self.text_injection == "gated" and self.cfg_output_combine and text_pack is not None
+                        if use_cfg:
+                            guide_weight = self.guide_w_default if guide_w is None else float(guide_w)
+                            predicted = self._combine_cfg_prediction(
+                                diff_input, side_info, t, timestep_emb, size_emb, text_pack, guide_weight
+                            )
+                        elif self.save_attn:
                             predicted, attn = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                         else:
                             predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
@@ -1817,7 +2201,7 @@ class CSDI_base(nn.Module):
             if pattern_baseline is not None:
                 sample = sample + pattern_baseline.detach()
             imputed_samples[:, i] = sample
-            if self.timestep_branch and timesteps is not None:
+            if self.timestep_outer_mix != "none" and self.timestep_branch and timesteps is not None:
                 predicted_from_timestep = self.timestep_pred(timesteps)
                 imputed_samples[:, i] = 0.9 * imputed_samples[:, i] + 0.1 * predicted_from_timestep.detach()
             if not self.noise_esti:
@@ -1898,6 +2282,16 @@ class CSDI_Forecasting(CSDI_base):
             text_cot_mask = text_cot_mask.to(self.device).float().reshape(-1).clamp(0.0, 1.0)
         else:
             text_cot_mask = text_mask.clone()
+        text_raw = batch.get("text_raw", batch.get("texts"))
+        text_ret = batch.get("text_ret", batch.get("retrieved_text"))
+        text_cot = batch.get("text_cot", batch.get("cot_text"))
+        text_raw_mark = batch.get("text_raw_mark")
+        if text_raw_mark is not None and torch.is_tensor(text_raw_mark):
+            text_raw_mark = text_raw_mark.to(self.device).float().reshape(-1).clamp(0.0, 1.0)
+        elif text_raw_mark is not None:
+            text_raw_mark = torch.tensor(text_raw_mark, device=self.device, dtype=torch.float32).reshape(-1).clamp(0.0, 1.0)
+        else:
+            text_raw_mark = self._mark_from_text_batch(text_raw, batch_size, self.device)
         text_quality_raw = batch.get("text_quality_raw")
         if text_quality_raw is not None:
             text_quality_raw = text_quality_raw.to(self.device).float().reshape(-1)
@@ -1998,6 +2392,10 @@ class CSDI_Forecasting(CSDI_base):
             text_event_quality_feats,
             text_event_mask,
             target_feature_index,
+            text_raw,
+            text_ret,
+            text_cot,
+            text_raw_mark,
         )        
 
     def _unpack_forecasting_batch(self, data):
@@ -2017,8 +2415,40 @@ class CSDI_Forecasting(CSDI_base):
             "text_event_quality_feats": None,
             "text_event_mask": None,
             "target_feature_index": None,
+            "text_raw": None,
+            "text_ret": None,
+            "text_cot": None,
+            "text_raw_mark": None,
         }
-        if len(data) >= 21:
+        if len(data) >= 25:
+            (
+                observed_data,
+                observed_mask,
+                observed_tp,
+                gt_mask,
+                _,
+                _,
+                defaults["feature_id"],
+                defaults["timesteps"],
+                defaults["texts"],
+                defaults["text_mask"],
+                defaults["text_ret_mask"],
+                defaults["text_cot_mask"],
+                defaults["trend_prior_num"],
+                defaults["trend_prior_text"],
+                defaults["text_evidence_vec"],
+                defaults["text_event_texts"],
+                defaults["text_event_source_ids"],
+                defaults["text_event_time_deltas"],
+                defaults["text_event_quality_feats"],
+                defaults["text_event_mask"],
+                defaults["target_feature_index"],
+                defaults["text_raw"],
+                defaults["text_ret"],
+                defaults["text_cot"],
+                defaults["text_raw_mark"],
+            ) = data
+        elif len(data) >= 21:
             (
                 observed_data,
                 observed_mask,
@@ -2214,10 +2644,137 @@ class CSDI_Forecasting(CSDI_base):
             return [[str(item) for item in row] for row in transposed]
         return None
 
+    def _mark_from_text_batch(self, texts, batch_size, device):
+        marks = []
+        items = texts if isinstance(texts, (list, tuple)) else [texts] * batch_size
+        for item in list(items)[:batch_size]:
+            normalized = "" if item is None else str(item).strip()
+            marks.append(0.0 if normalized == "" or normalized.upper() == "NA" else 1.0)
+        if len(marks) < batch_size:
+            marks.extend([0.0] * (batch_size - len(marks)))
+        return torch.tensor(marks, device=device, dtype=torch.float32)
+
+    def _maybe_shuffle_text_alignment(self, bundle):
+        if not self.shuffle_text_in_batch:
+            return bundle
+        batch = None
+        for value in bundle.values():
+            if torch.is_tensor(value) and value.dim() >= 1:
+                batch = value.shape[0]
+                break
+            if isinstance(value, (list, tuple)):
+                batch = len(value)
+                break
+        if batch is None or batch <= 1:
+            return bundle
+        perm = torch.randperm(batch)
+        shuffled = {}
+        for key, value in bundle.items():
+            if torch.is_tensor(value) and value.shape[0] == batch:
+                shuffled[key] = value[perm]
+            elif isinstance(value, (list, tuple)) and len(value) == batch:
+                order = perm.tolist()
+                shuffled[key] = [value[index] for index in order]
+            else:
+                shuffled[key] = value
+        return shuffled
+
+    def _stable_token_id(self, token):
+        digest = 0
+        for char in str(token):
+            digest = (digest * 131 + ord(char)) % 30000
+        return int(digest)
+
+    def _hash_token_vector(self, token_id, width):
+        positions = torch.arange(width, dtype=torch.float32)
+        angles = (float(token_id) + 1.0) * torch.exp(-positions / max(width / 8.0, 1.0))
+        vector = torch.sin(angles)
+        vector[1::2] = torch.cos(angles[1::2])
+        return vector
+
+    def _hash_encode_texts(self, texts, max_length, truncation_side):
+        max_length = int(max_length)
+        hidden = torch.zeros((len(texts), max_length, self.text_hidden_dim), device=self.device)
+        attention = torch.zeros((len(texts), max_length), device=self.device)
+        input_ids = torch.zeros((len(texts), max_length), device=self.device, dtype=torch.long)
+        for row, text in enumerate(texts):
+            tokens = str(text).split()
+            budget = max(max_length - 2, 1)
+            if len(tokens) > budget:
+                tokens = tokens[-budget:] if truncation_side == "left" else tokens[:budget]
+            ids = [101] + [1 + (self._stable_token_id(token) % 30000) for token in tokens] + [102]
+            ids = ids[:max_length]
+            for col, token_id in enumerate(ids):
+                hidden[row, col] = self._hash_token_vector(token_id, self.text_hidden_dim).to(self.device)
+                attention[row, col] = 1.0
+                input_ids[row, col] = int(token_id)
+        pooled = (hidden * attention.unsqueeze(-1)).sum(dim=1) / attention.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return hidden, pooled, {"input_ids": input_ids, "attention_mask": attention}
+
+    def _encode_text_tokens(self, texts, max_length=None, truncation_side="right"):
+        max_length = int(max_length or self.text_max_length)
+        if self.tokenizer is None:
+            hidden, pooled, token_input = self._hash_encode_texts(texts, max_length, truncation_side)
+            return hidden, pooled, token_input["attention_mask"]
+        previous_side = getattr(self.tokenizer, "truncation_side", "right")
+        self.tokenizer.truncation_side = truncation_side
+        try:
+            hidden, pooled, token_input = self._encode_text_source_with_options(
+                texts, max_length=max_length, return_sequence=True
+            )
+        finally:
+            self.tokenizer.truncation_side = previous_side
+        return hidden, pooled, token_input["attention_mask"]
+
+    def _build_text_pack(self, text_raw, text_ret, text_cot, raw_mark, ret_mark, cot_mark, router_text_mask):
+        batch = int(raw_mark.shape[0])
+        sources = [
+            ("raw", text_raw if text_raw is not None else ["NA"] * batch, "left", raw_mark),
+            ("ret", text_ret if text_ret is not None else ["NA"] * batch, "right", ret_mark),
+        ]
+        if self.cot_as_source:
+            sources.append(("cot", text_cot if text_cot is not None else ["NA"] * batch, "right", cot_mark))
+        hiddens = []
+        token_masks = []
+        pooled = []
+        source_ids = []
+        source_marks = []
+        for source_index, (_, texts, side, mark) in enumerate(sources):
+            if not isinstance(texts, (list, tuple)):
+                texts = [texts] * batch
+            hidden, pooled_source, attention = self._encode_text_tokens(list(texts), truncation_side=side)
+            mark = mark.reshape(batch).to(device=hidden.device, dtype=hidden.dtype)
+            token_mask = attention.to(device=hidden.device, dtype=hidden.dtype) * mark.unsqueeze(1)
+            hiddens.append(hidden)
+            token_masks.append(token_mask)
+            pooled.append(pooled_source)
+            source_ids.append(torch.full((hidden.shape[1],), source_index, device=hidden.device, dtype=torch.long))
+            source_marks.append(mark)
+        source_mask = torch.stack(source_marks, dim=1)
+        if source_mask.shape[1] < self.n_text_sources:
+            source_mask = F.pad(source_mask, (0, self.n_text_sources - source_mask.shape[1]))
+        pooled_tensor = torch.stack(pooled, dim=1)
+        weights = source_mask[:, : pooled_tensor.shape[1]].unsqueeze(-1)
+        router_pooled = (pooled_tensor * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+        any_text = (source_mask.sum(dim=1) > 0).to(dtype=router_pooled.dtype)
+        if router_text_mask is not None:
+            any_text = any_text * router_text_mask.reshape(-1).to(dtype=any_text.dtype)
+        text_pack = {
+            "hidden": torch.cat(hiddens, dim=1),
+            "token_mask": torch.cat(token_masks, dim=1),
+            "source_ids": torch.cat(source_ids, dim=0),
+            "source_mask": source_mask[:, : self.n_text_sources],
+        }
+        return text_pack, router_pooled, any_text
+
     def _encode_text_source(self, text):
         return self._encode_text_source_with_options(text, max_length=self.text_max_length, return_sequence=False)
 
     def _encode_text_source_with_options(self, text, max_length=None, return_sequence=True):
+        if self.tokenizer is None:
+            texts = [text] if isinstance(text, str) else [str(item) if item is not None else "NA" for item in text]
+            hidden, pooled, token_input = self._hash_encode_texts(texts, int(max_length or self.text_max_length), "right")
+            return (hidden if return_sequence else None), pooled, token_input
         if isinstance(text, str):
             texts = [text]
         elif isinstance(text, (list, tuple)):
@@ -2523,6 +3080,10 @@ class CSDI_Forecasting(CSDI_base):
         text_event_quality_feats = unpacked["text_event_quality_feats"]
         text_event_mask = unpacked["text_event_mask"]
         target_feature_index = unpacked["target_feature_index"]
+        text_raw = unpacked["text_raw"]
+        text_ret = unpacked["text_ret"]
+        text_cot = unpacked["text_cot"]
+        text_raw_mark = unpacked["text_raw_mark"]
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask,target_feature_index = \
                     self.sample_features(observed_data, observed_mask,feature_id,gt_mask,target_feature_index=target_feature_index)
@@ -2533,7 +3094,31 @@ class CSDI_Forecasting(CSDI_base):
         if target_feature_index is not None:
             self.target_feature_index = int(target_feature_index[0].item())
 
-        if self.with_texts:
+        text_pack = None
+        if self.with_texts and (self.text_injection == "gated" or self.pattern_router_mode == "linear_history_text"):
+            if text_raw_mark is None:
+                text_raw_mark = self._mark_from_text_batch(text_raw if text_raw is not None else texts, observed_data.shape[0], self.device)
+            shuffled = self._maybe_shuffle_text_alignment({
+                "text_raw": text_raw if text_raw is not None else texts,
+                "text_ret": text_ret,
+                "text_cot": text_cot,
+                "text_raw_mark": text_raw_mark,
+                "text_ret_mask": text_ret_mask,
+                "text_cot_mask": text_cot_mask,
+            })
+            text_pack, text_pooled, any_text = self._build_text_pack(
+                shuffled["text_raw"],
+                shuffled["text_ret"],
+                shuffled["text_cot"],
+                shuffled["text_raw_mark"],
+                shuffled["text_ret_mask"] if shuffled["text_ret_mask"] is not None else text_raw_mark,
+                shuffled["text_cot_mask"] if shuffled["text_cot_mask"] is not None else text_raw_mark,
+                text_mask,
+            )
+            text_mask = any_text
+            if self.text_injection != "gated":
+                text_pack = None
+        elif self.with_texts:
             _, text_pooled, _ = self._encode_text_source(texts)
         else:
             text_pooled = None
@@ -2595,6 +3180,7 @@ class CSDI_Forecasting(CSDI_base):
             pattern_text_mask=text_mask,
             pattern_text_evidence_vec=text_evidence_vec,
             controller_state=controller_state,
+            text_pack=text_pack,
         )
 
     def evaluate(self, batch, n_samples, guide_w):
@@ -2615,6 +3201,10 @@ class CSDI_Forecasting(CSDI_base):
         text_event_quality_feats = unpacked["text_event_quality_feats"]
         text_event_mask = unpacked["text_event_mask"]
         target_feature_index = unpacked["target_feature_index"]
+        text_raw = unpacked["text_raw"]
+        text_ret = unpacked["text_ret"]
+        text_cot = unpacked["text_cot"]
+        text_raw_mark = unpacked["text_raw_mark"]
 
         with torch.no_grad():
             if target_feature_index is not None:
@@ -2622,9 +3212,33 @@ class CSDI_Forecasting(CSDI_base):
             cond_mask = gt_mask
 
             tokens = None
-            if self.with_texts:
+            text_pack = None
+            if self.with_texts and (self.text_injection == "gated" or self.pattern_router_mode == "linear_history_text"):
+                if text_raw_mark is None:
+                    text_raw_mark = self._mark_from_text_batch(text_raw if text_raw is not None else texts, observed_data.shape[0], self.device)
+                shuffled = self._maybe_shuffle_text_alignment({
+                    "text_raw": text_raw if text_raw is not None else texts,
+                    "text_ret": text_ret,
+                    "text_cot": text_cot,
+                    "text_raw_mark": text_raw_mark,
+                    "text_ret_mask": text_ret_mask,
+                    "text_cot_mask": text_cot_mask,
+                })
+                text_pack, text_pooled, any_text = self._build_text_pack(
+                    shuffled["text_raw"],
+                    shuffled["text_ret"],
+                    shuffled["text_cot"],
+                    shuffled["text_raw_mark"],
+                    shuffled["text_ret_mask"] if shuffled["text_ret_mask"] is not None else text_raw_mark,
+                    shuffled["text_cot_mask"] if shuffled["text_cot_mask"] is not None else text_raw_mark,
+                    text_mask,
+                )
+                text_mask = any_text
+                if self.text_injection != "gated":
+                    text_pack = None
+            elif self.with_texts:
                 _, text_pooled, token_input = self._encode_text_source(texts)
-                if self.save_token:
+                if self.save_token and self.tokenizer is not None:
                     tokens = self.tokenizer.batch_decode(token_input['input_ids'])
             else:
                 text_pooled = None
@@ -2660,9 +3274,9 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 size_emb = None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state, text_pack=text_pack)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=None, pattern_text_pooled=text_pooled, pattern_text_mask=text_mask, pattern_text_evidence_vec=text_evidence_vec, controller_state=controller_state, text_pack=text_pack)
 
         if self.save_attn:
             if self.save_token:

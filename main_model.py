@@ -87,6 +87,16 @@ class CSDI_series_decomp(nn.Module):
     
 
 class CSDI_base(nn.Module):
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, "text_encoder_eval", False) and getattr(self, "text_encoder", None) is not None:
+            self.text_encoder.eval()
+        return self
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        self._text_encode_cache = {}
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def __init__(self, target_dim, config, device, window_lens):
         super().__init__()
         self.device = device
@@ -108,6 +118,14 @@ class CSDI_base(nn.Module):
         # Off for legacy runs. xattn configs turn it on. It corrects the diffusion
         # index passed to the denoiser, the x0 DDIM direction scale, and the x0 DDPM endpoint.
         self.sampler_fix = bool(config["diffusion"].get("sampler_fix", False))
+        # Legacy leaves the frozen text encoder in whatever mode model.train() sets.
+        # xattn keeps it in eval so its dropout cannot change a repeated string.
+        self.text_encoder_eval = bool(config["model"].get("text_encoder_eval", False))
+        self.text_encoder = None
+        # Memo of eval-mode encodings. Keyed only by the string and the truncation
+        # settings, so a value does not depend on the split or on other samples.
+        # load_state_dict clears it.
+        self._text_encode_cache = {}
         train_cfg = config.get("train", {})
 
         self.lookback_len = config["model"]["lookback_len"]
@@ -324,6 +342,8 @@ class CSDI_base(nn.Module):
                         self.tokenizer.pad_token = pad_token
                 text_hidden_dim = getattr(getattr(self.text_encoder, "config", None), "hidden_size", self.context_dim)
                 self.text_hidden_dim = int(text_hidden_dim)
+            if self.text_encoder_eval and self.text_encoder is not None:
+                self.text_encoder.eval()
 
         self.pattern_router = None
         self.pattern_evidence_head = None
@@ -2771,6 +2791,42 @@ class CSDI_Forecasting(CSDI_base):
 
     def _encode_text_tokens(self, texts, max_length=None, truncation_side="right"):
         max_length = int(max_length or self.text_max_length)
+        if not self.text_encoder_eval:
+            return self._encode_text_tokens_impl(texts, max_length, truncation_side)
+        texts = [str(item) if item is not None else "NA" for item in texts]
+        hidden_rows = [None] * len(texts)
+        pooled_rows = [None] * len(texts)
+        mask_rows = [None] * len(texts)
+        missing_text = []
+        missing_at = []
+        for index, text in enumerate(texts):
+            key = (str(truncation_side), max_length, text)
+            cached = self._text_encode_cache.get(key)
+            if cached is None:
+                if text not in {item for item in missing_text}:
+                    missing_text.append(text)
+                missing_at.append(index)
+                continue
+            hidden_rows[index], pooled_rows[index], mask_rows[index] = cached
+        if missing_text:
+            hidden, pooled, mask = self._encode_text_tokens_impl(missing_text, max_length, truncation_side)
+            located = {text: row for row, text in enumerate(missing_text)}
+            for index in missing_at:
+                text = texts[index]
+                row = located[text]
+                stored = (
+                    hidden[row].detach().to("cpu"),
+                    pooled[row].detach().to("cpu"),
+                    mask[row].detach().to("cpu"),
+                )
+                self._text_encode_cache[(str(truncation_side), max_length, text)] = stored
+                hidden_rows[index], pooled_rows[index], mask_rows[index] = stored
+        hidden = torch.stack([row.to(self.device) for row in hidden_rows], dim=0)
+        pooled = torch.stack([row.to(self.device) for row in pooled_rows], dim=0)
+        mask = torch.stack([row.to(self.device) for row in mask_rows], dim=0)
+        return hidden, pooled, mask
+
+    def _encode_text_tokens_impl(self, texts, max_length, truncation_side):
         if self.tokenizer is None:
             hidden, pooled, token_input = self._hash_encode_texts(texts, max_length, truncation_side)
             return hidden, pooled, token_input["attention_mask"]

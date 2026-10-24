@@ -138,6 +138,7 @@ model:
   shuffle_text_in_batch: false
   text_drop_prob: 0.0
   idf_fit_train_only: true
+  text_encoder_eval: true
   pattern_residual_diffusion: false
 dataset:
   aug_noise_std: 0.01

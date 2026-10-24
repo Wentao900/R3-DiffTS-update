@@ -10,7 +10,9 @@ import unittest
 
 import numpy as np
 import torch
+import yaml
 
+from diff_models import ResidualBlock
 from main_model import CSDI_Forecasting
 from tests.synthetic_factory import xattn_config
 
@@ -145,6 +147,50 @@ class DdimCoefficientTests(unittest.TestCase):
         self.assertAlmostEqual(legacy, (1.0 - alpha_prev) / math.sqrt(1.0 - alpha_tau))
         self.assertNotAlmostEqual(legacy, fixed)
         self.assertAlmostEqual(model._ddim_x0_direction_coeff(0.25, 0.25), math.sqrt(0.75))
+
+
+def _feature_dropout_p(block):
+    layer = block.feature_layer.layers[0]
+    dropouts = [module.p for module in layer.modules() if isinstance(module, torch.nn.Dropout)]
+    return dropouts[0]
+
+
+class TowerDropoutTests(unittest.TestCase):
+    def _block(self, text_mode, tower_dropout, dropout=0.0):
+        return ResidualBlock(
+            side_dim=4,
+            channels=32,
+            diffusion_embedding_dim=16,
+            nheads=4,
+            dropout=dropout,
+            pred_len=4,
+            use_tv=False,
+            with_text=text_mode != "off",
+            context_dim=32,
+            text_mode=text_mode,
+            tower_dropout=tower_dropout,
+        )
+
+    def test_explicit_zero_overrides_the_legacy_point_one(self):
+        self.assertEqual(_feature_dropout_p(self._block("legacy", 0.0)), 0.0)
+        self.assertEqual(_feature_dropout_p(self._block("legacy", None)), 0.1)
+        self.assertEqual(_feature_dropout_p(self._block("gated", None, dropout=0.0)), 0.0)
+        self.assertEqual(_feature_dropout_p(self._block("gated", 0.0)), 0.0)
+
+    def test_a1_and_t1_configs_share_tower_dropout(self):
+        with open("config/xattn/agriculture_36_12_xattn.yaml") as handle:
+            a1 = yaml.safe_load(handle)
+        with open("config/xattn/ablation/agriculture_T1_router_text.yaml") as handle:
+            t1 = yaml.safe_load(handle)
+        with open("config/xattn/ablation/agriculture_T0_numeric_only.yaml") as handle:
+            t0 = yaml.safe_load(handle)
+        self.assertTrue(a1["diffusion"]["sampler_fix"])
+        self.assertEqual(float(a1["diffusion"]["tower_dropout"]), 0.0)
+        self.assertEqual(float(t1["diffusion"]["tower_dropout"]), 0.0)
+        self.assertEqual(float(t0["diffusion"]["tower_dropout"]), 0.0)
+        self.assertEqual(t1["model"]["text_injection"], "off")
+        self.assertEqual(a1["model"]["text_injection"], "gated")
+        self.assertEqual(float(a1["model"]["guide_w_default"]), 1.0)
 
 
 class ScheduleClosedFormTests(unittest.TestCase):

@@ -2,6 +2,9 @@
 # Single-factor ablations for the gated cross-attention method.
 # numeric_only (T0) changes only text_drop_prob. It does not turn off the router,
 # retrieval code path's parameters, the controller, or the multi-resolution loss.
+# A1, T0, and T1 share diffusion.tower_dropout 0 (set when the configs are
+# generated). T1 turns text injection off, which used to fall back to the
+# legacy 0.1 feature-tower dropout.
 #
 # Examples:
 #   DRY_RUN=1 bash scripts/run_xattn_ablation.sh

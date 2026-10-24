@@ -75,7 +75,7 @@ class DiffusionEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False, with_text=False, context_dim=None, dropout=0., attn_drop=0., pre_norm=False, pred_len=-1, use_tv=False, text_mode="legacy"):
+    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False, with_text=False, context_dim=None, dropout=0., attn_drop=0., pre_norm=False, pred_len=-1, use_tv=False, text_mode="legacy", tower_dropout=None):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
@@ -93,10 +93,14 @@ class ResidualBlock(nn.Module):
             self.time_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
             self.feature_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
         else:
-            # Legacy blocks keep the historical 0.1 Transformer dropout. Gated blocks use the
-            # configured dropout (0 unless --dropout is set) so the text and null passes see
-            # the same function when that dropout is 0.
-            tower_dropout = dropout if self.text_mode == "gated" else 0.1
+            # Legacy blocks keep the historical 0.1 Transformer dropout unless a config
+            # sets tower_dropout. xattn sets 0 for every text mode so A1 and T1 share a backbone.
+            # Gated blocks without that key still use the configured dropout (CLI default 0).
+            # 0 is a real value here; only a missing key falls through.
+            if tower_dropout is None:
+                tower_dropout = dropout if self.text_mode == "gated" else 0.1
+            else:
+                tower_dropout = float(tower_dropout)
             if use_tv:
                 self.time_layer = get_custom_tv_trans(heads=nheads, layers=1, channels=channels, dropout=dropout, pre_norm=pre_norm)
             else:
@@ -330,6 +334,7 @@ class diff_CSDI(nn.Module):
                     pred_len=self.pred_len,
                     use_tv=config.get("with_timestep", False),
                     text_mode=self.text_mode,
+                    tower_dropout=config.get("tower_dropout", None),
                 )
                 for _ in range(config["layers"])
             ]

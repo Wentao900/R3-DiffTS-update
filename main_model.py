@@ -405,6 +405,7 @@ class CSDI_base(nn.Module):
         config_diff["with_texts"] = denoiser_with_text
         config_diff["text_mode"] = "legacy" if self.text_injection in ("legacy", "off") else self.text_injection
         config_diff["n_text_sources"] = self.n_text_sources
+        config_diff["tower_dropout"] = config["diffusion"].get("tower_dropout", None)
         config_diff["time_weight"] = config["diffusion"]["time_weight"]
         config_diff["save_attn"] = config["model"]["save_attn"]
 

@@ -62,6 +62,7 @@ def apply_a1(config, season_period, pred_len):
     # Same numeric-tower dropout for A1, T0, and T1. 0 keeps the text and null
     # passes identical. Legacy configs omit the key and stay at 0.1.
     diffusion["tower_dropout"] = 0.0
+    diffusion["estimable_window_norm"] = True
     model = config.setdefault("model", {})
     model.update({
         "force_legacy_entrypoint": False,

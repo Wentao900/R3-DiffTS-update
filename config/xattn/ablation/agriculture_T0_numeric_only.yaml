@@ -62,6 +62,7 @@ diffusion:
   mask_noisy_target: true
   sampler_fix: true
   tower_dropout: 0.0
+  estimable_window_norm: true
 model:
   cot_model: ./gpt2-medium
   cot_temperature: 0.2

@@ -3,6 +3,7 @@
 Each case is the check that would have failed on the previous code.
 """
 
+import math
 import unittest
 
 import torch
@@ -12,6 +13,45 @@ from data_provider.data_loader import Dataset_Custom
 from tests.synthetic_factory import make_model, xattn_config
 from main_model import CSDI_Forecasting
 from utils.text_presence import text_is_absent
+
+
+class WindowNormTests(unittest.TestCase):
+    def test_fewer_than_two_observations_keep_unit_scale(self):
+        model = make_model(layers=1, num_steps=2)
+        observed = torch.tensor([[[5.0, 0.0, 0.0, 9.0]]])
+        mask = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]])
+        model.estimable_window_norm = False
+        legacy, _, legacy_std = model._standardize_observed(observed, mask)
+        self.assertAlmostEqual(float(legacy_std), math.sqrt(1e-5), places=6)
+        self.assertGreater(float(legacy.abs().max()), 100.0)
+
+        model.estimable_window_norm = True
+        fixed, means, stdev = model._standardize_observed(observed, mask)
+        self.assertTrue(torch.allclose(stdev, torch.ones_like(stdev)))
+        self.assertAlmostEqual(float(means), 5.0)
+        self.assertTrue(torch.allclose(fixed, observed - 5.0))
+        self.assertLess(float(fixed.abs().max()), 10.0)
+
+        empty_mask = torch.zeros_like(mask)
+        untouched, empty_mean, empty_std = model._standardize_observed(observed, empty_mask)
+        self.assertTrue(torch.allclose(empty_std, torch.ones_like(empty_std)))
+        self.assertAlmostEqual(float(empty_mean), 0.0)
+        self.assertTrue(torch.allclose(untouched, observed))
+
+    def test_two_observations_match_the_legacy_scale(self):
+        model = make_model(layers=1, num_steps=2)
+        observed = torch.tensor([[[1.0, 3.0, 0.0, 8.0]]])
+        mask = torch.tensor([[[1.0, 1.0, 0.0, 0.0]]])
+        model.estimable_window_norm = False
+        legacy, _, _ = model._standardize_observed(observed, mask)
+        model.estimable_window_norm = True
+        fixed, _, _ = model._standardize_observed(observed, mask)
+        self.assertTrue(torch.allclose(legacy, fixed))
+
+    def test_xattn_configs_enable_estimable_window_norm(self):
+        with open("config/xattn/agriculture_36_12_xattn.yaml") as handle:
+            config = yaml.safe_load(handle)
+        self.assertTrue(config["diffusion"]["estimable_window_norm"])
 
 
 class PlaceholderMarkTests(unittest.TestCase):

@@ -119,6 +119,9 @@ class CSDI_base(nn.Module):
         # Off for legacy runs. xattn configs turn it on. It corrects the diffusion
         # index passed to the denoiser, the x0 DDIM direction scale, and the x0 DDPM endpoint.
         self.sampler_fix = bool(config["diffusion"].get("sampler_fix", False))
+        # When a channel has fewer than two observed points, the window
+        # standard deviation is undefined. xattn then leaves the scale at 1.
+        self.estimable_window_norm = bool(config["diffusion"].get("estimable_window_norm", False))
         # Legacy leaves the frozen text encoder in whatever mode model.train() sets.
         # xattn keeps it in eval so its dropout cannot change a repeated string.
         self.text_encoder_eval = bool(config["model"].get("text_encoder_eval", False))
@@ -1503,6 +1506,27 @@ class CSDI_base(nn.Module):
             return any_mask
         return self.text_gate(similarity.detach(), source_mask, any_mask)
 
+    def _standardize_observed(self, observed_data, cond_mask):
+        """Per-window standardization used by training and sampling.
+
+        The unbiased sample standard deviation divides by n-1, so it is not
+        defined for fewer than two observed points. In that case the xattn
+        path leaves the scale at 1. That is the training-split scale already
+        applied by Dataset_Custom's StandardScaler, not an extra constant.
+        Channels with two or more observations keep the previous formula,
+        including the existing 1e-5 floor.
+        """
+        cond_count = torch.sum(cond_mask, dim=2, keepdim=True)
+        safe_count = cond_count.clamp(min=1.0)
+        means = torch.sum(observed_data * cond_mask, dim=2, keepdim=True) / safe_count
+        var_denom = (cond_count - 1.0).clamp(min=1.0)
+        stdev = torch.sqrt(
+            torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / var_denom + 1e-5
+        )
+        if self.estimable_window_norm:
+            stdev = torch.where(cond_count >= 2, stdev, torch.ones_like(stdev))
+        return (observed_data - means) / stdev, means, stdev
+
     def calc_loss_valid(
         self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, text_pack=None
     ):
@@ -1520,12 +1544,7 @@ class CSDI_base(nn.Module):
 
         B, K, L = observed_data.shape
         if not self.noise_esti:
-            cond_count = torch.sum(cond_mask, dim=2, keepdim=True)
-            safe_count = cond_count.clamp(min=1.0)
-            means = torch.sum(observed_data * cond_mask, dim=2, keepdim=True) / safe_count
-            var_denom = (cond_count - 1.0).clamp(min=1.0)
-            stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / var_denom + 1e-5)
-            observed_data = (observed_data - means) / stdev
+            observed_data, _, _ = self._standardize_observed(observed_data, cond_mask)
 
         target_mask = observed_mask - cond_mask
         pattern = None
@@ -2131,12 +2150,7 @@ class CSDI_base(nn.Module):
             time_steps = None
             time_steps_prev = None
         if not self.noise_esti:
-            cond_count = torch.sum(cond_mask, dim=2, keepdim=True)
-            safe_count = cond_count.clamp(min=1.0)
-            means = torch.sum(observed_data * cond_mask, dim=2, keepdim=True) / safe_count
-            var_denom = (cond_count - 1.0).clamp(min=1.0)
-            stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / var_denom + 1e-5)
-            observed_data = (observed_data - means) / stdev
+            observed_data, means, stdev = self._standardize_observed(observed_data, cond_mask)
 
         pattern_baseline = None
         diffusion_observed_data = observed_data

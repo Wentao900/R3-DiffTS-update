@@ -60,6 +60,7 @@ def apply_entrypoint_overrides(config, freq="m"):
     if model_cfg["baseline_form"] == "none":
         model_cfg["pattern_residual_diffusion"] = False
     diffusion_cfg["sampler_fix"] = bool(diffusion_cfg.get("sampler_fix", False))
+    diffusion_cfg["estimable_window_norm"] = bool(diffusion_cfg.get("estimable_window_norm", False))
     return config
 
 

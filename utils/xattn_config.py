@@ -48,6 +48,7 @@ def apply_entrypoint_overrides(config, freq="m"):
     else:
         model_cfg["season_period"] = int(model_cfg["season_period"])
     model_cfg["benefit_eps"] = float(model_cfg.get("benefit_eps", 1e-8))
+    model_cfg["idf_fit_train_only"] = bool(model_cfg.get("idf_fit_train_only", False))
 
     diffusion_cfg = config.setdefault("diffusion", {})
     diffusion_cfg["mask_noisy_target"] = bool(diffusion_cfg.get("mask_noisy_target", False))

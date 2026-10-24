@@ -57,6 +57,7 @@ class RAGCoTPipeline:
         lookback_len: int,
         pred_len: int,
         config: Optional[RAGCoTConfig] = None,
+        idf_fit_end_date=None,
     ) -> None:
         self.domain = domain
         self.desc = desc
@@ -70,6 +71,7 @@ class RAGCoTPipeline:
         self.rag_stage2_topk = self._resolve_stage2_topk(self.config.rag_stage2_topk)
         self.rag_stage1_topk = self._resolve_stage1_topk(self.config.rag_stage1_topk, self.rag_stage2_topk)
         self.search_df = self._prep_search_df(search_df)
+        self.idf_fit_end_date = None if idf_fit_end_date is None else pd.Timestamp(idf_fit_end_date)
         self.retriever = self._fit_retriever(self.search_df)
         self.generator = self._init_generator(self.config)
         self.cache: OrderedDict[str, Dict[str, str]] = OrderedDict()
@@ -103,7 +105,19 @@ class RAGCoTPipeline:
         if search_df.empty or not self.config.use_retrieval:
             return None
         vectorizer = TfidfVectorizer(stop_words="english", max_features=4096, ngram_range=(1, 2))
-        matrix = vectorizer.fit_transform(search_df["fact"].tolist())
+        facts = search_df["fact"].tolist()
+        # Retrieval still searches the full corpus and filters by the sample cutoff.
+        # IDF and the vocabulary are fit only through the training-period end so
+        # validation and test documents cannot change the weights.
+        if self.idf_fit_end_date is not None and "end_date" in search_df.columns:
+            fit_mask = search_df["end_date"].notna() & (search_df["end_date"] <= self.idf_fit_end_date)
+            fit_facts = search_df.loc[fit_mask, "fact"].tolist()
+            if len(fit_facts) == 0:
+                fit_facts = facts
+            vectorizer.fit(fit_facts)
+            matrix = vectorizer.transform(facts)
+        else:
+            matrix = vectorizer.fit_transform(facts)
         return {"vectorizer": vectorizer, "matrix": matrix}
 
     def _init_generator(self, config: RAGCoTConfig):
@@ -190,7 +204,7 @@ class RAGCoTPipeline:
         ]
 
     def _cache_signature(self) -> Dict[str, object]:
-        return {
+        signature = {
             "domain": self.domain,
             "lookback_len": self.lookback_len,
             "pred_len": self.pred_len,
@@ -210,6 +224,12 @@ class RAGCoTPipeline:
             "date_cutoff": True,
             "skip_cot_generation": bool(getattr(self.config, "skip_cot_generation", False)),
         }
+        # Leave the legacy signature unchanged when IDF is fit on the whole corpus.
+        if self.idf_fit_end_date is not None:
+            signature["cache_version"] = 3
+            signature["idf_fit_train_only"] = True
+            signature["idf_fit_end"] = str(self.idf_fit_end_date)
+        return signature
 
     def _select_numeric_history(self, numeric_history: Sequence[float], target_index=None):
         arr = np.asarray(numeric_history, dtype=float)

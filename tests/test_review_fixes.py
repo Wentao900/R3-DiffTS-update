@@ -9,12 +9,14 @@ import math
 import unittest
 
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 
 from diff_models import ResidualBlock
 from main_model import CSDI_Forecasting
 from tests.synthetic_factory import make_model, xattn_config
+from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
 
 
 class _StepRecorder(torch.nn.Module):
@@ -211,6 +213,52 @@ class TowerDropoutTests(unittest.TestCase):
         self.assertEqual(t1["model"]["text_injection"], "off")
         self.assertEqual(a1["model"]["text_injection"], "gated")
         self.assertEqual(float(a1["model"]["guide_w_default"]), 1.0)
+        self.assertTrue(a1["model"]["idf_fit_train_only"])
+        self.assertTrue(t1["model"]["idf_fit_train_only"])
+
+
+class IdfFitTests(unittest.TestCase):
+    def _frame(self):
+        return pd.DataFrame({
+            "fact": ["apple banana", "apple citrus", "apple zebra"],
+            "start_date": pd.to_datetime(["2020-01-01", "2020-02-01", "2021-06-01"]),
+            "end_date": pd.to_datetime(["2020-01-31", "2020-02-28", "2021-06-30"]),
+        })
+
+    def _pipeline(self, frame, idf_end):
+        config = RAGCoTConfig(use_retrieval=True, top_k=2, cot_model=None)
+        return RAGCoTPipeline(
+            "synthetic", frame, "desc", 4, 2, config, idf_fit_end_date=idf_end,
+        )
+
+    def test_idf_fit_excludes_documents_after_the_training_end(self):
+        frame = self._frame()
+        train_end = pd.Timestamp("2020-03-01")
+        fitted = self._pipeline(frame, train_end)
+        leaked = self._pipeline(frame, None)
+        self.assertNotIn("zebra", fitted.retriever["vectorizer"].vocabulary_)
+        self.assertIn("zebra", leaked.retriever["vectorizer"].vocabulary_)
+        self.assertEqual(fitted.retriever["matrix"].shape[0], len(frame))
+        hits = fitted._retrieve("apple zebra", top_k=2, cutoff_end_date=pd.Timestamp("2020-03-15"))
+        self.assertTrue(hits)
+        self.assertTrue(all("zebra" not in hit for hit in hits))
+        future_hits = fitted._retrieve("apple zebra", top_k=1, cutoff_end_date=pd.Timestamp("2021-07-01"))
+        self.assertIn("zebra", future_hits[0])
+
+    def test_cache_signature_stays_version_two_unless_the_cutoff_is_set(self):
+        frame = self._frame()
+        legacy = self._pipeline(frame, None)._cache_signature()
+        fixed = self._pipeline(frame, pd.Timestamp("2020-03-01"))._cache_signature()
+        self.assertEqual(legacy["cache_version"], 2)
+        self.assertNotIn("idf_fit_train_only", legacy)
+        self.assertEqual(fixed["cache_version"], 3)
+        self.assertTrue(fixed["idf_fit_train_only"])
+        self.assertIn("2020-03-01", fixed["idf_fit_end"])
+
+    def test_empty_training_subset_falls_back_to_the_full_corpus(self):
+        frame = self._frame()
+        fitted = self._pipeline(frame, pd.Timestamp("2019-01-01"))
+        self.assertIn("zebra", fitted.retriever["vectorizer"].vocabulary_)
 
 
 class ScheduleClosedFormTests(unittest.TestCase):

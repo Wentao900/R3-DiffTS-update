@@ -137,6 +137,7 @@ model:
   n_text_sources: 2
   shuffle_text_in_batch: true
   text_drop_prob: 0.0
+  idf_fit_train_only: true
 dataset:
   aug_noise_std: 0.01
   aug_time_warp_prob: 0.3

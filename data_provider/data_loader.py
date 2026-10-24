@@ -79,7 +79,8 @@ class Dataset_Custom(Dataset):
                  max_text_events=12,
                  text_features_mode="legacy",
                  skip_cot_generation=False,
-                 numeric_summary_target_only=False):
+                 numeric_summary_target_only=False,
+                 idf_fit_train_only=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -148,6 +149,7 @@ class Dataset_Custom(Dataset):
         self.text_features_mode = str(text_features_mode or "legacy").lower()
         self.skip_cot_generation = bool(skip_cot_generation)
         self.numeric_summary_target_only = bool(numeric_summary_target_only)
+        self.idf_fit_train_only = bool(idf_fit_train_only)
 
         self.root_path = root_path
         self.data_path = data_path
@@ -200,6 +202,7 @@ class Dataset_Custom(Dataset):
                 lookback_len=self.seq_len,
                 pred_len=self.pred_len,
                 config=rag_cfg,
+                idf_fit_end_date=self.train_period_end if self.idf_fit_train_only else None,
             )
         else:
             self.rag_cot = None
@@ -852,6 +855,9 @@ class Dataset_Custom(Dataset):
         
         first_start_date = df_num.start_date[border1]
         final_end_date = df_num.end_date[border2-1]
+        # Last numeric end date of the 70% training split. IDF uses this cutoff
+        # on every split; retrieval still uses each sample's own history end.
+        self.train_period_end = df_num.end_date[border2s[0] - 1]
 
         if self.use_all_numeric_features:
             feature_cols, feature_roles = self._resolve_numeric_feature_columns(df_num)

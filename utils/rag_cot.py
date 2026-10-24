@@ -102,6 +102,7 @@ class RAGCoTPipeline:
         return df
 
     def _fit_retriever(self, search_df: pd.DataFrame) -> Optional[Dict[str, object]]:
+        self.idf_fit_document_count = 0
         if search_df.empty or not self.config.use_retrieval:
             return None
         vectorizer = TfidfVectorizer(stop_words="english", max_features=4096, ngram_range=(1, 2))
@@ -113,11 +114,19 @@ class RAGCoTPipeline:
             fit_mask = search_df["end_date"].notna() & (search_df["end_date"] <= self.idf_fit_end_date)
             fit_facts = search_df.loc[fit_mask, "fact"].tolist()
             if len(fit_facts) == 0:
-                fit_facts = facts
+                self.idf_fit_document_count = 0
+                raise RuntimeError(
+                    "IDF fit refused: no documents have end_date on or before "
+                    f"{self.idf_fit_end_date}. Refusing to fit on the full corpus."
+                )
             vectorizer.fit(fit_facts)
             matrix = vectorizer.transform(facts)
+            fit_count = len(fit_facts)
         else:
             matrix = vectorizer.fit_transform(facts)
+            fit_count = len(facts)
+        self.idf_fit_document_count = int(fit_count)
+        print(f"[rag] IDF fit on {fit_count} documents (corpus {len(facts)})")
         return {"vectorizer": vectorizer, "matrix": matrix}
 
     def _init_generator(self, config: RAGCoTConfig):

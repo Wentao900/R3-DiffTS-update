@@ -15,6 +15,60 @@ from main_model import CSDI_Forecasting
 from utils.text_presence import text_is_absent
 
 
+class _Denoiser(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, diff_input, side_info, diffusion_step, *args, **kwargs):
+        self.calls.append((int(diffusion_step.reshape(-1)[0].item()), int(diff_input.shape[1])))
+        return torch.zeros(diff_input.shape[0], diff_input.shape[2], diff_input.shape[3])
+
+
+def _unconditional_model(num_steps, sample_steps, sampler_fix):
+    config = xattn_config(
+        decomp=False, lookback=8, pred=4, num_steps=num_steps, layers=1, channels=32,
+    )
+    config["model"]["is_unconditional"] = 1
+    config["model"]["pattern_residual_diffusion"] = False
+    config["model"]["text_injection"] = "off"
+    config["diffusion"].update({
+        "ddim": True,
+        "sample_steps": sample_steps,
+        "sample_method": "linear",
+        "sampler_fix": sampler_fix,
+    })
+    model = CSDI_Forecasting(config, torch.device("cpu"), 2, [8, 4])
+    model.diffmodel = _Denoiser()
+    return model
+
+
+class UnconditionalScheduleTests(unittest.TestCase):
+    def _impute(self, model):
+        observed = torch.zeros(1, 2, 12)
+        mask = torch.zeros(1, 2, 12)
+        mask[:, :, :8] = 1.0
+        return model.impute(observed, mask, side_info=None, n_samples=1)
+
+    def test_sampler_fix_reads_the_history_at_tau(self):
+        model = _unconditional_model(num_steps=20, sample_steps=4, sampler_fix=True)
+        self._impute(model)
+        self.assertEqual([step for step, _ in model.diffmodel.calls], [16, 11, 6, 1])
+        self.assertTrue(all(channels == 1 for _, channels in model.diffmodel.calls))
+
+    def test_tau_past_the_history_table_raises(self):
+        model = _unconditional_model(num_steps=5, sample_steps=5, sampler_fix=True)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._impute(model)
+        self.assertIn("noisy-history", str(ctx.exception))
+
+    def test_legacy_unconditional_ddim_does_not_call_the_denoiser(self):
+        model = _unconditional_model(num_steps=20, sample_steps=4, sampler_fix=False)
+        with self.assertRaises(NameError):
+            self._impute(model)
+        self.assertEqual(model.diffmodel.calls, [])
+
+
 class DeterministicValidTests(unittest.TestCase):
     def _predict_from_noise(self, model):
         masks = []

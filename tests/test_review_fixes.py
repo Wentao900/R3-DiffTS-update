@@ -267,10 +267,15 @@ class IdfFitTests(unittest.TestCase):
         self.assertTrue(fixed["idf_fit_train_only"])
         self.assertIn("2020-03-01", fixed["idf_fit_end"])
 
-    def test_empty_training_subset_falls_back_to_the_full_corpus(self):
+    def test_empty_training_subset_raises_instead_of_using_the_full_corpus(self):
         frame = self._frame()
-        fitted = self._pipeline(frame, pd.Timestamp("2019-01-01"))
-        self.assertIn("zebra", fitted.retriever["vectorizer"].vocabulary_)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._pipeline(frame, pd.Timestamp("2019-01-01"))
+        self.assertIn("Refusing", str(ctx.exception))
+
+    def test_idf_fit_count_is_the_training_subset(self):
+        fitted = self._pipeline(self._frame(), pd.Timestamp("2020-03-01"))
+        self.assertEqual(fitted.idf_fit_document_count, 2)
 
 
 class ScheduleClosedFormTests(unittest.TestCase):

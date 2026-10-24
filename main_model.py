@@ -2221,8 +2221,25 @@ class CSDI_base(nn.Module):
             for t in range(self.sample_steps - 1, -1, -1):
                 denoise_t = self._denoiser_step_index(t, time_steps)
                 if self.is_unconditional == True:
-                    diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
-                    diff_input = diff_input.unsqueeze(1) 
+                    if self.ddim and self.sampler_fix:
+                        history_index = int(denoise_t)
+                        if history_index < 0 or history_index >= len(noisy_cond_history):
+                            raise RuntimeError(
+                                "unconditional DDIM step τ=%d is outside the noisy-history table "
+                                "of length %d. The table is indexed by the diffusion step, not the "
+                                "reverse-loop index." % (history_index, len(noisy_cond_history))
+                            )
+                    else:
+                        history_index = t
+                    diff_input = cond_mask * noisy_cond_history[history_index] + (1.0 - cond_mask) * current_sample
+                    diff_input = diff_input.unsqueeze(1)
+                    if self.ddim and self.sampler_fix:
+                        # The conditional branch calls the denoiser below. This path had
+                        # only built the input, so sampler_fix also runs that call at τ.
+                        predicted = self.diffmodel(
+                            diff_input, side_info, torch.tensor([denoise_t]).to(self.device),
+                            cfg_mask, timestep_emb, size_emb, context,
+                        )
                 else:
                     if self.decomp:
                         cond_obs = cond_mask * diffusion_observed_data

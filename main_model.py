@@ -105,6 +105,9 @@ class CSDI_base(nn.Module):
         self.ddim = config["diffusion"]["ddim"]
         self.sample_steps = config["diffusion"]["sample_steps"]
         self.sample_method = config["diffusion"]["sample_method"]
+        # Off for legacy runs. xattn configs turn it on. It corrects the diffusion
+        # index passed to the denoiser, the x0 DDIM direction scale, and the x0 DDPM endpoint.
+        self.sampler_fix = bool(config["diffusion"].get("sampler_fix", False))
         train_cfg = config.get("train", {})
 
         self.lookback_len = config["model"]["lookback_len"]
@@ -2053,20 +2056,37 @@ class CSDI_base(nn.Module):
         gate = gate.view(batch, 1, 1).to(dtype=predicted.dtype)
         return pred_null + float(guide_weight) * gate * (pred_cond - pred_null)
 
+    def _build_ddim_schedule(self):
+        """Sub-schedule of diffusion indices. Values are the τ used by the DDIM update."""
+        if self.sample_method == 'linear':
+            stride = self.num_steps // self.sample_steps
+            time_steps = np.asarray(list(range(0, self.num_steps, stride)))
+        elif self.sample_method == "quad":
+            time_steps = (np.linspace(0, np.sqrt(self.num_steps * 0.8), self.sample_steps) ** 2).astype(int)
+        else:
+            raise NotImplementedError(f"sampling method {self.sample_method} is not implemented!")
+        time_steps = time_steps + 1
+        time_steps_prev = np.concatenate([[0], time_steps[:-1]])
+        return time_steps, time_steps_prev
+
+    def _denoiser_step_index(self, loop_index, time_steps):
+        """Diffusion-step argument for the denoiser.
+
+        Legacy DDIM passes the loop index 0..S-1. With sampler_fix it passes τ,
+        the schedule entry whose ᾱ is the noise level of this reverse step.
+        """
+        if self.ddim and self.sampler_fix:
+            return int(time_steps[loop_index])
+        return int(loop_index)
+
     def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, text_pack=None):
         B, K, L = observed_data.shape
         if self.ddim:
-            if self.sample_method == 'linear':
-                a = self.num_steps // self.sample_steps
-                time_steps = np.asarray(list(range(0, self.num_steps, a)))
-            elif self.sample_method == "quad":
-                time_steps = (np.linspace(0, np.sqrt(self.num_steps * 0.8), self.sample_steps) ** 2).astype(int)
-            else:
-                raise NotImplementedError(f"sampling method {self.sample_method} is not implemented!")
-            time_steps = time_steps + 1
-            time_steps_prev = np.concatenate([[0], time_steps[:-1]])
+            time_steps, time_steps_prev = self._build_ddim_schedule()
         else:
             self.sample_steps = self.num_steps
+            time_steps = None
+            time_steps_prev = None
         if not self.noise_esti:
             cond_count = torch.sum(cond_mask, dim=2, keepdim=True)
             safe_count = cond_count.clamp(min=1.0)
@@ -2116,6 +2136,7 @@ class CSDI_base(nn.Module):
 
             current_sample = torch.randn_like(diffusion_observed_data)
             for t in range(self.sample_steps - 1, -1, -1):
+                denoise_t = self._denoiser_step_index(t, time_steps)
                 if self.is_unconditional == True:
                     diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
                     diff_input = diff_input.unsqueeze(1) 
@@ -2131,14 +2152,14 @@ class CSDI_base(nn.Module):
                         if use_cfg:
                             guide_weight = self.guide_w_default if guide_w is None else float(guide_w)
                             predicted = self._combine_cfg_prediction(
-                                [res_input, moving_mean_input], side_info, t, timestep_emb, size_emb, text_pack, guide_weight
+                                [res_input, moving_mean_input], side_info, denoise_t, timestep_emb, size_emb, text_pack, guide_weight
                             )
                         else:
                             predicted_seasonal = self._unwrap_diffmodel_output(
-                                self.diffmodel_sesonal(res_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
+                                self.diffmodel_sesonal(res_input, side_info, torch.tensor([denoise_t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
                             ) # (2*B, K, L)
                             predicted_trend = self._unwrap_diffmodel_output(
-                                self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
+                                self.diffmodel_trend(moving_mean_input, side_info, torch.tensor([denoise_t]).to(self.device), cfg_mask, timestep_emb, size_emb, context)
                             ) # (2*B, K, L)
                             predicted = predicted_seasonal + predicted_trend # (2*B, K, L)
                     else:
@@ -2149,12 +2170,12 @@ class CSDI_base(nn.Module):
                         if use_cfg:
                             guide_weight = self.guide_w_default if guide_w is None else float(guide_w)
                             predicted = self._combine_cfg_prediction(
-                                diff_input, side_info, t, timestep_emb, size_emb, text_pack, guide_weight
+                                diff_input, side_info, denoise_t, timestep_emb, size_emb, text_pack, guide_weight
                             )
                         elif self.save_attn:
-                            predicted, attn = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
+                            predicted, attn = self.diffmodel(diff_input, side_info, torch.tensor([denoise_t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                         else:
-                            predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
+                            predicted = self.diffmodel(diff_input, side_info, torch.tensor([denoise_t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
 
                 if self.noise_esti:
                     # noise prediction

@@ -56,7 +56,9 @@ def apply_a1(config, season_period, pred_len):
         "valid_loss_main_only": True,
         "forecast_calibrator": False,
     })
-    config.setdefault("diffusion", {})["mask_noisy_target"] = True
+    diffusion = config.setdefault("diffusion", {})
+    diffusion["mask_noisy_target"] = True
+    diffusion["sampler_fix"] = True
     model = config.setdefault("model", {})
     model.update({
         "force_legacy_entrypoint": False,

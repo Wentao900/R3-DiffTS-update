@@ -17,6 +17,7 @@ from diff_models import ResidualBlock
 from main_model import CSDI_Forecasting
 from tests.synthetic_factory import make_model, xattn_config
 from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
+from utils.xattn_config import resolve_xattn_guide_w
 
 
 class _StepRecorder(torch.nn.Module):
@@ -215,6 +216,17 @@ class TowerDropoutTests(unittest.TestCase):
         self.assertEqual(float(a1["model"]["guide_w_default"]), 1.0)
         self.assertTrue(a1["model"]["idf_fit_train_only"])
         self.assertTrue(t1["model"]["idf_fit_train_only"])
+
+
+class GuideWeightTests(unittest.TestCase):
+    def test_xattn_negative_guide_w_defaults_to_one(self):
+        legacy = {"model": {"force_legacy_entrypoint": True}}
+        xattn = {"model": {"force_legacy_entrypoint": False, "guide_w_default": 1.0}}
+        self.assertEqual(resolve_xattn_guide_w(legacy, -1, ""), -1.0)
+        self.assertEqual(resolve_xattn_guide_w(xattn, -1, ""), 1.0)
+        self.assertEqual(resolve_xattn_guide_w(xattn, -1, "0,0.5,1"), -1.0)
+        self.assertEqual(resolve_xattn_guide_w(xattn, 2, ""), 2.0)
+        self.assertEqual(resolve_xattn_guide_w({}, -1, ""), -1.0)
 
 
 class IdfFitTests(unittest.TestCase):

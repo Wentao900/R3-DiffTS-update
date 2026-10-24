@@ -59,3 +59,19 @@ def apply_entrypoint_overrides(config, freq="m"):
         model_cfg["pattern_residual_diffusion"] = False
     diffusion_cfg["sampler_fix"] = bool(diffusion_cfg.get("sampler_fix", False))
     return config
+
+
+def resolve_xattn_guide_w(config, guide_w, guide_list=""):
+    """Keep the legacy 20-value sweep. xattn defaults to guide_w_default (1).
+
+    A negative guide_w with an explicit guide_list still sweeps that list.
+    A negative guide_w with an empty list sweeps the built-in table only when
+    force_legacy_entrypoint is on.
+    """
+    guide_w = float(guide_w)
+    if guide_w >= 0 or str(guide_list or "").strip():
+        return guide_w
+    model_cfg = config.get("model", {})
+    if bool(model_cfg.get("force_legacy_entrypoint", True)):
+        return guide_w
+    return float(model_cfg.get("guide_w_default", 1.0))

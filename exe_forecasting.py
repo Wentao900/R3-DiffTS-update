@@ -11,7 +11,7 @@ import math
 from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate, fit_forecast_calibrator
-from utils.xattn_config import apply_entrypoint_overrides
+from utils.xattn_config import apply_entrypoint_overrides, resolve_xattn_guide_w
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
@@ -419,6 +419,7 @@ with open(path, "r") as f:
     config = yaml.safe_load(f)
 # Legacy configs keep the forced text/timestep switches. xattn configs opt out.
 apply_entrypoint_overrides(config, freq=args.freq)
+args.guide_w = resolve_xattn_guide_w(config, args.guide_w, args.guide_list)
 args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
 args.cot_only = config["model"].get("cot_only", args.cot_only)
 args.use_two_stage_rag = config["model"].get("use_two_stage_rag", args.use_two_stage_rag)

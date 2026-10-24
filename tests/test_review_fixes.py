@@ -5,6 +5,7 @@ still pass on the old DDPM sampler, because that call already happened and
 its output was discarded.
 """
 
+import math
 import unittest
 
 import numpy as np
@@ -99,6 +100,20 @@ class SamplerIndexTests(unittest.TestCase):
         _run_impute(model)
         self.assertEqual(recorder.steps[0], first_tau)
         self.assertEqual(recorder.steps, [int(time_steps[t]) for t in range(19, -1, -1)])
+
+
+class DdimCoefficientTests(unittest.TestCase):
+    def test_x0_ddim_direction_matches_song_eta_zero(self):
+        model = _sampler_model(num_steps=4, ddim=True, sample_steps=2, sampler_fix=True)
+        alpha_prev, alpha_tau = 0.4, 0.1
+        fixed = model._ddim_x0_direction_coeff(alpha_prev, alpha_tau)
+        self.assertAlmostEqual(fixed, math.sqrt((1.0 - alpha_prev) / (1.0 - alpha_tau)))
+        self.assertAlmostEqual(model._ddim_x0_direction_coeff(0.25, 0.25), 1.0)
+        model.sampler_fix = False
+        legacy = model._ddim_x0_direction_coeff(alpha_prev, alpha_tau)
+        self.assertAlmostEqual(legacy, (1.0 - alpha_prev) / math.sqrt(1.0 - alpha_tau))
+        self.assertNotAlmostEqual(legacy, fixed)
+        self.assertAlmostEqual(model._ddim_x0_direction_coeff(0.25, 0.25), math.sqrt(0.75))
 
 
 class ScheduleClosedFormTests(unittest.TestCase):

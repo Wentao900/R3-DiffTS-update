@@ -2079,6 +2079,18 @@ class CSDI_base(nn.Module):
             return int(time_steps[loop_index])
         return int(loop_index)
 
+    def _ddim_x0_direction_coeff(self, alpha_prev, alpha_tau):
+        """Coefficient of x_τ in the η=0 x0 DDIM update.
+
+        Song et al. 2021 eq. 12 with η=0 is
+        sqrt((1-ᾱ_prev)/(1-ᾱ_τ)). The legacy expression omits the numerator square root.
+        """
+        alpha_prev = float(alpha_prev)
+        alpha_tau = float(alpha_tau)
+        if self.sampler_fix:
+            return ((1.0 - alpha_prev) / (1.0 - alpha_tau)) ** 0.5
+        return (1.0 - alpha_prev) / (1.0 - alpha_tau) ** 0.5
+
     def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w=None, timesteps=None, timestep_emb=None, size_emb=None, context=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, text_pack=None):
         B, K, L = observed_data.shape
         if self.ddim:
@@ -2212,7 +2224,7 @@ class CSDI_base(nn.Module):
                                 current_sample += sigma * noise
                     else:
                         tau, tau_prev = time_steps[t], time_steps_prev[t]
-                        aaa_ = (1-self.alpha[tau_prev])/(1-self.alpha[tau]) ** 0.5
+                        aaa_ = self._ddim_x0_direction_coeff(self.alpha[tau_prev], self.alpha[tau])
                         current_sample = (
                             aaa_ * current_sample +
                             ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted

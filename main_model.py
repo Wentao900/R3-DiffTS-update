@@ -2210,8 +2210,24 @@ class CSDI_base(nn.Module):
                         )
                 else:
                     if not self.ddim:
-                        if t > 1:
-                            # data prediction
+                        # Legacy stops at x_1: the mean update requires t>1 and noise requires t>2,
+                        # so the t=1 and t=0 denoiser calls are discarded. sampler_fix runs the
+                        # posterior down through t=1 (deterministic x_0 mean, noise only for t>1)
+                        # and returns the t=0 x_0 prediction.
+                        if self.sampler_fix:
+                            if t == 0:
+                                current_sample = predicted
+                            else:
+                                coeff1 = (self.alpha_hat[t] ** 0.5 * (1 - self.alpha[t-1])) / (1 - self.alpha[t])
+                                coeff2 = (self.alpha[t-1] ** 0.5 * self.beta[t]) / (1 - self.alpha[t])
+                                current_sample = coeff1 * current_sample + coeff2 * predicted
+                                if t > 1:
+                                    noise = torch.randn_like(current_sample)
+                                    sigma = (
+                                        (1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]
+                                    ) ** 0.5
+                                    current_sample += sigma * noise
+                        elif t > 1:
                             coeff1 = (self.alpha_hat[t] ** 0.5 * (1 - self.alpha[t-1])) / (1 - self.alpha[t])
                             coeff2 = (self.alpha[t-1] ** 0.5 * self.beta[t]) / (1 - self.alpha[t])
                             current_sample = coeff1 * current_sample + coeff2 * predicted # (B, K, L)

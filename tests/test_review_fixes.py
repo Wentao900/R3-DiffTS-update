@@ -44,6 +44,17 @@ def _run_impute(model):
     return observed, cond_mask, samples
 
 
+def _invert_revin(observed, cond_mask, samples):
+    cond_count = torch.sum(cond_mask, dim=2, keepdim=True)
+    safe_count = cond_count.clamp(min=1.0)
+    means = torch.sum(observed * cond_mask, dim=2, keepdim=True) / safe_count
+    var_denom = (cond_count - 1.0).clamp(min=1.0)
+    stdev = torch.sqrt(
+        torch.sum((observed - means) ** 2 * cond_mask, dim=2, keepdim=True) / var_denom + 1e-5
+    )
+    return (samples[:, 0] - means) / stdev
+
+
 class SamplerIndexTests(unittest.TestCase):
     def test_ddim_denoiser_receives_schedule_timesteps(self):
         model = _sampler_model(
@@ -100,6 +111,26 @@ class SamplerIndexTests(unittest.TestCase):
         _run_impute(model)
         self.assertEqual(recorder.steps[0], first_tau)
         self.assertEqual(recorder.steps, [int(time_steps[t]) for t in range(19, -1, -1)])
+
+
+class DdpmEndpointTests(unittest.TestCase):
+    def test_ddpm_returns_the_t0_x0_prediction(self):
+        torch.manual_seed(0)
+        model = _sampler_model(num_steps=4, ddim=False, sampler_fix=True, noise_esti=False)
+        recorder = _StepRecorder(value=4.0)
+        model.diffmodel = recorder
+        observed, cond_mask, samples = _run_impute(model)
+        self.assertEqual(recorder.steps, [3, 2, 1, 0])
+        restored = _invert_revin(observed, cond_mask, samples)
+        self.assertTrue(torch.allclose(restored, torch.full_like(restored, 4.0)))
+
+    def test_legacy_ddpm_does_not_return_the_t0_prediction(self):
+        torch.manual_seed(0)
+        model = _sampler_model(num_steps=4, ddim=False, sampler_fix=False, noise_esti=False)
+        model.diffmodel = _StepRecorder(value=4.0)
+        observed, cond_mask, samples = _run_impute(model)
+        restored = _invert_revin(observed, cond_mask, samples)
+        self.assertFalse(torch.allclose(restored, torch.full_like(restored, 4.0), atol=1e-4))
 
 
 class DdimCoefficientTests(unittest.TestCase):

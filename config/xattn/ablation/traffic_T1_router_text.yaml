@@ -41,6 +41,7 @@ train:
   pattern_consistency_weight: 0.0
   pattern_expert_weight: 0.05
   valid_loss_main_only: true
+  deterministic_valid: true
   forecast_calibrator: false
 diffusion:
   layers: 4

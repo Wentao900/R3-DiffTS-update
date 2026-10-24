@@ -10,9 +10,47 @@ import torch
 import yaml
 
 from data_provider.data_loader import Dataset_Custom
-from tests.synthetic_factory import make_model, xattn_config
+from tests.synthetic_factory import make_batch, make_model, xattn_config
 from main_model import CSDI_Forecasting
 from utils.text_presence import text_is_absent
+
+
+class DeterministicValidTests(unittest.TestCase):
+    def _predict_from_noise(self, model):
+        masks = []
+
+        def _run(total_input, side_info, t, cfg_mask, **kwargs):
+            masks.append(None if cfg_mask is None else cfg_mask.detach().clone())
+            noisy = total_input[0][:, 1] if isinstance(total_input, list) else total_input[:, 1]
+            return noisy, None
+
+        model._run_diffusion_model = _run
+        return masks
+
+    def test_validation_loss_repeats_and_keeps_text(self):
+        model = make_model(layers=1, num_steps=2, decomp=False)
+        model.c_mask_prob = 1.0
+        model.eval()
+        batch = make_batch(model)
+        model.deterministic_valid = True
+        fixed_masks = self._predict_from_noise(model)
+        first = model(batch, is_train=0)
+        second = model(batch, is_train=0)
+        self.assertTrue(torch.equal(first, second))
+        self.assertTrue(all(torch.equal(mask, torch.ones_like(mask)) for mask in fixed_masks))
+
+        model.deterministic_valid = False
+        random_masks = self._predict_from_noise(model)
+        third = model(batch, is_train=0)
+        fourth = model(batch, is_train=0)
+        self.assertFalse(torch.equal(third, fourth))
+        self.assertTrue(all(torch.equal(mask, torch.zeros_like(mask)) for mask in random_masks))
+
+    def test_xattn_selects_on_deterministic_main_loss(self):
+        with open("config/xattn/agriculture_36_12_xattn.yaml") as handle:
+            config = yaml.safe_load(handle)
+        self.assertTrue(config["train"]["deterministic_valid"])
+        self.assertTrue(config["train"]["valid_loss_main_only"])
 
 
 class WindowNormTests(unittest.TestCase):

@@ -54,6 +54,7 @@ def apply_a1(config, season_period, pred_len):
         "coarse_forecast_weight": 0.0,
         "uncertainty_forecast_weight": 0.0,
         "valid_loss_main_only": True,
+        "deterministic_valid": True,
         "forecast_calibrator": False,
     })
     diffusion = config.setdefault("diffusion", {})

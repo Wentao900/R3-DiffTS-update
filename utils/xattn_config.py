@@ -57,6 +57,7 @@ def apply_entrypoint_overrides(config, freq="m"):
 
     train_cfg = config.setdefault("train", {})
     train_cfg["valid_loss_main_only"] = bool(train_cfg.get("valid_loss_main_only", False))
+    train_cfg["deterministic_valid"] = bool(train_cfg.get("deterministic_valid", False))
     if model_cfg["baseline_form"] == "none":
         model_cfg["pattern_residual_diffusion"] = False
     diffusion_cfg["sampler_fix"] = bool(diffusion_cfg.get("sampler_fix", False))

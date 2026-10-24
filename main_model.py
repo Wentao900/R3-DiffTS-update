@@ -198,6 +198,10 @@ class CSDI_base(nn.Module):
         self.benefit_eps = float(config["model"].get("benefit_eps", 1e-8))
         self.mask_noisy_target = bool(config["diffusion"].get("mask_noisy_target", False))
         self.valid_loss_main_only = bool(train_cfg.get("valid_loss_main_only", False))
+        # Validation redraws diffusion noise and the text-drop mask unless this
+        # is set. xattn fixes both so checkpoint selection is a pure function
+        # of the weights and the validation batch.
+        self.deterministic_valid = bool(train_cfg.get("deterministic_valid", False))
         if self.baseline_form == "none":
             self.pattern_residual_diffusion = False
         self.pattern_consistency_weight = float(train_cfg.get("pattern_consistency_weight", 0.03))
@@ -1530,6 +1534,15 @@ class CSDI_base(nn.Module):
     def calc_loss_valid(
         self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, text_pack=None
     ):
+        """Mean over diffusion steps of the loss used for checkpoint selection.
+
+        With ``valid_loss_main_only`` (on for xattn) that loss is L_main, the
+        masked MSE of the x0 prediction. L_E, L_MR, and the gate BCE are
+        training regularizers and are not the selection objective.
+        ``deterministic_valid`` draws the noise from a generator seeded by the
+        step index and keeps text injection on, so the same weights and batch
+        always return the same value.
+        """
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
@@ -1606,12 +1619,25 @@ class CSDI_base(nn.Module):
         else:
             t = torch.randint(0, self.num_steps, [B]).to(self.device)
         current_alpha = self.alpha_torch[t]
-        noise = torch.randn_like(diffusion_target)
+        if is_train != 1 and self.deterministic_valid:
+            # One draw from the standard generator at seed t. The seed is the
+            # diffusion index, so no extra constant is introduced.
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(set_t))
+            noise = torch.randn(diffusion_target.shape, generator=generator).to(
+                device=diffusion_target.device, dtype=diffusion_target.dtype
+            )
+        else:
+            noise = torch.randn_like(diffusion_target)
         noisy_data = (current_alpha ** 0.5) * diffusion_target + (1.0 - current_alpha) ** 0.5 * noise
 
         total_input = self.set_input_to_diffmodel(noisy_data, diffusion_target, cond_mask)
 
-        if self.cfg:
+        if self.cfg and is_train != 1 and self.deterministic_valid:
+            # Text drop is the CFG training regularizer. Selection scores the
+            # conditional branch, the one sampling starts from.
+            cfg_mask = torch.ones((B,), device=self.device)
+        elif self.cfg:
             cfg_mask = torch.bernoulli(torch.ones((B, )) - self.c_mask_prob).to(self.device)
         else:
             cfg_mask = None

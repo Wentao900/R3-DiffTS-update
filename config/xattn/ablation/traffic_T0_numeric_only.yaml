@@ -139,6 +139,7 @@ model:
   text_drop_prob: 1.0
   idf_fit_train_only: true
   text_encoder_eval: true
+  text_placeholder_absent: true
 dataset:
   aug_noise_std: 0.01
   aug_time_warp_prob: 0.3

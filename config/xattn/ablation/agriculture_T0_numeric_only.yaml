@@ -139,6 +139,7 @@ model:
   text_drop_prob: 1.0
   idf_fit_train_only: true
   text_encoder_eval: true
+  text_placeholder_absent: true
 dataset:
   use_all_numeric_features: true
   aug_noise_std: 0.01

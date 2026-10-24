@@ -9,6 +9,7 @@ from utils.prepare4llm import get_llm
 from utils.controller import ForecastPolicyController
 from utils.forecast_modules import CoarseForecastHead, UncertaintyHead
 from utils.text_gate import TextValidityGate, benefit_label
+from utils.text_presence import text_is_absent
 
 class moving_avg(nn.Module):
     """
@@ -121,6 +122,7 @@ class CSDI_base(nn.Module):
         # Legacy leaves the frozen text encoder in whatever mode model.train() sets.
         # xattn keeps it in eval so its dropout cannot change a repeated string.
         self.text_encoder_eval = bool(config["model"].get("text_encoder_eval", False))
+        self.text_placeholder_absent = bool(config["model"].get("text_placeholder_absent", False))
         self.text_encoder = None
         # Memo of eval-mode encodings. Keyed only by the string and the truncation
         # settings, so a value does not depend on the split or on other samples.
@@ -2726,8 +2728,7 @@ class CSDI_Forecasting(CSDI_base):
         marks = []
         items = texts if isinstance(texts, (list, tuple)) else [texts] * batch_size
         for item in list(items)[:batch_size]:
-            normalized = "" if item is None else str(item).strip()
-            marks.append(0.0 if normalized == "" or normalized.upper() == "NA" else 1.0)
+            marks.append(0.0 if text_is_absent(item, placeholder_absent=self.text_placeholder_absent) else 1.0)
         if len(marks) < batch_size:
             marks.extend([0.0] * (batch_size - len(marks)))
         return torch.tensor(marks, device=device, dtype=torch.float32)

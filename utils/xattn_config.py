@@ -50,6 +50,7 @@ def apply_entrypoint_overrides(config, freq="m"):
     model_cfg["benefit_eps"] = float(model_cfg.get("benefit_eps", 1e-8))
     model_cfg["idf_fit_train_only"] = bool(model_cfg.get("idf_fit_train_only", False))
     model_cfg["text_encoder_eval"] = bool(model_cfg.get("text_encoder_eval", False))
+    model_cfg["text_placeholder_absent"] = bool(model_cfg.get("text_placeholder_absent", False))
 
     diffusion_cfg = config.setdefault("diffusion", {})
     diffusion_cfg["mask_noisy_target"] = bool(diffusion_cfg.get("mask_noisy_target", False))

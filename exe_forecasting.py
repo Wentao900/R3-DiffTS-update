@@ -638,6 +638,7 @@ args.text_features_mode = str(config["model"].get("text_features_mode", dataset_
 args.skip_cot_generation = bool(config["model"].get("skip_cot_generation", False))
 args.numeric_summary_target_only = bool(config["model"].get("numeric_summary_target_only", False))
 args.idf_fit_train_only = bool(config["model"].get("idf_fit_train_only", False))
+args.text_placeholder_absent = bool(config["model"].get("text_placeholder_absent", False))
 if "text_drop_prob" in config["model"] and float(args.text_drop_prob) == 0.0:
     args.text_drop_prob = float(config["model"]["text_drop_prob"])
 

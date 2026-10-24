@@ -8,6 +8,7 @@ from utils.timefeatures import time_features
 from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
 from utils.trend_prior import build_trend_fields, trend_fields_to_vector
 from utils.prepare4llm import get_desc
+from utils.text_presence import text_is_absent
 
 try:
     from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -80,7 +81,8 @@ class Dataset_Custom(Dataset):
                  text_features_mode="legacy",
                  skip_cot_generation=False,
                  numeric_summary_target_only=False,
-                 idf_fit_train_only=False):
+                 idf_fit_train_only=False,
+                 text_placeholder_absent=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -150,6 +152,7 @@ class Dataset_Custom(Dataset):
         self.skip_cot_generation = bool(skip_cot_generation)
         self.numeric_summary_target_only = bool(numeric_summary_target_only)
         self.idf_fit_train_only = bool(idf_fit_train_only)
+        self.text_placeholder_absent = bool(text_placeholder_absent)
 
         self.root_path = root_path
         self.data_path = data_path
@@ -394,10 +397,9 @@ class Dataset_Custom(Dataset):
     def _normalize_text(self, text):
         if not isinstance(text, str):
             return ""
-        text = text.strip()
-        if text.upper() == "NA":
+        if text_is_absent(text, placeholder_absent=self.text_placeholder_absent):
             return ""
-        return text
+        return text.strip()
 
     def _tokenize_quality_text(self, text):
         normalized = self._normalize_text(text).lower()

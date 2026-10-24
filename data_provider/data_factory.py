@@ -73,6 +73,7 @@ def data_provider(args, flag):
         extra_kwargs['skip_cot_generation'] = getattr(args, "skip_cot_generation", False)
         extra_kwargs['numeric_summary_target_only'] = getattr(args, "numeric_summary_target_only", False)
         extra_kwargs['idf_fit_train_only'] = getattr(args, "idf_fit_train_only", False)
+        extra_kwargs['text_placeholder_absent'] = getattr(args, "text_placeholder_absent", False)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

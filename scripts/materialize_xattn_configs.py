@@ -100,6 +100,7 @@ def apply_a1(config, season_period, pred_len):
         "text_drop_prob": 0.0,
         "idf_fit_train_only": True,
         "text_encoder_eval": True,
+        "text_placeholder_absent": True,
     })
     config.setdefault("dataset", {})["text_features_mode"] = "none"
     return config

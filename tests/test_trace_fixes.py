@@ -8,8 +8,55 @@ import unittest
 import torch
 import yaml
 
+from data_provider.data_loader import Dataset_Custom
 from tests.synthetic_factory import make_model, xattn_config
 from main_model import CSDI_Forecasting
+from utils.text_presence import text_is_absent
+
+
+class PlaceholderMarkTests(unittest.TestCase):
+    def test_na_explanation_is_absent_only_when_enabled(self):
+        placeholder = "NA (No relevant information found for this window)"
+        self.assertFalse(text_is_absent(placeholder, placeholder_absent=False))
+        self.assertTrue(text_is_absent(placeholder, placeholder_absent=True))
+        self.assertTrue(text_is_absent("NA", placeholder_absent=False))
+        self.assertTrue(text_is_absent("  na  ", placeholder_absent=False))
+        self.assertFalse(text_is_absent("Napa valley prices rose", placeholder_absent=True))
+        self.assertFalse(text_is_absent("wheat prices rose", placeholder_absent=True))
+        self.assertTrue(text_is_absent("", placeholder_absent=True))
+
+    def test_loader_and_model_marks_agree_for_raw_and_retrieved(self):
+        class Holder:
+            text_placeholder_absent = True
+
+        normalize = Dataset_Custom._normalize_text
+        self.assertEqual(normalize(Holder(), "NA (No relevant information found)"), "")
+        self.assertEqual(normalize(Holder(), "NA"), "")
+        self.assertEqual(normalize(Holder(), "prices rose"), "prices rose")
+        Holder.text_placeholder_absent = False
+        self.assertEqual(normalize(Holder(), "NA (No relevant information found)"), "NA (No relevant information found)")
+
+        config = xattn_config(layers=1, num_steps=2)
+        config["model"]["text_placeholder_absent"] = True
+        model = CSDI_Forecasting(config, torch.device("cpu"), 2, [12, 4])
+        texts = [
+            "NA",
+            "NA (No relevant information found for this window)",
+            "prices rose",
+        ]
+        marks = model._mark_from_text_batch(texts, 3, torch.device("cpu"))
+        self.assertTrue(torch.equal(marks, torch.tensor([0.0, 0.0, 1.0])))
+        model.text_placeholder_absent = False
+        legacy = model._mark_from_text_batch(texts, 3, torch.device("cpu"))
+        self.assertTrue(torch.equal(legacy, torch.tensor([0.0, 1.0, 1.0])))
+
+    def test_xattn_configs_mark_placeholders_absent(self):
+        with open("config/xattn/economy_36_12_xattn.yaml") as handle:
+            a1 = yaml.safe_load(handle)
+        with open("config/xattn/ablation/traffic_T0_numeric_only.yaml") as handle:
+            t0 = yaml.safe_load(handle)
+        self.assertTrue(a1["model"]["text_placeholder_absent"])
+        self.assertTrue(t0["model"]["text_placeholder_absent"])
 
 
 class _DropoutEncoder(torch.nn.Module):

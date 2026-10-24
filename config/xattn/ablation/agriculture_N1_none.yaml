@@ -139,6 +139,7 @@ model:
   text_drop_prob: 0.0
   idf_fit_train_only: true
   text_encoder_eval: true
+  text_placeholder_absent: true
   pattern_residual_diffusion: false
 dataset:
   use_all_numeric_features: true

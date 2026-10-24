@@ -38,6 +38,7 @@ class RAGCoTConfig:
     two_stage_gate: bool = True
     trend_slope_eps: float = 1e-3
     debug: bool = False
+    skip_cot_generation: bool = False
 
 
 class RAGCoTPipeline:
@@ -56,6 +57,7 @@ class RAGCoTPipeline:
         lookback_len: int,
         pred_len: int,
         config: Optional[RAGCoTConfig] = None,
+        idf_fit_end_date=None,
     ) -> None:
         self.domain = domain
         self.desc = desc
@@ -69,6 +71,7 @@ class RAGCoTPipeline:
         self.rag_stage2_topk = self._resolve_stage2_topk(self.config.rag_stage2_topk)
         self.rag_stage1_topk = self._resolve_stage1_topk(self.config.rag_stage1_topk, self.rag_stage2_topk)
         self.search_df = self._prep_search_df(search_df)
+        self.idf_fit_end_date = None if idf_fit_end_date is None else pd.Timestamp(idf_fit_end_date)
         self.retriever = self._fit_retriever(self.search_df)
         self.generator = self._init_generator(self.config)
         self.cache: OrderedDict[str, Dict[str, str]] = OrderedDict()
@@ -99,10 +102,31 @@ class RAGCoTPipeline:
         return df
 
     def _fit_retriever(self, search_df: pd.DataFrame) -> Optional[Dict[str, object]]:
+        self.idf_fit_document_count = 0
         if search_df.empty or not self.config.use_retrieval:
             return None
         vectorizer = TfidfVectorizer(stop_words="english", max_features=4096, ngram_range=(1, 2))
-        matrix = vectorizer.fit_transform(search_df["fact"].tolist())
+        facts = search_df["fact"].tolist()
+        # Retrieval still searches the full corpus and filters by the sample cutoff.
+        # IDF and the vocabulary are fit only through the training-period end so
+        # validation and test documents cannot change the weights.
+        if self.idf_fit_end_date is not None and "end_date" in search_df.columns:
+            fit_mask = search_df["end_date"].notna() & (search_df["end_date"] <= self.idf_fit_end_date)
+            fit_facts = search_df.loc[fit_mask, "fact"].tolist()
+            if len(fit_facts) == 0:
+                self.idf_fit_document_count = 0
+                raise RuntimeError(
+                    "IDF fit refused: no documents have end_date on or before "
+                    f"{self.idf_fit_end_date}. Refusing to fit on the full corpus."
+                )
+            vectorizer.fit(fit_facts)
+            matrix = vectorizer.transform(facts)
+            fit_count = len(fit_facts)
+        else:
+            matrix = vectorizer.fit_transform(facts)
+            fit_count = len(facts)
+        self.idf_fit_document_count = int(fit_count)
+        print(f"[rag] IDF fit on {fit_count} documents (corpus {len(facts)})")
         return {"vectorizer": vectorizer, "matrix": matrix}
 
     def _init_generator(self, config: RAGCoTConfig):
@@ -189,7 +213,7 @@ class RAGCoTPipeline:
         ]
 
     def _cache_signature(self) -> Dict[str, object]:
-        return {
+        signature = {
             "domain": self.domain,
             "lookback_len": self.lookback_len,
             "pred_len": self.pred_len,
@@ -205,10 +229,26 @@ class RAGCoTPipeline:
             "rag_stage2_topk": int(self.config.rag_stage2_topk),
             "two_stage_gate": bool(self.config.two_stage_gate),
             "trend_slope_eps": float(self.config.trend_slope_eps),
+            "cache_version": 2,
+            "date_cutoff": True,
+            "skip_cot_generation": bool(getattr(self.config, "skip_cot_generation", False)),
         }
+        # Leave the legacy signature unchanged when IDF is fit on the whole corpus.
+        if self.idf_fit_end_date is not None:
+            signature["cache_version"] = 3
+            signature["idf_fit_train_only"] = True
+            signature["idf_fit_end"] = str(self.idf_fit_end_date)
+        return signature
 
-    def _make_cache_key(self, numeric_history: Sequence[float], start_date, end_date, base_text: str) -> str:
-        numeric_arr = np.asarray(numeric_history, dtype=np.float32)
+    def _select_numeric_history(self, numeric_history: Sequence[float], target_index=None):
+        arr = np.asarray(numeric_history, dtype=float)
+        if target_index is None or arr.ndim < 2 or arr.shape[-1] <= 1:
+            return arr
+        index = int(np.clip(int(target_index), 0, arr.shape[-1] - 1))
+        return arr[..., index]
+
+    def _make_cache_key(self, numeric_history: Sequence[float], start_date, end_date, base_text: str, target_index=None) -> str:
+        numeric_arr = np.asarray(self._select_numeric_history(numeric_history, target_index), dtype=np.float32)
         numeric_digest = hashlib.sha1(numeric_arr.tobytes()).hexdigest()
         payload = {
             "signature": self._cache_signature(),
@@ -217,6 +257,7 @@ class RAGCoTPipeline:
             "base_text_digest": hashlib.sha1(str(base_text).encode("utf-8")).hexdigest(),
             "numeric_shape": list(numeric_arr.shape),
             "numeric_digest": numeric_digest,
+            "target_index": None if target_index is None else int(target_index),
         }
         raw_key = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
@@ -588,8 +629,11 @@ class RAGCoTPipeline:
         query = self._build_query(numeric_summary, base_text)
         retrieved_records = self._retrieve_records(query, cutoff_end_date=cutoff_end_date)
         retrieved = [record["fact"] for record in retrieved_records]
-        prompt = self._format_prompt(numeric_summary, retrieved)
-        cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
+        if bool(getattr(self.config, "skip_cot_generation", False)):
+            cot_text = ""
+        else:
+            prompt = self._format_prompt(numeric_summary, retrieved)
+            cot_text = self._generate_cot(prompt, numeric_summary, retrieved)
         composed_text = self._compose_text(base_text, retrieved, cot_text)
         return {
             "cot_text": cot_text,
@@ -605,8 +649,11 @@ class RAGCoTPipeline:
         start_date,
         end_date,
         base_text: str,
+        target_index=None,
     ) -> Dict[str, str]:
-        cache_key = self._make_cache_key(numeric_history, start_date, end_date, base_text)
+        if target_index is not None:
+            numeric_history = self._select_numeric_history(numeric_history, target_index)
+        cache_key = self._make_cache_key(numeric_history, start_date, end_date, base_text, target_index=target_index)
         if cache_key in self.cache:
             return self.cache[cache_key]
         disk_cached = self._load_disk_cache(cache_key)

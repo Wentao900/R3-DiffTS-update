@@ -11,6 +11,7 @@ import math
 from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate, fit_forecast_calibrator
+from utils.xattn_config import apply_entrypoint_overrides, resolve_xattn_guide_w
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
@@ -416,10 +417,9 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
-# Force unified TAA + TTF path: always use texts, timestep embeddings, and timestep branch
-config["model"]["with_texts"] = True
-config["model"]["timestep_emb_cat"] = True
-config["model"]["timestep_branch"] = True
+# Legacy configs keep the forced text/timestep switches. xattn configs opt out.
+apply_entrypoint_overrides(config, freq=args.freq)
+args.guide_w = resolve_xattn_guide_w(config, args.guide_w, args.guide_list)
 args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
 args.cot_only = config["model"].get("cot_only", args.cot_only)
 args.use_two_stage_rag = config["model"].get("use_two_stage_rag", args.use_two_stage_rag)
@@ -453,7 +453,10 @@ if args.embed == 'timeF':
         config["model"]["timestep_dim"] = 0
 else:
     config["model"]["timestep_dim"] = 4 + extra_timestep_dims
-config["model"]["context_dim"] = context_dim_dict[config["model"]["llm"]] if config["model"]["with_texts"] else 0
+if str(config["model"].get("llm", "")).lower() == "hash":
+    config["model"]["context_dim"] = int(config["model"].get("context_dim", 768))
+else:
+    config["model"]["context_dim"] = context_dim_dict[config["model"]["llm"]] if config["model"]["with_texts"] else 0
 
 if args.datatype == 'electricity':
     target_dim = 370
@@ -631,6 +634,13 @@ args.text_quality_drop_threshold = float(config["model"].get("text_quality_drop_
 args.text_quality_mid_threshold = float(config["model"].get("text_quality_mid_threshold", 0.6))
 args.max_text_events = int(dataset_cfg.get("max_text_events", 12))
 args.num_workers = int(dataset_cfg.get("num_workers", args.num_workers))
+args.text_features_mode = str(config["model"].get("text_features_mode", dataset_cfg.get("text_features_mode", "legacy")))
+args.skip_cot_generation = bool(config["model"].get("skip_cot_generation", False))
+args.numeric_summary_target_only = bool(config["model"].get("numeric_summary_target_only", False))
+args.idf_fit_train_only = bool(config["model"].get("idf_fit_train_only", False))
+args.text_placeholder_absent = bool(config["model"].get("text_placeholder_absent", False))
+if "text_drop_prob" in config["model"] and float(args.text_drop_prob) == 0.0:
+    args.text_drop_prob = float(config["model"]["text_drop_prob"])
 
 args.batch_size = config["train"]["batch_size"]
 

@@ -1,6 +1,19 @@
 from data_provider.data_loader import Dataset_Custom, Dataset_ETT_hour, Dataset_ETT_minute
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
+
+
+def collate_forecast_batch(batch):
+    """Collate mixed tensor and string fields. String fields stay as lists."""
+    elem = batch[0]
+    if isinstance(elem, str):
+        return [item for item in batch]
+    if isinstance(elem, dict):
+        return {key: collate_forecast_batch([sample[key] for sample in batch]) for key in elem}
+    if isinstance(elem, (list, tuple)) and elem and isinstance(elem[0], str):
+        return [list(item) for item in batch]
+    return default_collate(batch)
 
 data_dict = {
     'custom': Dataset_Custom,
@@ -56,6 +69,11 @@ def data_provider(args, flag):
         extra_kwargs['text_quality_drop_threshold'] = getattr(args, "text_quality_drop_threshold", 0.3)
         extra_kwargs['text_quality_mid_threshold'] = getattr(args, "text_quality_mid_threshold", 0.6)
         extra_kwargs['max_text_events'] = getattr(args, "max_text_events", 12)
+        extra_kwargs['text_features_mode'] = getattr(args, "text_features_mode", "legacy")
+        extra_kwargs['skip_cot_generation'] = getattr(args, "skip_cot_generation", False)
+        extra_kwargs['numeric_summary_target_only'] = getattr(args, "numeric_summary_target_only", False)
+        extra_kwargs['idf_fit_train_only'] = getattr(args, "idf_fit_train_only", False)
+        extra_kwargs['text_placeholder_absent'] = getattr(args, "text_placeholder_absent", False)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,
@@ -73,5 +91,6 @@ def data_provider(args, flag):
         batch_size=batch_size,
         shuffle=shuffle_flag,
         num_workers=args.num_workers,
-        drop_last=drop_last)
+        drop_last=drop_last,
+        collate_fn=collate_forecast_batch)
     return data_set, data_loader

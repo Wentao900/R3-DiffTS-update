@@ -8,6 +8,7 @@ from utils.timefeatures import time_features
 from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
 from utils.trend_prior import build_trend_fields, trend_fields_to_vector
 from utils.prepare4llm import get_desc
+from utils.text_presence import text_is_absent
 
 try:
     from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -76,7 +77,12 @@ class Dataset_Custom(Dataset):
                  text_trend_raw_weight=1.0,
                  text_trend_ret_weight=0.35,
                  text_trend_cot_weight=0.15,
-                 max_text_events=12):
+                 max_text_events=12,
+                 text_features_mode="legacy",
+                 skip_cot_generation=False,
+                 numeric_summary_target_only=False,
+                 idf_fit_train_only=False,
+                 text_placeholder_absent=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -142,6 +148,11 @@ class Dataset_Custom(Dataset):
         self.text_trend_ret_weight = float(max(text_trend_ret_weight, 0.0))
         self.text_trend_cot_weight = float(max(text_trend_cot_weight, 0.0))
         self.max_text_events = int(max(max_text_events, 4))
+        self.text_features_mode = str(text_features_mode or "legacy").lower()
+        self.skip_cot_generation = bool(skip_cot_generation)
+        self.numeric_summary_target_only = bool(numeric_summary_target_only)
+        self.idf_fit_train_only = bool(idf_fit_train_only)
+        self.text_placeholder_absent = bool(text_placeholder_absent)
 
         self.root_path = root_path
         self.data_path = data_path
@@ -185,6 +196,7 @@ class Dataset_Custom(Dataset):
                 rag_stage2_topk=self.rag_stage2_topk,
                 two_stage_gate=self.two_stage_gate,
                 trend_slope_eps=self.trend_slope_eps,
+                skip_cot_generation=self.skip_cot_generation,
             )
             self.rag_cot = RAGCoTPipeline(
                 domain=self.domain,
@@ -193,6 +205,7 @@ class Dataset_Custom(Dataset):
                 lookback_len=self.seq_len,
                 pred_len=self.pred_len,
                 config=rag_cfg,
+                idf_fit_end_date=self.train_period_end if self.idf_fit_train_only else None,
             )
         else:
             self.rag_cot = None
@@ -384,10 +397,9 @@ class Dataset_Custom(Dataset):
     def _normalize_text(self, text):
         if not isinstance(text, str):
             return ""
-        text = text.strip()
-        if text.upper() == "NA":
+        if text_is_absent(text, placeholder_absent=self.text_placeholder_absent):
             return ""
-        return text
+        return text.strip()
 
     def _tokenize_quality_text(self, text):
         normalized = self._normalize_text(text).lower()
@@ -845,6 +857,9 @@ class Dataset_Custom(Dataset):
         
         first_start_date = df_num.start_date[border1]
         final_end_date = df_num.end_date[border2-1]
+        # Last numeric end date of the 70% training split. IDF uses this cutoff
+        # on every split; retrieval still uses each sample's own history end.
+        self.train_period_end = df_num.end_date[border2s[0] - 1]
 
         if self.use_all_numeric_features:
             feature_cols, feature_roles = self._resolve_numeric_feature_columns(df_num)
@@ -1018,6 +1033,7 @@ class Dataset_Custom(Dataset):
                     start_date=history_start_date,
                     end_date=history_end_date,
                     base_text=raw_text,
+                    target_index=self.target_index if self.numeric_summary_target_only else None,
                 )
                 composed_text = guidance["composed_text"]
                 cot_text = guidance["cot_text"]
@@ -1037,31 +1053,43 @@ class Dataset_Custom(Dataset):
         ) else 0
 
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
-        quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
-        trend_prior_text, source_priors = self._build_text_trend_components(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            seq_x,
-        )
-        text_evidence_vec = self._build_window_evidence(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            source_priors,
-            text_meta,
-            seq_x,
-        )
-        text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
-            raw_events=text_meta.get("raw_events", []),
-            retrieved_records=retrieved_records,
-            cot_text=cot_text,
-            seq_x=seq_x,
-            forecast_start_date=self.num_dates.start_date[r_begin],
-            raw_text=raw_text,
-        )
+        if self.text_features_mode == "none":
+            quality_pkg = {
+                "quality_raw": 0.0,
+                "quality_ret": 0.0,
+                "quality_cot": 0.0,
+                "quality_total": 0.0,
+            }
+            trend_prior_text = np.zeros_like(np.asarray(trend_prior_num, dtype=np.float32))
+            text_evidence_vec = np.zeros((7,), dtype=np.float32)
+            text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._pad_text_events([])
+        else:
+            quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
+            trend_prior_text, source_priors = self._build_text_trend_components(
+                raw_text,
+                rag_retrieved,
+                cot_text,
+                quality_pkg,
+                seq_x,
+            )
+            text_evidence_vec = self._build_window_evidence(
+                raw_text,
+                rag_retrieved,
+                cot_text,
+                quality_pkg,
+                source_priors,
+                text_meta,
+                seq_x,
+            )
+            text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
+                raw_events=text_meta.get("raw_events", []),
+                retrieved_records=retrieved_records,
+                cot_text=cot_text,
+                seq_x=seq_x,
+                forecast_start_date=self.num_dates.start_date[r_begin],
+                raw_text=raw_text,
+            )
+        text_raw_mark = np.asarray(float(len(self._normalize_text(raw_text)) > 0), dtype=np.float32)
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         if observed_data.shape[1] > 1:
@@ -1104,6 +1132,7 @@ class Dataset_Custom(Dataset):
             'text_quality_total': np.asarray(quality_pkg["quality_total"], dtype=np.float32),
             'text_ret_mark': np.asarray(float(len(self._normalize_text(rag_retrieved)) > 0), dtype=np.float32),
             'text_cot_mark': np.asarray(float(len(self._normalize_text(cot_text)) > 0), dtype=np.float32),
+            'text_raw_mark': text_raw_mark,
             'target_feature_index': np.asarray(self.target_index, dtype=np.int64),
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }

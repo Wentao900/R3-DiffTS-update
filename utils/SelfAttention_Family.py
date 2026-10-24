@@ -19,7 +19,7 @@ class FullAttention(nn.Module):
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, queries, keys, values, attn_mask):
+    def forward(self, queries, keys, values, attn_mask, key_padding_mask=None):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
@@ -35,7 +35,22 @@ class FullAttention(nn.Module):
 
             scores.masked_fill_(attn_mask.mask, -np.inf)
 
+        none_valid = None
+        if key_padding_mask is not None:
+            # True marks a valid key. This is the opposite of nn.MultiheadAttention,
+            # where True marks a position to ignore.
+            valid = key_padding_mask.to(device=scores.device).bool()
+            if valid.dim() == 1:
+                valid = valid.unsqueeze(0).expand(B, -1)
+            invalid = ~valid
+            scores = scores.masked_fill(invalid[:, None, None, :], float("-inf"))
+            none_valid = ~valid.any(dim=-1)
+            if none_valid.any():
+                scores = scores.masked_fill(none_valid[:, None, None, None], 0.0)
+
         A = torch.softmax(scale * scores, dim=-1)
+        if none_valid is not None and none_valid.any():
+            A = A.masked_fill(none_valid[:, None, None, None], 0.0)
         A_drop = self.dropout(A)
         V = torch.einsum("bhls,bshd->blhd", A_drop, values)
         #print('output shape',V.shape)
@@ -179,7 +194,7 @@ class AttentionLayer(nn.Module):
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
         self.n_heads = n_heads
 
-    def forward(self, queries, keys, values, attn_mask):
+    def forward(self, queries, keys, values, attn_mask, key_padding_mask=None):
         B, L, _ = queries.shape
         _, S, _ = keys.shape
         H = self.n_heads
@@ -192,7 +207,8 @@ class AttentionLayer(nn.Module):
             queries,
             keys,
             values,
-            attn_mask
+            attn_mask,
+            key_padding_mask=key_padding_mask,
         )
         out = out.view(B, L, -1)
 

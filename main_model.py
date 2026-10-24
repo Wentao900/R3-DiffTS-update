@@ -1389,8 +1389,7 @@ class CSDI_base(nn.Module):
         future_mask = target_mask[:, :, start:end].unsqueeze(1)
         future_target = observed_data[:, :, start:end].unsqueeze(1)
         residual = (experts - future_target) * future_mask
-        abs_res = residual.abs()
-        huber = torch.where(abs_res <= 1.0, 0.5 * residual ** 2, abs_res - 0.5)
+        huber = self._smooth_l1(residual)
         denom = future_mask.sum(dim=(2, 3)).clamp(min=1.0)
         expert_loss = huber.sum(dim=(2, 3)) / denom
         weighted = (pi * expert_loss).sum(dim=1).mean()
@@ -1420,8 +1419,7 @@ class CSDI_base(nn.Module):
             future_mask = target_mask[:, :, start:end].unsqueeze(1)
             future_target = observed_data[:, :, start:end].unsqueeze(1)
             residual = (pattern["expert_futures"] - future_target) * future_mask
-            abs_res = residual.abs()
-            huber = torch.where(abs_res <= 1.0, 0.5 * residual ** 2, abs_res - 0.5)
+            huber = self._smooth_l1(residual)
             denom = future_mask.sum(dim=(2, 3)).clamp(min=1.0)
             expert_loss = huber.sum(dim=(2, 3)) / denom
             weighted_expert_loss = (pattern["pi"] * expert_loss).sum(dim=1)
@@ -1435,6 +1433,16 @@ class CSDI_base(nn.Module):
                 legacy_aux = legacy_aux + self.pattern_expert_weight * weighted_expert_loss
             return legacy_aux
         return aux
+
+    def _smooth_l1(self, residual):
+        """Huber penalty. δ is multi_res_huber_delta (default 1, the old literal)."""
+        delta = float(self.multi_res_huber_delta)
+        abs_res = residual.abs()
+        return torch.where(
+            abs_res <= delta,
+            0.5 * residual.square(),
+            delta * abs_res - 0.5 * (delta ** 2),
+        )
 
     def _per_sample_target_mse(self, prediction, target, target_mask):
         residual = (target - prediction) * target_mask

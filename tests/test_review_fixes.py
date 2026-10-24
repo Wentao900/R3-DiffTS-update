@@ -14,7 +14,7 @@ import yaml
 
 from diff_models import ResidualBlock
 from main_model import CSDI_Forecasting
-from tests.synthetic_factory import xattn_config
+from tests.synthetic_factory import make_model, xattn_config
 
 
 class _StepRecorder(torch.nn.Module):
@@ -153,6 +153,26 @@ def _feature_dropout_p(block):
     layer = block.feature_layer.layers[0]
     dropouts = [module.p for module in layer.modules() if isinstance(module, torch.nn.Dropout)]
     return dropouts[0]
+
+
+class HuberDeltaTests(unittest.TestCase):
+    def _loss(self, delta, residual_value):
+        model = make_model(lookback=12, pred=4, layers=1)
+        model.multi_res_huber_delta = delta
+        model.pattern_expert_weight = 1.0
+        experts = torch.full((1, 1, 2, 4), residual_value)
+        observed = torch.zeros(1, 2, 16)
+        mask = torch.zeros(1, 2, 16)
+        mask[:, :, 12:] = 1.0
+        pattern = {"expert_futures": experts, "pi": torch.ones(1, 1)}
+        return float(model._calc_simple_expert_loss(pattern, observed, mask))
+
+    def test_expert_huber_reads_config_delta(self):
+        # |r|=1.5. δ=2 stays in the quadratic piece; δ=1 uses the linear piece.
+        self.assertAlmostEqual(self._loss(2.0, 1.5), 0.5 * 1.5 ** 2)
+        self.assertAlmostEqual(self._loss(1.0, 1.5), 1.5 - 0.5)
+        model = make_model(layers=1)
+        self.assertEqual(model.multi_res_huber_delta, 1.0)
 
 
 class TowerDropoutTests(unittest.TestCase):

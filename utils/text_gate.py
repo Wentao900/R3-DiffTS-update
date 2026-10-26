@@ -20,6 +20,15 @@ class TextValidityGate(nn.Module):
         self.a = nn.Parameter(torch.zeros(1))
         self.b = nn.Parameter(torch.zeros(1))
         self.beta = nn.Parameter(torch.zeros(self.n_sources))
+        self.beta_mask = None
+        self.omit_similarity = False
+
+    def set_identifiable_betas(self, keep):
+        """R2: a False entry folds that beta into b by multiplying it by zero."""
+        mask = torch.tensor([1.0 if flag else 0.0 for flag in keep], dtype=torch.float32)
+        if mask.numel() != self.n_sources:
+            raise ValueError("beta mask length %d does not match n_sources %d" % (mask.numel(), self.n_sources))
+        self.beta_mask = mask
 
     def forward(self, similarity, source_mask, any_mask=None):
         """
@@ -35,7 +44,11 @@ class TextValidityGate(nn.Module):
             any_mask = (source_mask.sum(dim=-1) > 0).to(dtype=similarity.dtype)
         else:
             any_mask = any_mask.reshape(-1).to(device=similarity.device, dtype=similarity.dtype)
-        logit = self.a * similarity + self.b + (source_mask * self.beta.view(1, -1)).sum(dim=-1)
+        beta = self.beta
+        if self.beta_mask is not None:
+            beta = beta * self.beta_mask.to(device=beta.device, dtype=beta.dtype)
+        similarity_term = 0.0 if self.omit_similarity else self.a * similarity
+        logit = similarity_term + self.b + (source_mask * beta.view(1, -1)).sum(dim=-1)
         return any_mask * torch.sigmoid(logit)
 
 

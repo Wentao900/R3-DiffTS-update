@@ -18,6 +18,10 @@ class FullAttention(nn.Module):
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
+        self.time_axis = False
+        self._dropout_mode = None
+        self._dropout_masks = []
+        self._dropout_cursor = 0
 
     def forward(self, queries, keys, values, attn_mask, key_padding_mask=None):
         B, L, H, E = queries.shape
@@ -51,7 +55,7 @@ class FullAttention(nn.Module):
         A = torch.softmax(scale * scores, dim=-1)
         if none_valid is not None and none_valid.any():
             A = A.masked_fill(none_valid[:, None, None, None], 0.0)
-        A_drop = self.dropout(A)
+        A_drop = self._apply_attention_dropout(A)
         V = torch.einsum("bhls,bshd->blhd", A_drop, values)
         #print('output shape',V.shape)
 
@@ -59,6 +63,30 @@ class FullAttention(nn.Module):
             return (V.contiguous(), A)
         else:
             return (V.contiguous(), None)
+
+    def _apply_attention_dropout(self, weights):
+        """Default path is nn.Dropout. The shared-mask path is only for the time axis.
+
+        The reference forward that builds the text-benefit label replays the mask
+        drawn by the main forward, so the label is not a second dropout sample.
+        The keep probability stays ``1 - p`` with the module's existing ``p``.
+        """
+        mode = self._dropout_mode if self.time_axis else None
+        probability = float(self.dropout.p)
+        if mode == "record" and self.training and probability > 0:
+            keep = torch.bernoulli(
+                torch.full(weights.shape, 1.0 - probability, device=weights.device, dtype=weights.dtype)
+            )
+            mask = keep / (1.0 - probability)
+            self._dropout_masks.append(mask.detach())
+            return weights * mask
+        if mode == "replay" and probability > 0:
+            if self._dropout_cursor >= len(self._dropout_masks):
+                raise RuntimeError("time-attention dropout replay ran out of masks from the main forward")
+            mask = self._dropout_masks[self._dropout_cursor]
+            self._dropout_cursor += 1
+            return weights * mask.to(device=weights.device, dtype=weights.dtype)
+        return self.dropout(weights)
 
         
 class SparseAttention(nn.Module):

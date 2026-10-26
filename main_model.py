@@ -126,6 +126,17 @@ class CSDI_base(nn.Module):
         # xattn keeps it in eval so its dropout cannot change a repeated string.
         self.text_encoder_eval = bool(config["model"].get("text_encoder_eval", False))
         self.text_placeholder_absent = bool(config["model"].get("text_placeholder_absent", False))
+        self.text_sources_mode = str(config["model"].get("text_sources", "configured")).lower()
+        self.gate_beta_mode = str(config["model"].get("gate_beta", "all")).lower()
+        self.gate_constant_source = str(config["model"].get("gate_constant_source", "cumulative")).lower()
+        self.gate_ref_shared_dropout = bool(config["model"].get("gate_ref_shared_dropout", False))
+        self.log_control_calls = bool(config["model"].get("log_control_calls", False))
+        self.control_log = {} if self.log_control_calls else None
+        self.dropped_sources = []
+        self.infer_mask_sources = []
+        self.infer_guide_w = None
+        self.infer_gate_constant = None
+        self.source_decision = None
         self.text_encoder = None
         # Memo of eval-mode encodings. Keyed only by the string and the truncation
         # settings, so a value does not depend on the split or on other samples.
@@ -202,6 +213,10 @@ class CSDI_base(nn.Module):
         # is set. xattn fixes both so checkpoint selection is a pure function
         # of the weights and the validation batch.
         self.deterministic_valid = bool(train_cfg.get("deterministic_valid", False))
+        self.valid_t_schedule = str(train_cfg.get("valid_t_schedule", "all")).lower()
+        self.ddim_x0_endpoint = bool(config["diffusion"].get("ddim_x0_endpoint", False))
+        self.ddim_unique_steps = bool(config["diffusion"].get("ddim_unique_steps", False))
+        self.time_attn_dropout = float(config["diffusion"].get("time_attn_dropout", 0.1))
         if self.baseline_form == "none":
             self.pattern_residual_diffusion = False
         self.pattern_consistency_weight = float(train_cfg.get("pattern_consistency_weight", 0.03))
@@ -395,10 +410,18 @@ class CSDI_base(nn.Module):
                 )
         if self.baseline_form == "dlinear":
             self.dlinear_baseline = DLinearBaseline(self.lookback_len, self.pred_len)
-        if self.text_validity_gate and self.text_gate_mode == "learned":
+        if self.text_validity_gate and self.text_gate_mode in ("learned", "source_only"):
             self.text_gate = TextValidityGate(self.n_text_sources)
         self.register_buffer("gate_label_sum", torch.zeros((), dtype=torch.float32))
         self.register_buffer("gate_label_count", torch.zeros((), dtype=torch.float32))
+        # Epoch buffers exist only for gate_constant_source=last_epoch. A cumulative
+        # checkpoint from a90347e has no extra keys, so --modelfolder can still load it.
+        if self.gate_constant_source == "last_epoch":
+            self.register_buffer("gate_epoch_sum", torch.zeros((), dtype=torch.float32))
+            self.register_buffer("gate_epoch_count", torch.zeros((), dtype=torch.float32))
+            self.register_buffer("gate_last_epoch_mean", torch.tensor(0.5))
+            # Saved with the weights so inference after load keeps the closed epoch mean.
+            self.register_buffer("gate_epoch_closed", torch.zeros((), dtype=torch.float32))
         if self.use_coarse_forecast_head:
             self.coarse_forecast_head = CoarseForecastHead(
                 lookback_len=self.lookback_len,
@@ -435,6 +458,7 @@ class CSDI_base(nn.Module):
         config_diff["text_mode"] = "legacy" if self.text_injection in ("legacy", "off") else self.text_injection
         config_diff["n_text_sources"] = self.n_text_sources
         config_diff["tower_dropout"] = config["diffusion"].get("tower_dropout", None)
+        config_diff["time_attn_dropout"] = self.time_attn_dropout
         config_diff["time_weight"] = config["diffusion"]["time_weight"]
         config_diff["save_attn"] = config["model"]["save_attn"]
 
@@ -446,6 +470,7 @@ class CSDI_base(nn.Module):
             self.diffmodel_sesonal = diff_CSDI(config_diff, input_dim, mode_num=mode_num)
         else:
             self.diffmodel = diff_CSDI(config_diff, input_dim, mode_num=mode_num)
+        self._attach_control_log()
 
         self.num_steps = config_diff["num_steps"]
         if config_diff["schedule"] == "quad":
@@ -1479,6 +1504,13 @@ class CSDI_base(nn.Module):
         return (residual ** 2).sum(dim=(1, 2)) / denom
 
     def _current_gate_constant(self):
+        if self.gate_constant_source == "last_epoch":
+            # The constant is the previous epoch's label mean, not the running mean
+            # over the whole training run (最优方案 C6). 0.5 is the empty-buffer value
+            # already used before any label has been seen.
+            if float(self.gate_epoch_closed.detach()) <= 0:
+                return self.gate_last_epoch_mean.new_tensor(0.5)
+            return self.gate_last_epoch_mean.clamp(0.0, 1.0)
         if float(self.gate_label_count.detach()) <= 0:
             return self.gate_label_sum.new_tensor(0.5)
         return (self.gate_label_sum / self.gate_label_count.clamp(min=1.0)).clamp(0.0, 1.0)
@@ -1489,6 +1521,59 @@ class CSDI_base(nn.Module):
         with torch.no_grad():
             self.gate_label_sum.add_(label.detach()[valid].float().sum())
             self.gate_label_count.add_(valid.float().sum())
+            if self.gate_constant_source == "last_epoch":
+                self.gate_epoch_sum.add_(label.detach()[valid].float().sum())
+                self.gate_epoch_count.add_(valid.float().sum())
+
+    def close_gate_label_epoch(self):
+        """Store this epoch's label mean and clear the epoch counters."""
+        if self.gate_constant_source != "last_epoch":
+            return
+        if float(self.gate_epoch_count.detach()) > 0:
+            mean = (self.gate_epoch_sum / self.gate_epoch_count.clamp(min=1.0)).clamp(0.0, 1.0)
+            self.gate_last_epoch_mean.copy_(mean)
+            self.gate_epoch_closed.fill_(1.0)
+        self.gate_epoch_sum.zero_()
+        self.gate_epoch_count.zero_()
+
+    def apply_source_decision(self, decision):
+        """R1 drops unused sources. R2 keeps only identifiable betas. Embeddings stay."""
+        self.source_decision = decision
+        if self.text_sources_mode == "auto_from_train":
+            self.dropped_sources = list(decision["dropped"])
+        else:
+            self.dropped_sources = []
+        if self.gate_beta_mode == "auto_identifiable" and self.text_gate is not None:
+            keep = list(decision["beta_keep"])
+            if len(keep) < self.text_gate.n_sources:
+                keep = keep + [False] * (self.text_gate.n_sources - len(keep))
+            self.text_gate.set_identifiable_betas(keep[: self.text_gate.n_sources])
+        n_beta = int(sum(decision["beta_keep"])) if self.gate_beta_mode == "auto_identifiable" else int(self.n_text_sources)
+        if self.text_gate_mode == "source_only":
+            n_params = 1 + n_beta
+        elif self.text_gate_mode == "learned":
+            n_params = 2 + (n_beta if self.gate_beta_mode == "auto_identifiable" else int(self.n_text_sources))
+        else:
+            n_params = 0
+        kept = [name for name, flag in zip(decision["sources"], decision["used"]) if flag or self.text_sources_mode != "auto_from_train"]
+        if self.text_sources_mode != "auto_from_train":
+            kept = list(decision["sources"])
+        print(
+            "[gate] sources=%s dropped=%s beta_keep=%s gate_parameters=%d"
+            % (kept, self.dropped_sources, decision["beta_keep"], n_params)
+        )
+        return {"sources": kept, "dropped": list(self.dropped_sources), "beta_keep": list(decision["beta_keep"]), "gate_parameters": n_params}
+
+    def _arm_time_dropout(self, mode):
+        from utils.SelfAttention_Family import FullAttention
+        for module in self.modules():
+            if isinstance(module, FullAttention) and getattr(module, "time_axis", False):
+                if mode == "record":
+                    module._dropout_masks = []
+                    module._dropout_cursor = 0
+                if mode == "replay":
+                    module._dropout_cursor = 0
+                module._dropout_mode = mode
 
     def _text_gate_value(self, similarity, source_mask):
         batch = int(similarity.shape[0])
@@ -1501,11 +1586,18 @@ class CSDI_base(nn.Module):
             elif source_mask.shape[-1] > self.n_text_sources:
                 source_mask = source_mask[:, : self.n_text_sources]
         any_mask = (source_mask.sum(dim=-1) > 0).to(dtype=similarity.dtype)
+        if self.log_control_calls:
+            self.control_log["gate_calls"] = self.control_log.get("gate_calls", 0) + int(similarity.shape[0])
         if self.text_gate_mode == "one":
             return any_mask
         if self.text_gate_mode == "constant":
-            constant = self._current_gate_constant().to(device=similarity.device, dtype=similarity.dtype)
+            if self.infer_gate_constant is not None:
+                constant = similarity.new_tensor(float(self.infer_gate_constant))
+            else:
+                constant = self._current_gate_constant().to(device=similarity.device, dtype=similarity.dtype)
             return any_mask * constant
+        if self.text_gate is not None:
+            self.text_gate.omit_similarity = self.text_gate_mode == "source_only"
         if self.text_gate is None:
             return any_mask
         return self.text_gate(similarity.detach(), source_mask, any_mask)
@@ -1544,12 +1636,18 @@ class CSDI_base(nn.Module):
         always return the same value.
         """
         loss_sum = 0
-        for t in range(self.num_steps):
+        # C14 stays on every diffusion index unless valid_t_schedule is "sampling".
+        if self.valid_t_schedule == "sampling" and self.ddim:
+            schedule, _ = self._build_ddim_schedule()
+            step_ids = [int(value) for value in schedule]
+        else:
+            step_ids = list(range(self.num_steps))
+        for t in step_ids:
             loss = self.calc_loss(
                 observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior, pattern_text_pooled=pattern_text_pooled, pattern_text_mask=pattern_text_mask, pattern_text_evidence_vec=pattern_text_evidence_vec, controller_state=controller_state, text_pack=text_pack
             )
             loss_sum += loss.detach()
-        return loss_sum / self.num_steps
+        return loss_sum / max(len(step_ids), 1)
 
     def calc_loss(
         self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None, pattern_text_pooled=None, pattern_text_mask=None, pattern_text_evidence_vec=None, controller_state=None, set_t=-1, text_pack=None
@@ -1646,8 +1744,10 @@ class CSDI_base(nn.Module):
             self.text_injection == "gated"
             and text_pack is not None
             and is_train == 1
-            and self.text_gate_mode in ("learned", "constant")
+            and self.text_gate_mode in ("learned", "constant", "source_only")
         )
+        if want_similarity and self.gate_ref_shared_dropout:
+            self._arm_time_dropout("record")
         predicted, text_similarity = self._run_diffusion_model(
             total_input,
             side_info,
@@ -1663,6 +1763,8 @@ class CSDI_base(nn.Module):
         validity_loss = torch.zeros((), device=observed_data.device)
         if want_similarity and text_similarity is not None and cfg_mask is not None:
             with torch.no_grad():
+                if self.gate_ref_shared_dropout:
+                    self._arm_time_dropout("replay")
                 reference_mask = 1.0 - cfg_mask.reshape(-1)
                 reference, _ = self._run_diffusion_model(
                     total_input,
@@ -1687,12 +1789,14 @@ class CSDI_base(nn.Module):
             else:
                 any_valid = source_mask.reshape(observed_data.shape[0], -1).sum(dim=-1) > 0
             self._update_gate_label_mean(label, any_valid)
-            if self.text_gate_mode == "learned" and self.text_validity_loss and self.text_gate is not None and bool(any_valid.any()):
+            if self.text_gate_mode in ("learned", "source_only") and self.text_validity_loss and self.text_gate is not None and bool(any_valid.any()):
                 gate = self._text_gate_value(text_similarity.detach(), source_mask)
                 validity_loss = F.binary_cross_entropy(
                     gate[any_valid].clamp(1e-6, 1.0 - 1e-6),
                     label[any_valid].clamp(0.0, 1.0),
                 )
+        if self.gate_ref_shared_dropout:
+            self._arm_time_dropout(None)
 
         if self.timestep_outer_mix != "none" and self.timestep_branch and timesteps is not None:
             predicted_from_timestep = self.timestep_pred(timesteps)
@@ -2130,6 +2234,9 @@ class CSDI_base(nn.Module):
         sim_cond = similarity[:batch] if similarity is not None else predicted.new_zeros((batch,))
         gate = self._text_gate_value(sim_cond, text_pack.get("source_mask"))
         gate = gate.view(batch, 1, 1).to(dtype=predicted.dtype)
+        self._last_gate = gate.detach()
+        if self.log_control_calls:
+            self.control_log["cfg_combines"] = self.control_log.get("cfg_combines", 0) + int(batch)
         return pred_null + float(guide_weight) * gate * (pred_cond - pred_null)
 
     def _build_ddim_schedule(self):
@@ -2143,6 +2250,23 @@ class CSDI_base(nn.Module):
             raise NotImplementedError(f"sampling method {self.sample_method} is not implemented!")
         time_steps = time_steps + 1
         time_steps_prev = np.concatenate([[0], time_steps[:-1]])
+        requested = int(len(time_steps))
+        if self.ddim_unique_steps:
+            # Integer truncation of the quad grid repeats τ. A repeated step is a no-op
+            # under the corrected coefficient, so it is dropped. The 0.8 factor is unchanged.
+            kept = []
+            seen = set()
+            for value in time_steps.tolist():
+                value = int(value)
+                if value in seen:
+                    continue
+                seen.add(value)
+                kept.append(value)
+            time_steps = np.asarray(kept, dtype=int)
+            time_steps_prev = np.concatenate([[0], time_steps[:-1]])
+            if not getattr(self, "_ddim_steps_logged", False):
+                print("[ddim] effective steps %d (requested %d)" % (len(time_steps), requested))
+                self._ddim_steps_logged = True
         return time_steps, time_steps_prev
 
     def _denoiser_step_index(self, loop_index, time_steps):
@@ -2171,10 +2295,12 @@ class CSDI_base(nn.Module):
         B, K, L = observed_data.shape
         if self.ddim:
             time_steps, time_steps_prev = self._build_ddim_schedule()
+            reverse_steps = len(time_steps)
         else:
             self.sample_steps = self.num_steps
             time_steps = None
             time_steps_prev = None
+            reverse_steps = self.sample_steps
         if not self.noise_esti:
             observed_data, means, stdev = self._standardize_observed(observed_data, cond_mask)
 
@@ -2218,7 +2344,7 @@ class CSDI_base(nn.Module):
                     noisy_cond_history.append(noisy_obs * cond_mask)
 
             current_sample = torch.randn_like(diffusion_observed_data)
-            for t in range(self.sample_steps - 1, -1, -1):
+            for t in range(reverse_steps - 1, -1, -1):
                 denoise_t = self._denoiser_step_index(t, time_steps)
                 if self.is_unconditional == True:
                     if self.ddim and self.sampler_fix:
@@ -2327,12 +2453,18 @@ class CSDI_base(nn.Module):
                                 ) ** 0.5
                                 current_sample += sigma * noise
                     else:
-                        tau, tau_prev = time_steps[t], time_steps_prev[t]
-                        aaa_ = self._ddim_x0_direction_coeff(self.alpha[tau_prev], self.alpha[tau])
-                        current_sample = (
-                            aaa_ * current_sample +
-                            ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
-                        )
+                        # The last reverse step is t == 0. With ddim_x0_endpoint it returns
+                        # the network x0, matching the sampler_fix DDPM endpoint. Earlier
+                        # steps keep the η=0 DDIM update.
+                        if self.ddim_x0_endpoint and t == 0:
+                            current_sample = predicted
+                        else:
+                            tau, tau_prev = time_steps[t], time_steps_prev[t]
+                            aaa_ = self._ddim_x0_direction_coeff(self.alpha[tau_prev], self.alpha[tau])
+                            current_sample = (
+                                aaa_ * current_sample +
+                                ((self.alpha[tau_prev])**0.5 - (self.alpha[tau])**0.5 * aaa_) * predicted
+                            )
 
             sample = current_sample.detach()
             if pattern_baseline is not None:
@@ -2898,6 +3030,33 @@ class CSDI_Forecasting(CSDI_base):
             self.tokenizer.truncation_side = previous_side
         return hidden, pooled, token_input["attention_mask"]
 
+    def _apply_source_masks(self, raw_mark, ret_mark, cot_mark):
+        """Zero marks for sources dropped by R1 or by an inference override."""
+        blocked = set(self.dropped_sources) | set(self.infer_mask_sources)
+        if not blocked:
+            return raw_mark, ret_mark, cot_mark
+        def _zero(mark, name):
+            if name not in blocked or mark is None:
+                return mark
+            if self.log_control_calls:
+                self.control_log["mask_" + name] = self.control_log.get("mask_" + name, 0) + 1
+            return torch.zeros_like(mark)
+        return _zero(raw_mark, "raw"), _zero(ret_mark, "ret"), _zero(cot_mark, "cot")
+
+    def _attach_control_log(self):
+        if not self.log_control_calls:
+            return
+        denoisers = []
+        if getattr(self, "diffmodel", None) is not None:
+            denoisers.append(self.diffmodel)
+        if getattr(self, "diffmodel_sesonal", None) is not None:
+            denoisers.append(self.diffmodel_sesonal)
+        if getattr(self, "diffmodel_trend", None) is not None:
+            denoisers.append(self.diffmodel_trend)
+        for denoiser in denoisers:
+            for block in getattr(denoiser, "residual_layers", []):
+                block.control_log = self.control_log
+
     def _build_text_pack(self, text_raw, text_ret, text_cot, raw_mark, ret_mark, cot_mark, router_text_mask):
         batch = int(raw_mark.shape[0])
         sources = [
@@ -3270,6 +3429,7 @@ class CSDI_Forecasting(CSDI_base):
         if self.with_texts and (self.text_injection == "gated" or self.pattern_router_mode == "linear_history_text"):
             if text_raw_mark is None:
                 text_raw_mark = self._mark_from_text_batch(text_raw if text_raw is not None else texts, observed_data.shape[0], self.device)
+            text_raw_mark, text_ret_mask, text_cot_mask = self._apply_source_masks(text_raw_mark, text_ret_mask, text_cot_mask)
             shuffled = self._maybe_shuffle_text_alignment({
                 "text_raw": text_raw if text_raw is not None else texts,
                 "text_ret": text_ret,
@@ -3356,6 +3516,8 @@ class CSDI_Forecasting(CSDI_base):
         )
 
     def evaluate(self, batch, n_samples, guide_w):
+        if self.infer_guide_w is not None:
+            guide_w = self.infer_guide_w
         data = self.process_data(batch)
         observed_data, observed_mask, observed_tp, gt_mask, unpacked = self._unpack_forecasting_batch(data)
         feature_id = unpacked["feature_id"]
@@ -3388,6 +3550,7 @@ class CSDI_Forecasting(CSDI_base):
             if self.with_texts and (self.text_injection == "gated" or self.pattern_router_mode == "linear_history_text"):
                 if text_raw_mark is None:
                     text_raw_mark = self._mark_from_text_batch(text_raw if text_raw is not None else texts, observed_data.shape[0], self.device)
+                text_raw_mark, text_ret_mask, text_cot_mask = self._apply_source_masks(text_raw_mark, text_ret_mask, text_cot_mask)
                 shuffled = self._maybe_shuffle_text_alignment({
                     "text_raw": text_raw if text_raw is not None else texts,
                     "text_ret": text_ret,

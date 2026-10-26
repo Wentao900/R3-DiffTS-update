@@ -22,9 +22,12 @@ def get_linear_trans(heads=8,layers=1,channels=64,localheads=0,localwindow=0):
         local_attn_window_size = 0,
     )
 
-def get_custom_tv_trans(heads=8, layers=1, channels=64, dropout=0.0, pre_norm=False):
+def get_custom_tv_trans(heads=8, layers=1, channels=64, dropout=0.0, pre_norm=False, attention_dropout=0.1):
+    # 0.1 is the historical FullAttention default, now readable from the config.
+    attention = FullAttention(mask_flag=False, attention_dropout=attention_dropout)
+    attention.time_axis = True
     encoder_layer = TV_AttentionLayer(
-        FullAttention(mask_flag=False),
+        attention,
         d_t=channels//4,
         d_v=channels,
         n_heads=heads
@@ -75,7 +78,7 @@ class DiffusionEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False, with_text=False, context_dim=None, dropout=0., attn_drop=0., pre_norm=False, pred_len=-1, use_tv=False, text_mode="legacy", tower_dropout=None):
+    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False, with_text=False, context_dim=None, dropout=0., attn_drop=0., pre_norm=False, pred_len=-1, use_tv=False, text_mode="legacy", tower_dropout=None, time_attn_dropout=0.1):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
@@ -102,7 +105,10 @@ class ResidualBlock(nn.Module):
             else:
                 tower_dropout = float(tower_dropout)
             if use_tv:
-                self.time_layer = get_custom_tv_trans(heads=nheads, layers=1, channels=channels, dropout=dropout, pre_norm=pre_norm)
+                self.time_layer = get_custom_tv_trans(
+                    heads=nheads, layers=1, channels=channels, dropout=dropout, pre_norm=pre_norm,
+                    attention_dropout=time_attn_dropout,
+                )
             else:
                 self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels, dropout=tower_dropout)
             self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels, dropout=tower_dropout)
@@ -221,6 +227,9 @@ class ResidualBlock(nn.Module):
         )
         scale = inject * row_valid * torch.tanh(self.text_alpha).to(dtype=y.dtype)
         delta = attn_out.transpose(1, 2) * scale.view(batch, 1, 1)
+        if getattr(self, "control_log", None) is not None:
+            self.control_log["xattn_calls"] = self.control_log.get("xattn_calls", 0) + int(scale.shape[0])
+            self.control_log["xattn_nonzero"] = self.control_log.get("xattn_nonzero", 0) + int((scale.detach().abs() > 0).sum().item())
         return y + delta, text_stats
 
     def forward(self, x, cond_info, diffusion_emb, timesteps_emb=None, context=None, text_memory=None, text_token_mask=None, text_inject=None, return_text_stats=False):
@@ -335,6 +344,7 @@ class diff_CSDI(nn.Module):
                     use_tv=config.get("with_timestep", False),
                     text_mode=self.text_mode,
                     tower_dropout=config.get("tower_dropout", None),
+                    time_attn_dropout=float(config.get("time_attn_dropout", 0.1)),
                 )
                 for _ in range(config["layers"])
             ]

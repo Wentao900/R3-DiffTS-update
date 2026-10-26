@@ -74,6 +74,14 @@ def data_provider(args, flag):
         extra_kwargs['numeric_summary_target_only'] = getattr(args, "numeric_summary_target_only", False)
         extra_kwargs['idf_fit_train_only'] = getattr(args, "idf_fit_train_only", False)
         extra_kwargs['text_placeholder_absent'] = getattr(args, "text_placeholder_absent", False)
+        extra_kwargs['ext_text_mode'] = getattr(args, "ext_text_mode", "tfidf")
+        extra_kwargs['ext_future_year_filter'] = getattr(args, "ext_future_year_filter", False)
+        extra_kwargs['raw_placeholder_filter'] = getattr(args, "raw_placeholder_filter", False)
+        extra_kwargs['text_max_length'] = getattr(args, "text_max_length", None)
+        extra_kwargs['text_shift_mode'] = getattr(args, "text_shift_mode", "none")
+        extra_kwargs['text_shift_splits'] = getattr(args, "text_shift_splits", None)
+        extra_kwargs['rag_query_unaugmented'] = getattr(args, "rag_query_unaugmented", False)
+        extra_kwargs['record_window_index'] = getattr(args, "record_window_index", False)
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,

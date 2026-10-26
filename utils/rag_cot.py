@@ -14,6 +14,7 @@ import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils.text_protocol import strip_na_tokens
 
 
 @dataclass
@@ -39,6 +40,7 @@ class RAGCoTConfig:
     trend_slope_eps: float = 1e-3
     debug: bool = False
     skip_cot_generation: bool = False
+    query_drop_na: bool = False
 
 
 class RAGCoTPipeline:
@@ -531,7 +533,11 @@ class RAGCoTPipeline:
         return stripped == "" or stripped.upper() == "NA"
 
     def _build_query(self, numeric_summary: str, base_text: str) -> str:
-        return f"{self.domain} {numeric_summary} {base_text}"
+        query = f"{self.domain} {numeric_summary} {base_text}"
+        if self.config.query_drop_na:
+            # C17. Standalone NA is the missing-text sentinel, not a query term.
+            query = strip_na_tokens(query)
+        return query
 
     def _build_stage2_query(self, base_query: str, trend_hypothesis: str) -> str:
         return (

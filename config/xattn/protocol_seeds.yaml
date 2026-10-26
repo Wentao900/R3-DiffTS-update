@@ -1,0 +1,9 @@
+# Three seeds. Each dataset uses its own config. There is no joint training.
+# The main comparison averages these three runs first, then applies a
+# per-window Harvey-Leybourne-Newbold test (HLN-DM; Harvey, Leybourne and
+# Newbold 1997). Across seeds, report only the mean and the standard deviation.
+alpha: 0.05
+seeds:
+  - 2024
+  - 2025
+  - 2026

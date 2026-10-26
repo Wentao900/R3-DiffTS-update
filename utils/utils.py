@@ -82,6 +82,8 @@ def train(
                 if batch_no >= config["itr_per_epoch"]:
                     break
 
+            if hasattr(model, "close_gate_label_epoch"):
+                model.close_gate_label_epoch()
             if warmup_epochs <= 0:
                 lr_scheduler.step()
             elif epoch_no + 1 >= warmup_epochs:
@@ -454,8 +456,69 @@ def fit_forecast_calibrator(
     }
 
 
-def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", window_lens=[1, 1], guide_w=0, save_attn=False, save_token=False, save_trend_prior=False, point_estimator="mean", forecast_calibrator=None):
-    model.load_state_dict(torch.load(foldername + "/model.pth"))
+def _batch_mark(batch, key):
+    if not isinstance(batch, dict) or key not in batch:
+        return None
+    return batch[key]
+
+
+def _row_mark(value, row):
+    if value is None:
+        return ""
+    if torch.is_tensor(value):
+        item = value.reshape(-1)[row]
+        return float(item.detach().cpu()) if item.numel() == 1 else float(item.reshape(-1)[0].detach().cpu())
+    if isinstance(value, (list, tuple)):
+        return value[row]
+    return value
+
+
+def _source_combo(raw, ret, cot):
+    parts = []
+    if raw == "" and ret == "":
+        return ""
+    if float(raw or 0) > 0:
+        parts.append("raw")
+    if float(ret or 0) > 0:
+        parts.append("ext")
+    if cot != "" and float(cot or 0) > 0:
+        parts.append("cot")
+    return "+".join(parts) if parts else "none"
+
+
+def _reseed_eval(seed):
+    import random
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    np.random.seed(int(seed))
+    random.seed(int(seed))
+
+
+def _window_crps(target, samples, eval_points):
+    """Per-window CRPS on the same quantile grid as calc_quantile_CRPS."""
+    quantiles = np.arange(0.05, 1.0, 0.05)
+    rows = []
+    for index in range(target.shape[0]):
+        points = eval_points[index]
+        denom = torch.sum(torch.abs(target[index] * points))
+        if float(denom) <= 0:
+            rows.append(float("nan"))
+            continue
+        total = 0.0
+        for quantile in quantiles:
+            forecast = torch.quantile(samples[index:index + 1], float(quantile), dim=1)
+            total += float(quantile_loss(target[index:index + 1], forecast, float(quantile), points.unsqueeze(0)) / denom)
+        rows.append(total / len(quantiles))
+    return rows
+
+
+def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", window_lens=[1, 1], guide_w=0, save_attn=False, save_token=False, save_trend_prior=False, point_estimator="mean", forecast_calibrator=None, checkpoint=None, reload_weights=True, reseed=None, point_metric_pairing=False, window_metrics_path=None, seed=None, split_name="test"):
+    if reseed is not None:
+        _reseed_eval(reseed)
+    if reload_weights:
+        weight_path = checkpoint if checkpoint else foldername + "/model.pth"
+        model.load_state_dict(torch.load(weight_path))
     with torch.no_grad():
         model.eval()
         mse_total = 0
@@ -477,6 +540,8 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
         all_tokens = []
         all_trend_priors = []
         all_text_marks = []
+        window_rows = []
+        seen_windows = 0
         with tqdm(test_loader, mininterval=1.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample, guide_w)
@@ -522,6 +587,9 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 else:
                     estimator_name = "mean"
                     point_prediction = samples_mean
+                # Gneiting 2011: squared error is optimized by the mean, absolute error by the median.
+                paired_mse = samples_mean
+                paired_mae = samples_median
                 calibrated_prediction = _apply_forecast_calibrator(
                     candidates,
                     eval_points.float(),
@@ -555,11 +623,13 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 mae_current = (
                     torch.abs((point_prediction - c_target) * eval_points)
                 ) * scaler
+                score_mse = paired_mse if point_metric_pairing else point_prediction
+                score_mae = paired_mae if point_metric_pairing else point_prediction
                 nmse_current = (
-                    ((point_prediction - c_target) * eval_points) ** 2
+                    ((score_mse - c_target) * eval_points) ** 2
                 )
                 nmae_current = (
-                    torch.abs((point_prediction - c_target) * eval_points)
+                    torch.abs((score_mae - c_target) * eval_points)
                 )
                 mse_mean_current = ((samples_mean - c_target) * eval_points) ** 2
                 mse_median_current = ((samples_median - c_target) * eval_points) ** 2
@@ -575,6 +645,34 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 nmse_total += nmse_current.sum().item()
                 nmae_total += nmae_current.sum().item()
                 evalpoints_total += eval_points.sum().item()
+                if window_metrics_path:
+                    crps_rows = _window_crps(c_target, samples, eval_points.float())
+                    raw_mark = _batch_mark(test_batch, "text_raw_mark")
+                    ret_mark = _batch_mark(test_batch, "text_ret_mark")
+                    cot_mark = _batch_mark(test_batch, "text_cot_mark")
+                    indices = _batch_mark(test_batch, "window_index")
+                    ends = test_batch.get("history_end") if isinstance(test_batch, dict) else None
+                    gate = getattr(model, "_last_gate", None)
+                    for row in range(c_target.shape[0]):
+                        m_raw = _row_mark(raw_mark, row)
+                        m_ret = _row_mark(ret_mark, row)
+                        m_cot = _row_mark(cot_mark, row)
+                        denom = float(eval_points[row].sum().clamp(min=1.0))
+                        window_rows.append({
+                            "seed": "" if seed is None else int(seed),
+                            "split": split_name,
+                            "window_index": seen_windows + row if indices is None else _row_mark(indices, row),
+                            "mse_mean": float(mse_mean_current[row].sum() / denom),
+                            "mae_median": float((torch.abs((samples_median[row] - c_target[row]) * eval_points[row])).sum() / denom),
+                            "crps": crps_rows[row],
+                            "m_raw": m_raw,
+                            "m_ret": m_ret,
+                            "m_cot": m_cot,
+                            "source_combo": _source_combo(m_raw, m_ret, m_cot),
+                            "history_end": "" if ends is None else str(ends[row]),
+                            "g": "" if gate is None or gate.reshape(-1).shape[0] <= row else float(gate.reshape(-1)[row].detach().cpu()),
+                        })
+                    seen_windows += c_target.shape[0]
 
                 it.set_postfix(
                     ordered_dict={
@@ -625,8 +723,12 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 "MSE_mean": mse_mean_total / evalpoints_total,
                 "MSE_median": mse_median_total / evalpoints_total,
                 "MSE_calibrated": mse_calibrated_total / evalpoints_total,
-                "point_estimator": estimator_name,
+                "point_estimator": "mean_mse_median_mae" if point_metric_pairing else estimator_name,
             }
+            if window_metrics_path and window_rows:
+                pd_frame = __import__("pandas").DataFrame(window_rows)
+                pd_frame.to_csv(window_metrics_path, index=False)
+                results["window_metrics"] = window_metrics_path
             if forecast_calibrator is not None:
                 results["forecast_calibrator"] = {
                     key: value for key, value in forecast_calibrator.items() if key != "coefficients"

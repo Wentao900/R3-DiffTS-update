@@ -8,6 +8,14 @@ from utils.timefeatures import time_features
 from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
 from utils.trend_prior import build_trend_fields, trend_fields_to_vector
 from utils.prepare4llm import get_desc
+from utils.text_presence import text_is_absent
+from utils.text_protocol import (
+    bert_content_budget,
+    cyclic_source_shift,
+    drop_future_year_rows,
+    fill_token_budget,
+    report_fact_is_placeholder,
+)
 
 try:
     from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -76,7 +84,20 @@ class Dataset_Custom(Dataset):
                  text_trend_raw_weight=1.0,
                  text_trend_ret_weight=0.35,
                  text_trend_cot_weight=0.15,
-                 max_text_events=12):
+                 max_text_events=12,
+                 text_features_mode="legacy",
+                 skip_cot_generation=False,
+                 numeric_summary_target_only=False,
+                 idf_fit_train_only=False,
+                 text_placeholder_absent=False,
+                 ext_text_mode="tfidf",
+                 ext_future_year_filter=False,
+                 raw_placeholder_filter=False,
+                 text_max_length=None,
+                 text_shift_mode="none",
+                 text_shift_splits=None,
+                 rag_query_unaugmented=False,
+                 record_window_index=False):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -89,6 +110,7 @@ class Dataset_Custom(Dataset):
         assert flag in ['train', 'test', 'valid']
         type_map = {'train': 0, 'valid': 1, 'test': 2}
         self.set_type = type_map[flag]
+        self.split_name = flag
 
         self.features = features
         self.target = target
@@ -142,6 +164,25 @@ class Dataset_Custom(Dataset):
         self.text_trend_ret_weight = float(max(text_trend_ret_weight, 0.0))
         self.text_trend_cot_weight = float(max(text_trend_cot_weight, 0.0))
         self.max_text_events = int(max(max_text_events, 4))
+        self.text_features_mode = str(text_features_mode or "legacy").lower()
+        self.skip_cot_generation = bool(skip_cot_generation)
+        self.numeric_summary_target_only = bool(numeric_summary_target_only)
+        self.idf_fit_train_only = bool(idf_fit_train_only)
+        self.text_placeholder_absent = bool(text_placeholder_absent)
+        self.ext_text_mode = str(ext_text_mode or "tfidf").lower()
+        self.ext_future_year_filter = bool(ext_future_year_filter)
+        self.raw_placeholder_filter = bool(raw_placeholder_filter)
+        # Content budget is the configured BERT length minus [CLS] and [SEP].
+        self.ext_token_budget = None if text_max_length is None else bert_content_budget(text_max_length)
+        self.text_shift_mode = str(text_shift_mode or "none").lower()
+        self.text_shift_splits = [str(item) for item in (text_shift_splits or [])]
+        self.rag_query_unaugmented = bool(rag_query_unaugmented)
+        self.record_window_index = bool(record_window_index)
+        self.future_year_removed = []
+        self.text_shift_report = {}
+        self._shift_raw = None
+        self._shift_ret = None
+        self._building_shift = False
 
         self.root_path = root_path
         self.data_path = data_path
@@ -185,6 +226,8 @@ class Dataset_Custom(Dataset):
                 rag_stage2_topk=self.rag_stage2_topk,
                 two_stage_gate=self.two_stage_gate,
                 trend_slope_eps=self.trend_slope_eps,
+                skip_cot_generation=self.skip_cot_generation,
+                query_drop_na=self.rag_query_unaugmented and self.ext_text_mode != "time_aligned",
             )
             self.rag_cot = RAGCoTPipeline(
                 domain=self.domain,
@@ -193,9 +236,11 @@ class Dataset_Custom(Dataset):
                 lookback_len=self.seq_len,
                 pred_len=self.pred_len,
                 config=rag_cfg,
+                idf_fit_end_date=self.train_period_end if self.idf_fit_train_only else None,
             )
         else:
             self.rag_cot = None
+        self._prepare_text_shift()
 
     def _normalize_feature_name(self, name):
         return str(name).strip().lower().replace("_", " ")
@@ -384,10 +429,9 @@ class Dataset_Custom(Dataset):
     def _normalize_text(self, text):
         if not isinstance(text, str):
             return ""
-        text = text.strip()
-        if text.upper() == "NA":
+        if text_is_absent(text, placeholder_absent=self.text_placeholder_absent):
             return ""
-        return text
+        return text.strip()
 
     def _tokenize_quality_text(self, text):
         normalized = self._normalize_text(text).lower()
@@ -834,6 +878,11 @@ class Dataset_Custom(Dataset):
         df_num = df_num.sort_values('date', ascending=True).reset_index(drop=True)
         df_report = df_report.sort_values('start_date', ascending=True).reset_index(drop=True)
         df_search = df_search.sort_values('start_date', ascending=True).reset_index(drop=True)
+        if self.ext_future_year_filter:
+            # Year rule (最优方案 §1.4): drop a row whose fact names a year after its own end_date.
+            df_report, removed_report = drop_future_year_rows(df_report, "report")
+            df_search, removed_search = drop_future_year_rows(df_search, "search")
+            self.future_year_removed = removed_report + removed_search
         num_train = int(len(df_num) * 0.7)
         num_test = int(len(df_num) * 0.2)
         num_vali = len(df_num) - num_train - num_test
@@ -845,6 +894,9 @@ class Dataset_Custom(Dataset):
         
         first_start_date = df_num.start_date[border1]
         final_end_date = df_num.end_date[border2-1]
+        # Last numeric end date of the 70% training split. IDF uses this cutoff
+        # on every split; retrieval still uses each sample's own history end.
+        self.train_period_end = df_num.end_date[border2s[0] - 1]
 
         if self.use_all_numeric_features:
             feature_cols, feature_roles = self._resolve_numeric_feature_columns(df_num)
@@ -939,6 +991,30 @@ class Dataset_Custom(Dataset):
             return " ".join(desc_tokens[:token_budget]) if desc_tokens else "NA"
         return " ".join(final_segments)
 
+    def collect_time_aligned_text(self, start_date, end_date):
+        """Newest-first search facts inside the history interval, filled to the token budget.
+
+        Placeholders are absent. There is no top-k. The old TF-IDF path is used when
+        ``ext_text_mode`` is not ``time_aligned``.
+        """
+        if self.ext_token_budget is None:
+            raise RuntimeError(
+                "time_aligned text needs model.text_max_length so the budget is the "
+                "domain token cap minus [CLS] and [SEP], not a new constant."
+            )
+        frame = self.search_df
+        window = frame.loc[(frame.end_date >= start_date) & (frame.end_date <= end_date)]
+        facts = []
+        for _, row in window.sort_values(["end_date", "start_date"], ascending=False).iterrows():
+            fact = row["fact"]
+            if report_fact_is_placeholder(fact):
+                continue
+            facts.append(str(fact).strip())
+        text = fill_token_budget(facts, self.ext_token_budget)
+        if not text:
+            return "NA"
+        return text
+
     def collect_text(self, start_date, end_date):
         report = self._collect_window_reports(start_date, end_date)
         def add_datemark(row):
@@ -964,7 +1040,18 @@ class Dataset_Custom(Dataset):
                 }
                 for _, row in report.iterrows()
             ]
-        if not report.empty:
+        if self.raw_placeholder_filter and not report.empty:
+            # Domain description and the date prefix are not evidence. A window whose
+            # facts are all NA placeholders is m_raw=0 (最优方案 C3).
+            content = report.loc[~report["fact"].map(report_fact_is_placeholder)]
+            if content.empty:
+                report = ['NA']
+                text_mark = 0
+            else:
+                report = content.apply(add_datemark, axis=1).to_list()
+                report.insert(0, self.desc)
+                text_mark = 1
+        elif not report.empty:
             report = report.apply(add_datemark, axis=1).to_list()
             report.insert(0, self.desc)
             text_mark = 1
@@ -990,8 +1077,12 @@ class Dataset_Custom(Dataset):
 
         seq_x = self.data_x[s_begin:s_end, :]
         seq_x_observed_mask = self.data_observed_mask[s_begin:s_end, :]
+        seq_x_query = seq_x
         if self.set_type == 0 and (self.aug_noise_std > 0 or self.aug_time_warp_prob > 0):
             seq_x = self._apply_lookback_augmentation(seq_x)
+        # C17: the TF-IDF query uses the unaugmented history. Time-aligned text does not query.
+        if not (self.rag_query_unaugmented and self.ext_text_mode != "time_aligned"):
+            seq_x_query = seq_x
         seq_y = self.data_y[r_begin:r_end, :]
     
         seq_x_stamp = self.data_stamp[s_begin:s_end]
@@ -1004,20 +1095,23 @@ class Dataset_Custom(Dataset):
 
         raw_text, txt_mark, text_meta = self.collect_text(history_start_date, history_end_date)
         text_dropped = False
-        if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
+        if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob) and not self._building_shift:
             raw_text, txt_mark = 'NA', 0
             text_dropped = True
         composed_text = raw_text
         rag_retrieved, cot_text = '', ''
         retrieved_records = []
-        if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
+        if self.ext_text_mode == "time_aligned" and not text_dropped:
+            rag_retrieved = self.collect_time_aligned_text(history_start_date, history_end_date)
+        elif self.use_rag_cot and self.rag_cot is not None and not text_dropped:
             cached = self.guidance_cache.get(index, None)
             if cached is None:
                 guidance = self.rag_cot.build_guidance_text(
-                    numeric_history=seq_x,
+                    numeric_history=seq_x_query,
                     start_date=history_start_date,
                     end_date=history_end_date,
                     base_text=raw_text,
+                    target_index=self.target_index if self.numeric_summary_target_only else None,
                 )
                 composed_text = guidance["composed_text"]
                 cot_text = guidance["cot_text"]
@@ -1037,31 +1131,52 @@ class Dataset_Custom(Dataset):
         ) else 0
 
         trend_prior_num = self._build_numeric_trend_prior(seq_x)
-        quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
-        trend_prior_text, source_priors = self._build_text_trend_components(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            seq_x,
-        )
-        text_evidence_vec = self._build_window_evidence(
-            raw_text,
-            rag_retrieved,
-            cot_text,
-            quality_pkg,
-            source_priors,
-            text_meta,
-            seq_x,
-        )
-        text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
-            raw_events=text_meta.get("raw_events", []),
-            retrieved_records=retrieved_records,
-            cot_text=cot_text,
-            seq_x=seq_x,
-            forecast_start_date=self.num_dates.start_date[r_begin],
-            raw_text=raw_text,
-        )
+        if self.text_features_mode == "none":
+            quality_pkg = {
+                "quality_raw": 0.0,
+                "quality_ret": 0.0,
+                "quality_cot": 0.0,
+                "quality_total": 0.0,
+            }
+            trend_prior_text = np.zeros_like(np.asarray(trend_prior_num, dtype=np.float32))
+            text_evidence_vec = np.zeros((7,), dtype=np.float32)
+            text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._pad_text_events([])
+        else:
+            quality_pkg = self._build_text_quality_package(raw_text, rag_retrieved, cot_text, seq_x)
+            trend_prior_text, source_priors = self._build_text_trend_components(
+                raw_text,
+                rag_retrieved,
+                cot_text,
+                quality_pkg,
+                seq_x,
+            )
+            text_evidence_vec = self._build_window_evidence(
+                raw_text,
+                rag_retrieved,
+                cot_text,
+                quality_pkg,
+                source_priors,
+                text_meta,
+                seq_x,
+            )
+            text_event_texts, text_event_source_ids, text_event_time_deltas, text_event_quality_feats, text_event_mask = self._build_text_events(
+                raw_events=text_meta.get("raw_events", []),
+                retrieved_records=retrieved_records,
+                cot_text=cot_text,
+                seq_x=seq_x,
+                forecast_start_date=self.num_dates.start_date[r_begin],
+                raw_text=raw_text,
+            )
+        text_raw_mark_value = float(len(self._normalize_text(raw_text)) > 0)
+        text_ret_mark_value = float(len(self._normalize_text(rag_retrieved)) > 0)
+        if self._shift_raw is not None and not self._building_shift:
+            # Marks stay with the window. Only the text content moves (最优方案 C5).
+            original_raw = raw_text
+            raw_text = self._shift_raw[index]
+            rag_retrieved = self._shift_ret[index]
+            if composed_text == original_raw:
+                composed_text = raw_text
+        text_raw_mark = np.asarray(text_raw_mark_value, dtype=np.float32)
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         if observed_data.shape[1] > 1:
@@ -1102,13 +1217,102 @@ class Dataset_Custom(Dataset):
             'text_quality_ret': np.asarray(quality_pkg["quality_ret"], dtype=np.float32),
             'text_quality_cot': np.asarray(quality_pkg["quality_cot"], dtype=np.float32),
             'text_quality_total': np.asarray(quality_pkg["quality_total"], dtype=np.float32),
-            'text_ret_mark': np.asarray(float(len(self._normalize_text(rag_retrieved)) > 0), dtype=np.float32),
+            'text_ret_mark': np.asarray(text_ret_mark_value, dtype=np.float32),
             'text_cot_mark': np.asarray(float(len(self._normalize_text(cot_text)) > 0), dtype=np.float32),
+            'text_raw_mark': text_raw_mark,
             'target_feature_index': np.asarray(self.target_index, dtype=np.int64),
             'domain_text_coverage': np.asarray(self.domain_text_coverage, dtype=np.float32),
         }
+        if self.record_window_index:
+            s['window_index'] = np.asarray(index, dtype=np.int64)
+            s['history_end'] = str(pd.Timestamp(history_end_date).date())
 
         return s
+
+    def write_future_year_audit(self, path):
+        frame = pd.DataFrame(self.future_year_removed)
+        if frame.empty:
+            frame = pd.DataFrame(columns=["source", "row_index", "start_date", "end_date", "fact"])
+        frame.to_csv(path, index=False)
+        return path
+
+    def training_source_marks(self):
+        """Raw and retrieval marks on this split, without lookback augmentation or text drop."""
+        saved_drop = self.text_drop_prob
+        self.text_drop_prob = 0.0
+        rows = []
+        try:
+            for index in range(len(self)):
+                item = self[index]
+                rows.append(
+                    (
+                        float(item["text_raw_mark"]),
+                        float(item["text_ret_mark"]),
+                        float(item["text_cot_mark"]),
+                    )
+                )
+        finally:
+            self.text_drop_prob = saved_drop
+        return rows
+
+    def _prepare_text_shift(self):
+        self._shift_raw = None
+        self._shift_ret = None
+        self.text_shift_report = {}
+        if self.text_shift_mode != "cyclic_per_source":
+            return
+        if self.split_name not in self.text_shift_splits:
+            return
+        self._building_shift = True
+        try:
+            raw_texts = []
+            ret_texts = []
+            raw_on = []
+            ret_on = []
+            for index in range(len(self)):
+                item = self[index]
+                raw_texts.append(item["text_raw"])
+                ret_texts.append(item["text_ret"])
+                raw_on.append(float(item["text_raw_mark"]) > 0)
+                ret_on.append(float(item["text_ret_mark"]) > 0)
+        finally:
+            self._building_shift = False
+        raw_shift = self._shift_one_source(raw_texts, raw_on)
+        ret_shift = self._shift_one_source(ret_texts, ret_on)
+        self._shift_raw = raw_shift["texts"]
+        self._shift_ret = ret_shift["texts"]
+        self.text_shift_report = {"raw": raw_shift["report"], "ret": ret_shift["report"]}
+        print(
+            "[text-shift] split=%s min_gap=%d raw_present=%s raw_unshifted=%s raw_min_gap=%s ret_present=%s ret_unshifted=%s ret_min_gap=%s"
+            % (
+                self.split_name,
+                int(self.seq_len),
+                raw_shift["report"]["present"],
+                raw_shift["report"]["unshifted"],
+                raw_shift["report"]["min_gap"],
+                ret_shift["report"]["present"],
+                ret_shift["report"]["unshifted"],
+                ret_shift["report"]["min_gap"],
+            )
+        )
+
+    def _shift_one_source(self, texts, present):
+        indices = [index for index, flag in enumerate(present) if flag]
+        plan = cyclic_source_shift(indices, self.seq_len)
+        shifted = list(texts)
+        donors = {indices[i]: indices[plan["donor"][i]] for i in range(len(indices))}
+        for index in indices:
+            shifted[index] = texts[donors[index]]
+        return {
+            "texts": shifted,
+            "report": {
+                "shift": plan["shift"],
+                "min_gap": plan["min_gap"],
+                "unshifted": plan["unshifted"],
+                "present": len(indices),
+                "history_length": int(self.seq_len),
+            },
+        }
 
     def __len__(self):
         return len(self.data_x) - self.seq_len - self.pred_len + 1

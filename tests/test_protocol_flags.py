@@ -562,31 +562,31 @@ class ControlLogTests(unittest.TestCase):
 
 class SeedLoopTests(unittest.TestCase):
     def test_protocol_seeds_and_dry_run_cover_eight_domains(self):
+        seed_text = Path("config/xattn/protocol_seeds.yaml").read_text()
+        self.assertNotIn("n_min", seed_text)
+        self.assertNotIn("2027", seed_text)
         with open("config/xattn/protocol_seeds.yaml") as handle:
             protocol = yaml.safe_load(handle)
-        self.assertEqual(protocol["seeds"], [2025, 2026, 2027, 2028, 2029, 2030])
-        self.assertEqual(protocol["n_min"], 6)
+        self.assertEqual(protocol["seeds"], [2024, 2025, 2026])
         env = os.environ.copy()
+        env.pop("SEEDS", None)
         env.update({
             "DRY_RUN": "1",
             "DOMAIN": "all",
             "ABLATION": "A1",
-            "SEEDS": "2025,2026,2027,2028,2029,2030",
         })
         output = subprocess.check_output(["bash", "scripts/run_xattn_ablation.sh"], env=env, text=True)
         commands = [line for line in output.splitlines() if "exe_forecasting.py" in line]
-        self.assertEqual(len(commands), 48)
+        self.assertEqual(len(commands), 24)
         for domain in ("agriculture", "climate", "economy", "energy", "environment", "health", "socialgood", "traffic"):
-            self.assertTrue(any(domain in line for line in commands))
-        self.assertTrue(any("Health_US/Health_US.csv" in line for line in commands))
-        self.assertTrue(all("--seed" in line for line in commands))
-        env["SEEDS"] = ""
-        env["DOMAIN"] = "agriculture"
-        once = subprocess.check_output(["bash", "scripts/run_xattn_ablation.sh"], env=env, text=True)
-        once_commands = [line for line in once.splitlines() if "exe_forecasting.py" in line]
-        self.assertEqual(len(once_commands), 1)
-        self.assertNotIn("--seed", once_commands[0])
+            matched = [line for line in commands if "--domain %s" % domain in line]
+            self.assertEqual(len(matched), 3)
+        self.assertTrue(all("--config xattn/unified.yaml" in line for line in commands))
+        self.assertTrue(all("--variant A1" in line for line in commands))
+        for seed in ("2024", "2025", "2026"):
+            self.assertTrue(any("--seed %s" % seed in line for line in commands))
         source = Path("exe_forecasting.py").read_text()
+        self.assertIn("unified_output_dir", source)
         self.assertIn('foldername = "./save/%s_seed%s/" % (config_stem, args.seed)', source)
 
 

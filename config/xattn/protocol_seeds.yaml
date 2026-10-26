@@ -1,12 +1,10 @@
-# Six seeds for the paired sign test in 最优方案 R4.
-# n_min = 6 because 2 * 0.5^6 = 0.03125 <= 0.05, while n = 5 gives 0.0625.
-# The values are exe_forecasting.py's existing default seed 2025 and the next five integers.
+# Three seeds for the unified protocol.
+# The main comparison averages these three runs first, then applies a
+# per-window Harvey-Leybourne-Newbold test (HLN-DM; Harvey, Leybourne and
+# Newbold 1997). Across seeds, report only the mean and the standard deviation.
+# 2024, 2025 and 2026 replace the earlier six-seed sign-test list.
 alpha: 0.05
-n_min: 6
 seeds:
+  - 2024
   - 2025
   - 2026
-  - 2027
-  - 2028
-  - 2029
-  - 2030

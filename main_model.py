@@ -134,6 +134,8 @@ class CSDI_base(nn.Module):
         self.control_log = {} if self.log_control_calls else None
         self.dropped_sources = []
         self.infer_mask_sources = []
+        # Training ablations (E8) list sources here. Absent means no extra mask.
+        self.mask_sources = [str(item) for item in (config["model"].get("mask_sources") or [])]
         self.infer_guide_w = None
         self.infer_gate_constant = None
         self.source_decision = None
@@ -3032,7 +3034,7 @@ class CSDI_Forecasting(CSDI_base):
 
     def _apply_source_masks(self, raw_mark, ret_mark, cot_mark):
         """Zero marks for sources dropped by R1 or by an inference override."""
-        blocked = set(self.dropped_sources) | set(self.infer_mask_sources)
+        blocked = set(self.dropped_sources) | set(self.infer_mask_sources) | set(self.mask_sources)
         if not blocked:
             return raw_mark, ret_mark, cot_mark
         def _zero(mark, name):

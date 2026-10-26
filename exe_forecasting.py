@@ -12,16 +12,18 @@ from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate, fit_forecast_calibrator
 from utils.infer_override import apply_infer_override, parse_infer_override
-from utils.xattn_config import apply_entrypoint_overrides, resolve_xattn_guide_w
+from utils.xattn_config import apply_entrypoint_overrides, resolve_unified_config, resolve_xattn_guide_w, unified_output_dir
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
+parser.add_argument("--domain", type=str, default="", help="dataset key in config/xattn/unified.yaml")
+parser.add_argument("--variant", type=str, default="A1", help="overlay name in the unified config")
 parser.add_argument("--datatype", type=str, default="multimodal")
 parser.add_argument('--device', default='cuda:0', help='Device for Attack')
 parser.add_argument("--seed", type=int, default=2025)
 parser.add_argument("--unconditional", action="store_true")
 parser.add_argument("--modelfolder", type=str, default="")
-parser.add_argument("--nsample", type=int, default=15)
+parser.add_argument("--nsample", type=int, default=-1, help="negative reads train.n_samples, else 15")
 parser.add_argument("--data", type=str, default="custom")
 parser.add_argument("--embed", type=str, default="timeF")
 parser.add_argument('--root_path', type=str, default='Time-MMD-main', help='root path of the data file')
@@ -419,6 +421,14 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
+config, unified_runtime = resolve_unified_config(config, domain=args.domain, variant=args.variant)
+if unified_runtime is not None:
+    args.data_path = unified_runtime["data_path"]
+    args.seq_len = int(unified_runtime["seq_len"])
+    args.pred_len = int(unified_runtime["pred_len"])
+    args.freq = unified_runtime["freq"]
+    args.target = unified_runtime["target"]
+    args.text_len = int(unified_runtime["text_len"])
 # Legacy configs keep the forced text/timestep switches. xattn configs opt out.
 apply_entrypoint_overrides(config, freq=args.freq)
 args.guide_w = resolve_xattn_guide_w(config, args.guide_w, args.guide_list)
@@ -653,13 +663,22 @@ if "text_drop_prob" in config["model"] and float(args.text_drop_prob) == 0.0:
     args.text_drop_prob = float(config["model"]["text_drop_prob"])
 
 args.batch_size = config["train"]["batch_size"]
+if int(args.nsample) < 0:
+    args.nsample = int(config.get("train", {}).get("n_samples", 15))
 
 current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-if bool(config.get("train", {}).get("named_output_dir", False)):
+run_meta = config.get("run") or {}
+if bool(config.get("train", {}).get("named_output_dir", False)) and run_meta.get("domain") and run_meta.get("variant"):
+    foldername = unified_output_dir(run_meta["domain"], run_meta["variant"], args.seed)
+elif bool(config.get("train", {}).get("named_output_dir", False)):
     config_stem = os.path.splitext(os.path.basename(args.config))[0]
     foldername = "./save/%s_seed%s/" % (config_stem, args.seed)
 else:
     foldername = "./save/forecasting_" + args.data_path.split('/')[0] + '_' + current_time + "/"
+if not args.modelfolder and run_meta.get("checkpoint_variant"):
+    args.modelfolder = "%s_%s_seed%s" % (run_meta["domain"], run_meta["checkpoint_variant"], args.seed)
+if not str(args.infer_override or "").strip() and run_meta.get("infer_override"):
+    args.infer_override = str(run_meta["infer_override"])
 print('model folder:', foldername)
 os.makedirs(foldername, exist_ok=True)
 

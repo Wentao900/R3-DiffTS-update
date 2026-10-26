@@ -4,6 +4,11 @@ Legacy configs keep the historical forced switches. The xattn configs set
 ``force_legacy_entrypoint: false`` and read the YAML values instead.
 """
 
+from copy import deepcopy
+from pathlib import Path
+
+import yaml
+
 FREQ_SEASON_PERIOD = {
     "m": 12,
     "w": 52,
@@ -83,6 +88,11 @@ def apply_entrypoint_overrides(config, freq="m"):
     return config
 
 
+def unified_output_dir(domain, variant, seed):
+    """Directory name carries the dataset, the variant, and the seed."""
+    return "./save/%s_%s_seed%s/" % (domain, variant, seed)
+
+
 def resolve_xattn_guide_w(config, guide_w, guide_list=""):
     """Keep the legacy 20-value sweep. xattn defaults to guide_w_default (1).
 
@@ -97,3 +107,191 @@ def resolve_xattn_guide_w(config, guide_w, guide_list=""):
     if bool(model_cfg.get("force_legacy_entrypoint", True)):
         return guide_w
     return float(model_cfg.get("guide_w_default", 1.0))
+
+
+ROOT = Path(__file__).resolve().parents[1]
+UNIFIED_CONFIG = ROOT / "config" / "xattn" / "unified.yaml"
+PROTOCOL_SEEDS = ROOT / "config" / "xattn" / "protocol_seeds.yaml"
+
+# Names the shell accepts. E4 and E5 are the plan's names for T2 and T3.
+VARIANT_ALIASES = {
+    "E4": "T2_gate_one",
+    "E4_gate_one": "T2_gate_one",
+    "E5": "T3_gate_constant",
+    "E5_gate_constant": "T3_gate_constant",
+}
+DOMAIN_ALIASES = {
+    "healthus": "health",
+    "health_us": "health",
+    "social_good": "socialgood",
+}
+TRAINING_VARIANTS = (
+    "A1",
+    "T0_numeric_only",
+    "T1_router_text",
+    "T2_gate_one",
+    "T3_gate_constant",
+    "T4a_shuffle_text",
+    "S1_raw_only",
+    "S4_cot_source",
+    "E6_source_only",
+    "E7_cyclic_shift",
+    "E8_ext_only",
+    "N1_naive",
+    "N1_dlinear",
+    "N1_none",
+    "N2_no_expert_loss",
+    "N3_no_multires_loss",
+    "C1_w1",
+    "C1_sweep",
+)
+
+
+def _normalize_domain(name):
+    key = str(name or "").strip().lower().replace("-", "_")
+    compact = key.replace("_", "")
+    if compact in DOMAIN_ALIASES:
+        return DOMAIN_ALIASES[compact]
+    if key in DOMAIN_ALIASES:
+        return DOMAIN_ALIASES[key]
+    return key
+
+
+def _deep_merge(base, patch):
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = deepcopy(value)
+    return base
+
+
+def load_protocol_seeds(path=None):
+    with open(path or PROTOCOL_SEEDS) as handle:
+        payload = yaml.safe_load(handle)
+    return [int(seed) for seed in payload["seeds"]]
+
+
+def load_unified_config(path=None):
+    with open(path or UNIFIED_CONFIG) as handle:
+        return yaml.safe_load(handle)
+
+
+def resolve_unified_config(config, domain="", variant="A1"):
+    """Flatten one dataset and one overlay.
+
+    A config without a ``domains`` table is returned unchanged, so the
+    per-domain YAMLs keep their old hyperparameters.
+    """
+    if not isinstance(config, dict) or not isinstance(config.get("domains"), dict):
+        if str(domain or "").strip():
+            raise ValueError("--domain is only valid for config/xattn/unified.yaml")
+        return config, None
+    domain_key = _normalize_domain(domain)
+    if not domain_key:
+        known = ", ".join(sorted(config["domains"]))
+        raise ValueError("unified config requires --domain or DOMAIN. Known datasets: %s" % known)
+    if domain_key not in config["domains"]:
+        known = ", ".join(sorted(config["domains"]))
+        raise ValueError("unknown domain %r. Known datasets: %s" % (domain, known))
+    variant_key = VARIANT_ALIASES.get(str(variant or "A1"), str(variant or "A1"))
+    variants = config.get("variants") or {}
+    if variant_key not in variants:
+        known = ", ".join(sorted(variants))
+        raise ValueError("unknown variant %r. Known overlays: %s" % (variant, known))
+    spec = variants[variant_key]
+    resolved = deepcopy(config)
+    for reserved in ("domains", "variants", "protocol_notes"):
+        resolved.pop(reserved, None)
+    patch = {key: value for key, value in spec.items() if key not in ("checkpoint_variant", "infer_override")}
+    _deep_merge(resolved, patch)
+    domain_spec = config["domains"][domain_key]
+    freq = str(domain_spec["freq"])
+    model_cfg = resolved.setdefault("model", {})
+    model_cfg["season_period"] = int(FREQ_SEASON_PERIOD[freq])
+    model_cfg["cot_cache_dir"] = ".rag_cot_cache/%s" % domain_key
+    resolved.setdefault("dataset", {})["use_all_numeric_features"] = True
+    resolved["run"] = {
+        "domain": domain_key,
+        "variant": variant_key,
+        "checkpoint_variant": spec.get("checkpoint_variant"),
+        "infer_override": spec.get("infer_override") or "",
+    }
+    runtime = {
+        "domain": domain_key,
+        "variant": variant_key,
+        "data_path": domain_spec["data_path"],
+        "seq_len": int(domain_spec["seq_len"]),
+        "pred_len": int(domain_spec["pred_len"]),
+        "freq": freq,
+        "target": str(domain_spec.get("target", "OT")),
+        "text_len": int(model_cfg.get("text_len", 36)),
+        "season_period": int(model_cfg["season_period"]),
+        "documented_numeric_columns": int(domain_spec["documented_numeric_columns"]),
+    }
+    return resolved, runtime
+
+
+def _variant_group(config, ablation):
+    name = str(ablation or "A1")
+    if name == "all":
+        return list(TRAINING_VARIANTS) + _variant_group(config, "E3")
+    if name == "E3":
+        return [
+            key for key, spec in config.get("variants", {}).items()
+            if spec.get("checkpoint_variant")
+        ]
+    return [VARIANT_ALIASES.get(name, name)]
+
+
+def plan_unified_runs(domain="all", ablation="A1", seeds=None, root_path="../Time-MMD-main", device="cpu", guide_list="0,0.5,1.0,1.5,2.0", nsample=None, config_path="xattn/unified.yaml"):
+    """Argv lists for one variant on the requested datasets and seeds.
+
+    ``seeds`` left empty uses config/xattn/protocol_seeds.yaml.
+    """
+    payload = load_unified_config()
+    if seeds is None or seeds == "" or seeds == []:
+        seed_list = load_protocol_seeds()
+    elif isinstance(seeds, str):
+        seed_list = [int(item) for item in seeds.split(",") if item.strip()]
+    else:
+        seed_list = [int(item) for item in seeds]
+    if str(domain) == "all":
+        domains = list(payload["domains"])
+    else:
+        domains = [_normalize_domain(domain)]
+    commands = []
+    for variant_name in _variant_group(payload, ablation):
+        for domain_name in domains:
+            resolved, runtime = resolve_unified_config(payload, domain_name, variant_name)
+            for seed in seed_list:
+                guide_w = "1"
+                extra_guide = None
+                if variant_name == "C1_sweep":
+                    guide_w = "-1"
+                    extra_guide = guide_list
+                argv = [
+                    "python3", "-u", "exe_forecasting.py",
+                    "--config", config_path,
+                    "--domain", runtime["domain"],
+                    "--variant", runtime["variant"],
+                    "--root_path", root_path,
+                    "--device", device,
+                    "--num_workers", "0",
+                    "--seed", str(seed),
+                    "--guide_w", guide_w,
+                ]
+                if extra_guide:
+                    argv.extend(["--guide_list", extra_guide])
+                if nsample is not None and str(nsample) != "":
+                    argv.extend(["--nsample", str(nsample)])
+                checkpoint = resolved["run"].get("checkpoint_variant")
+                if checkpoint:
+                    argv.extend(["--modelfolder", "%s_%s_seed%s" % (runtime["domain"], checkpoint, seed)])
+                override = resolved["run"].get("infer_override") or ""
+                if override:
+                    argv.extend(["--infer_override", override])
+                    if override.startswith("guide_w="):
+                        argv[argv.index("--guide_w") + 1] = override.split("=", 1)[1]
+                commands.append(argv)
+    return commands

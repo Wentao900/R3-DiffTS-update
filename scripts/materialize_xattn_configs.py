@@ -1,7 +1,7 @@
-"""Write the gated cross-attention configs and the minimal ablation set.
+"""Write the per-domain gated cross-attention configs and their ablations.
 
-A1 is produced for every mainline domain. Single-factor ablations are written
-for Agriculture (decomposition) and Traffic (no decomposition).
+Those files stay so older runs can be repeated. New runs use
+config/xattn/unified.yaml. This script does not write that file.
 """
 
 import math

@@ -1,0 +1,297 @@
+# One config for Agriculture, Climate, Economy, Energy, Environment, Health,
+# SocialGood and Traffic. Select a dataset with --domain or DOMAIN.
+# Model and training values are shared. Only the dataset table below changes.
+# The per-domain files config/xattn/*_xattn.yaml are left in place.
+#
+# Sources for the shared values are recorded in protocol_notes and in the PR.
+# Items under protocol_notes.pending_confirmation have no single published
+# value; the number in this file is the one the run will use until it is confirmed.
+
+protocol_notes:
+  pending_confirmation:
+    - c_mask_prob
+    - n_samples
+    - ddim
+    - is_linear
+    - noise_esti
+    - decomp
+    - text_max_length
+    - lambda_expert
+    - lambda_multires
+    - lr_warmup_epochs
+    - max_grad_norm
+    - text_encode_batch_size
+    - max_text_events
+    - augmentation
+
+train:
+  epochs: 100
+  batch_size: 8
+  lr: 0.001
+  itr_per_epoch: 100000000.0
+  # 0 matches CSDI, which has no warmup. The old xattn files use 10. Pending.
+  lr_warmup_epochs: 0
+  # 0 matches CSDI, which does not clip. The old xattn files use 1. Pending.
+  max_grad_norm: 0.0
+  n_samples: 15
+  multi_res_horizons: null
+  multi_res_use_stat_horizons: false
+  multi_res_loss_weight: 0.1
+  multi_res_use_huber: true
+  multi_res_huber_delta: 1.0
+  multi_res_huber_deltas: null
+  multi_res_huber_delta_mode: fallback_uniform
+  multi_res_dynamic: false
+  multi_res_dynamic_by_t: false
+  multi_res_dynamic_by_epoch: false
+  multi_res_dynamic_by_trend: false
+  multi_res_progressive: false
+  multi_res_difficulty_weight: 0.0
+  multi_res_segment_loss: false
+  auxiliary_loss_max_ratio: 0.0
+  pattern_consistency_weight: 0.0
+  pattern_expert_weight: 0.05
+  coarse_forecast_weight: 0.0
+  uncertainty_forecast_weight: 0.0
+  valid_loss_main_only: true
+  deterministic_valid: true
+  eval_reseed: true
+  save_window_metrics: true
+  point_metric_pairing: true
+  valid_t_schedule: all
+  named_output_dir: true
+  forecast_calibrator: false
+
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: quad
+  is_linear: false
+  noise_esti: false
+  cfg: true
+  c_mask_prob: 0.1
+  ddim: false
+  # Equals num_steps. The DDPM sampler does not read this while ddim is false.
+  sample_steps: 50
+  sample_method: quad
+  pre_norm: false
+  mask_noisy_target: true
+  sampler_fix: true
+  tower_dropout: 0.0
+  estimable_window_norm: true
+  time_attn_dropout: 0.1
+  ddim_x0_endpoint: true
+  ddim_unique_steps: true
+
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: test
+  num_sample_features: 64
+  llm: bert
+  llm_layers: 0
+  text_len: 36
+  # Encoder maximum. bert-base-uncased max_position_embeddings is 512
+  # (Devlin et al. 2019). Content budget is 512 - 2. Pending if a shorter cap is required.
+  text_max_length: 512
+  text_encode_batch_size: 8
+  decomp: false
+  timestep_branch: false
+  timestep_emb_cat: true
+  timestep_outer_mix: none
+  with_texts: true
+  relative_size_emb_cat: false
+  force_legacy_entrypoint: false
+  text_injection: gated
+  pattern_expert_set: fpp4
+  pattern_router_mode: linear_history
+  baseline_form: fpp4
+  pattern_text_evidence: false
+  pattern_reliability: false
+  pattern_aux_reliability: false
+  use_forecast_policy_controller: false
+  use_aux_forecast_heads: false
+  use_coarse_forecast_head: false
+  use_uncertainty_head: false
+  coarse_forecast_blend: 0.0
+  guide_mode: manual
+  final_method: false
+  guide_w_default: 1.0
+  text_validity_gate: true
+  text_gate_mode: learned
+  text_validity_loss: true
+  cfg_output_combine: true
+  text_features_mode: none
+  skip_cot_generation: true
+  numeric_summary_target_only: true
+  cot_as_source: false
+  n_text_sources: 2
+  use_two_stage_rag: false
+  use_rag_cot: true
+  shuffle_text_in_batch: false
+  text_drop_prob: 0.0
+  idf_fit_train_only: true
+  text_encoder_eval: true
+  text_placeholder_absent: true
+  ext_text_mode: time_aligned
+  ext_future_year_filter: true
+  raw_placeholder_filter: true
+  text_sources: auto_from_train
+  gate_beta: auto_identifiable
+  text_shift_mode: none
+  gate_constant_source: last_epoch
+  gate_ref_shared_dropout: true
+  rag_query_unaugmented: true
+  log_control_calls: true
+
+dataset:
+  # K is the number of numeric columns in the CSV, not a hyperparameter.
+  use_all_numeric_features: true
+  text_features_mode: none
+  num_workers: 0
+  # Already the same on every old xattn file. No CSDI or MCD-TSF source. Pending.
+  aug_noise_std: 0.01
+  aug_time_warp_prob: 0.3
+  aug_segment_scale_std: 0.1
+  max_text_events: 8
+
+domains:
+  agriculture:
+    data_path: Agriculture/Agriculture.csv
+    target: OT
+    freq: m
+    seq_len: 36
+    pred_len: 12
+    documented_numeric_columns: 3
+  climate:
+    data_path: Climate/Climate.csv
+    target: OT
+    freq: w
+    seq_len: 96
+    pred_len: 12
+    documented_numeric_columns: 6
+  economy:
+    data_path: Economy/Economy.csv
+    target: OT
+    freq: m
+    seq_len: 36
+    pred_len: 12
+    documented_numeric_columns: 3
+  energy:
+    data_path: Energy/Energy.csv
+    target: OT
+    freq: w
+    seq_len: 96
+    pred_len: 12
+    documented_numeric_columns: 8
+  environment:
+    data_path: Environment/Environment.csv
+    target: OT
+    freq: d
+    seq_len: 336
+    pred_len: 48
+    documented_numeric_columns: 2
+  health:
+    data_path: Health_US/Health_US.csv
+    target: OT
+    freq: w
+    seq_len: 96
+    pred_len: 12
+    documented_numeric_columns: 7
+  socialgood:
+    data_path: SocialGood/SocialGood.csv
+    target: OT
+    freq: m
+    seq_len: 36
+    pred_len: 12
+    documented_numeric_columns: 1
+  traffic:
+    data_path: Traffic/Traffic.csv
+    target: OT
+    freq: m
+    seq_len: 36
+    pred_len: 12
+    documented_numeric_columns: 1
+
+variants:
+  A1: {}
+  T0_numeric_only:
+    model:
+      text_drop_prob: 1.0
+  T1_router_text:
+    model:
+      text_injection: off
+      pattern_router_mode: linear_history_text
+      text_validity_gate: false
+      text_validity_loss: false
+      cfg_output_combine: false
+  T2_gate_one:
+    model:
+      text_gate_mode: one
+      text_validity_loss: false
+  T3_gate_constant:
+    model:
+      text_gate_mode: constant
+      text_validity_loss: false
+  T4a_shuffle_text:
+    model:
+      shuffle_text_in_batch: true
+  S1_raw_only:
+    model:
+      use_rag_cot: false
+  S4_cot_source:
+    model:
+      cot_as_source: true
+      n_text_sources: 3
+      skip_cot_generation: false
+  E6_source_only:
+    model:
+      text_gate_mode: source_only
+  E7_cyclic_shift:
+    model:
+      text_shift_mode: cyclic_per_source
+      text_shift_splits: [train, valid, test]
+  E8_ext_only:
+    model:
+      mask_sources: [raw]
+  N1_naive:
+    model:
+      baseline_form: naive
+  N1_dlinear:
+    model:
+      baseline_form: dlinear
+  N1_none:
+    model:
+      baseline_form: none
+      pattern_residual_diffusion: false
+  N2_no_expert_loss:
+    train:
+      pattern_expert_weight: 0.0
+  N3_no_multires_loss:
+    train:
+      multi_res_loss_weight: 0.0
+  C1_w1: {}
+  C1_sweep: {}
+  # E3 reuses the A1 checkpoint. g≡c does not pass a number: constant mode
+  # reads the previous epoch's label mean stored in that checkpoint.
+  E3_w0:
+    checkpoint_variant: A1
+    infer_override: guide_w=0
+  E3_gate_one:
+    checkpoint_variant: A1
+    infer_override: text_gate_mode=one
+  E3_gate_constant:
+    checkpoint_variant: A1
+    infer_override: text_gate_mode=constant
+  E3_cyclic_shift:
+    checkpoint_variant: A1
+    infer_override: text_shift_mode=cyclic_per_source
+  E3_mask_raw:
+    checkpoint_variant: A1
+    infer_override: mask_sources=raw

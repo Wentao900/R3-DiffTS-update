@@ -11,6 +11,7 @@ import math
 from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate, fit_forecast_calibrator
+from utils.infer_override import apply_infer_override, parse_infer_override
 from utils.xattn_config import apply_entrypoint_overrides, resolve_xattn_guide_w
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
@@ -48,6 +49,7 @@ parser.add_argument('--cot_load_in_8bit', action='store_true', help='load CoT mo
 parser.add_argument('--cot_load_in_4bit', action='store_true', help='load CoT model in 4-bit (requires bitsandbytes)')
 parser.add_argument('--guide_w', type=float, default=-1, help='override guidance weight when cfg is enabled; negative to use default sweep')
 parser.add_argument('--guide_list', type=str, default="", help='comma-separated guide weights for cfg sweep; overrides the built-in sweep when guide_w is negative')
+parser.add_argument('--infer_override', type=str, default="", help='comma-separated inference overrides: guide_w=0,text_gate_mode=one,gate_constant=0.5,text_shift_mode=cyclic_per_source,mask_sources=raw')
 parser.add_argument('--trend_cfg', action='store_true', help='enable trend-aware CFG modulation from CoT')
 parser.add_argument('--trend_cfg_power', type=float, default=1.0, help='power for trend CFG time schedule')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace trend prior with random draws')
@@ -639,13 +641,25 @@ args.skip_cot_generation = bool(config["model"].get("skip_cot_generation", False
 args.numeric_summary_target_only = bool(config["model"].get("numeric_summary_target_only", False))
 args.idf_fit_train_only = bool(config["model"].get("idf_fit_train_only", False))
 args.text_placeholder_absent = bool(config["model"].get("text_placeholder_absent", False))
+args.ext_text_mode = str(config["model"].get("ext_text_mode", "tfidf"))
+args.ext_future_year_filter = bool(config["model"].get("ext_future_year_filter", False))
+args.raw_placeholder_filter = bool(config["model"].get("raw_placeholder_filter", False))
+args.text_max_length = config["model"].get("text_max_length", None)
+args.text_shift_mode = str(config["model"].get("text_shift_mode", "none"))
+args.text_shift_splits = config["model"].get("text_shift_splits", [])
+args.rag_query_unaugmented = bool(config["model"].get("rag_query_unaugmented", False))
+args.record_window_index = bool(config["train"].get("save_window_metrics", False))
 if "text_drop_prob" in config["model"] and float(args.text_drop_prob) == 0.0:
     args.text_drop_prob = float(config["model"]["text_drop_prob"])
 
 args.batch_size = config["train"]["batch_size"]
 
 current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-foldername = "./save/forecasting_" + args.data_path.split('/')[0] + '_' + current_time + "/"
+if bool(config.get("train", {}).get("named_output_dir", False)):
+    config_stem = os.path.splitext(os.path.basename(args.config))[0]
+    foldername = "./save/%s_seed%s/" % (config_stem, args.seed)
+else:
+    foldername = "./save/forecasting_" + args.data_path.split('/')[0] + '_' + current_time + "/"
 print('model folder:', foldername)
 os.makedirs(foldername, exist_ok=True)
 
@@ -688,6 +702,17 @@ with open(foldername + "config_results.json", "w") as f:
 write_run_summary(foldername, config, horizon_info)
 
 model = CSDI_Forecasting(config, args.device, target_dim, window_lens=[args.seq_len, args.pred_len]).to(args.device)
+source_decision = None
+if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "training_source_marks"):
+    if str(config["model"].get("text_sources", "configured")) == "auto_from_train" or str(config["model"].get("gate_beta", "all")) == "auto_identifiable":
+        from utils.text_protocol import decide_text_sources
+        mark_rows = train_loader.dataset.training_source_marks()
+        if mark_rows:
+            raw_marks, ret_marks, cot_marks = zip(*mark_rows)
+            source_decision = model.apply_source_decision(decide_text_sources(raw_marks, ret_marks, cot_marks))
+if bool(config["model"].get("ext_future_year_filter", False)) and hasattr(test_loader, "dataset") and hasattr(test_loader.dataset, "write_future_year_audit"):
+    test_loader.dataset.write_future_year_audit(os.path.join(foldername, "future_year_removed.csv"))
+    print("[year-filter] removed %d entries; audit %s" % (len(test_loader.dataset.future_year_removed), os.path.join(foldername, "future_year_removed.csv")))
 write_run_summary(
     foldername,
     config,
@@ -706,9 +731,15 @@ if args.modelfolder == "":
         foldername=foldername,
         valid_epoch_interval=args.valid_interval
     )
+    checkpoint_path = os.path.join(foldername, "model.pth")
 else:
-    model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth"))
+    checkpoint_path = os.path.join("./save", args.modelfolder, "model.pth")
+    model.load_state_dict(torch.load(checkpoint_path))
+apply_infer_override(model, [valid_loader, test_loader], parse_infer_override(args.infer_override))
 model.target_dim = target_dim
+eval_reseed = args.seed if bool(config["train"].get("eval_reseed", False)) else None
+point_metric_pairing = bool(config["train"].get("point_metric_pairing", False))
+save_window_metrics = bool(config["train"].get("save_window_metrics", False))
 guide_sweep_metrics = []
 forecast_calibrator = None
 if config["train"].get("forecast_calibrator", False):
@@ -758,6 +789,12 @@ if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
             save_trend_prior=args.save_trend_prior,
             point_estimator=config["train"].get("forecast_point_estimator", "mean"),
             forecast_calibrator=forecast_calibrator,
+            checkpoint=checkpoint_path,
+            reseed=eval_reseed,
+            point_metric_pairing=point_metric_pairing,
+            window_metrics_path=(os.path.join(foldername, "window_metrics_seed%s_%s_w%s.csv" % (args.seed, selection_split, guide_w)) if save_window_metrics else None),
+            seed=args.seed,
+            split_name=selection_split,
         )
         metrics = {**metrics, "selection_split": selection_split}
         guide_sweep_metrics.append(metrics)
@@ -780,6 +817,12 @@ if config["diffusion"]["cfg"] and config["model"].get("guide_mode") != "auto":
             save_trend_prior=args.save_trend_prior,
             point_estimator=config["train"].get("forecast_point_estimator", "mean"),
             forecast_calibrator=forecast_calibrator,
+            checkpoint=checkpoint_path,
+            reseed=eval_reseed,
+            point_metric_pairing=point_metric_pairing,
+            window_metrics_path=(os.path.join(foldername, "window_metrics_seed%s_test_w%s.csv" % (args.seed, best_guide_w)) if save_window_metrics else None),
+            seed=args.seed,
+            split_name="test",
         )
         best_metrics["selected_guide_w"] = best_guide_w
         best_metrics["selection_split"] = selection_split
@@ -797,6 +840,12 @@ else:
             save_trend_prior=args.save_trend_prior,
             point_estimator=config["train"].get("forecast_point_estimator", "mean"),
             forecast_calibrator=forecast_calibrator,
+            checkpoint=checkpoint_path,
+            reseed=eval_reseed,
+            point_metric_pairing=point_metric_pairing,
+            window_metrics_path=(os.path.join(foldername, "window_metrics_seed%s_test.csv" % args.seed) if save_window_metrics else None),
+            seed=args.seed,
+            split_name="test",
         )
     guide_sweep_metrics.append(best_metrics)
 
@@ -812,5 +861,11 @@ write_run_summary(
     },
     metrics=best_metrics,
     guide_sweep=None if config["model"].get("guide_mode") == "auto" else guide_sweep_metrics,
-    extra={"selected_metric": "MSE"},
+    extra={
+        "selected_metric": "MSE",
+        "seed": int(args.seed),
+        "source_decision": source_decision,
+        "control_calls": getattr(model, "control_log", None),
+        "infer_override": parse_infer_override(args.infer_override),
+    },
 )

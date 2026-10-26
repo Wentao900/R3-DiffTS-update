@@ -581,12 +581,15 @@ class SeedLoopTests(unittest.TestCase):
         for domain in ("agriculture", "climate", "economy", "energy", "environment", "health", "socialgood", "traffic"):
             matched = [line for line in commands if "--domain %s" % domain in line]
             self.assertEqual(len(matched), 3)
-        self.assertTrue(all("--config xattn/unified.yaml" in line for line in commands))
+        self.assertTrue(all("--config xattn/" in line and "unified.yaml" not in line for line in commands))
         self.assertTrue(all("--variant A1" in line for line in commands))
+        self.assertTrue(all("ablation/" not in line for line in commands))
+        self.assertIn("--config xattn/agriculture_36_12_xattn.yaml", output)
+        self.assertIn("--config xattn/environment_336_48_xattn.yaml", output)
         for seed in ("2024", "2025", "2026"):
             self.assertTrue(any("--seed %s" % seed in line for line in commands))
         source = Path("exe_forecasting.py").read_text()
-        self.assertIn("unified_output_dir", source)
+        self.assertIn("variant_output_dir", source)
         self.assertIn('foldername = "./save/%s_seed%s/" % (config_stem, args.seed)', source)
 
 

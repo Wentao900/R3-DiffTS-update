@@ -1,7 +1,8 @@
 """Write the per-domain gated cross-attention configs and their ablations.
 
-Those files stay so older runs can be repeated. New runs use
-config/xattn/unified.yaml. This script does not write that file.
+Each dataset keeps config/xattn/<domain>_*_xattn.yaml. New runs apply the
+variant table in utils/xattn_config.py on that file. The Agriculture and
+Traffic files under config/xattn/ablation/ stay so older runs can be repeated.
 """
 
 import math

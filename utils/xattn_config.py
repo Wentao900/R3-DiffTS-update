@@ -88,7 +88,7 @@ def apply_entrypoint_overrides(config, freq="m"):
     return config
 
 
-def unified_output_dir(domain, variant, seed):
+def variant_output_dir(domain, variant, seed):
     """Directory name carries the dataset, the variant, and the seed."""
     return "./save/%s_%s_seed%s/" % (domain, variant, seed)
 
@@ -110,8 +110,41 @@ def resolve_xattn_guide_w(config, guide_w, guide_list=""):
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UNIFIED_CONFIG = ROOT / "config" / "xattn" / "unified.yaml"
 PROTOCOL_SEEDS = ROOT / "config" / "xattn" / "protocol_seeds.yaml"
+
+# One existing xattn YAML per dataset. Ablations do not get their own files.
+# The command line below is fixed by the Time-MMD file and the MCD-TSF short
+# protocol (run.sh): it is not a model hyperparameter.
+DOMAIN_CONFIGS = {
+    "agriculture": "xattn/agriculture_36_12_xattn.yaml",
+    "climate": "xattn/climate_96_12_xattn.yaml",
+    "economy": "xattn/economy_36_12_xattn.yaml",
+    "energy": "xattn/energy_96_12_xattn.yaml",
+    "environment": "xattn/environment_336_48_xattn.yaml",
+    "health": "xattn/health_96_12_xattn.yaml",
+    "socialgood": "xattn/socialgood_36_12_xattn.yaml",
+    "traffic": "xattn/traffic_36_12_xattn.yaml",
+}
+DOMAIN_CLI = {
+    "agriculture": {"data_path": "Agriculture/Agriculture.csv", "seq_len": 36, "pred_len": 12, "freq": "m", "text_len": 36},
+    "climate": {"data_path": "Climate/Climate.csv", "seq_len": 96, "pred_len": 12, "freq": "w", "text_len": 36},
+    "economy": {"data_path": "Economy/Economy.csv", "seq_len": 36, "pred_len": 12, "freq": "m", "text_len": 36},
+    "energy": {"data_path": "Energy/Energy.csv", "seq_len": 96, "pred_len": 12, "freq": "w", "text_len": 36},
+    "environment": {"data_path": "Environment/Environment.csv", "seq_len": 336, "pred_len": 48, "freq": "d", "text_len": 36},
+    "health": {"data_path": "Health_US/Health_US.csv", "seq_len": 96, "pred_len": 12, "freq": "w", "text_len": 36},
+    "socialgood": {"data_path": "SocialGood/SocialGood.csv", "seq_len": 36, "pred_len": 12, "freq": "m", "text_len": 36},
+    "traffic": {"data_path": "Traffic/Traffic.csv", "seq_len": 36, "pred_len": 12, "freq": "m", "text_len": 36},
+}
+DOMAIN_ORDER = (
+    "agriculture",
+    "climate",
+    "economy",
+    "energy",
+    "environment",
+    "health",
+    "socialgood",
+    "traffic",
+)
 
 # Names the shell accepts. E4 and E5 are the plan's names for T2 and T3.
 VARIANT_ALIASES = {
@@ -125,6 +158,48 @@ DOMAIN_ALIASES = {
     "health_us": "health",
     "social_good": "socialgood",
 }
+# Overrides applied on top of that domain's xattn YAML. Keys here are the only
+# difference from A1. E3 does not retrain: it loads the A1 checkpoint and sets
+# an inference override after load_state_dict.
+VARIANT_SPECS = {
+    "A1": {},
+    "T0_numeric_only": {"model": {"text_drop_prob": 1.0}},
+    "T1_router_text": {"model": {
+        "text_injection": "off",
+        "pattern_router_mode": "linear_history_text",
+        "text_validity_gate": False,
+        "text_validity_loss": False,
+        "cfg_output_combine": False,
+    }},
+    "T2_gate_one": {"model": {"text_gate_mode": "one", "text_validity_loss": False}},
+    "T3_gate_constant": {"model": {"text_gate_mode": "constant", "text_validity_loss": False}},
+    "T4a_shuffle_text": {"model": {"shuffle_text_in_batch": True}},
+    "S1_raw_only": {"model": {"use_rag_cot": False}},
+    "S4_cot_source": {"model": {
+        "cot_as_source": True,
+        "n_text_sources": 3,
+        "skip_cot_generation": False,
+    }},
+    "E6_source_only": {"model": {"text_gate_mode": "source_only"}},
+    "E7_cyclic_shift": {"model": {
+        "text_shift_mode": "cyclic_per_source",
+        "text_shift_splits": ["train", "valid", "test"],
+    }},
+    "E8_ext_only": {"model": {"mask_sources": ["raw"]}},
+    "N1_naive": {"model": {"baseline_form": "naive"}},
+    "N1_dlinear": {"model": {"baseline_form": "dlinear"}},
+    "N1_none": {"model": {"baseline_form": "none", "pattern_residual_diffusion": False}},
+    "N2_no_expert_loss": {"train": {"pattern_expert_weight": 0.0}},
+    "N3_no_multires_loss": {"train": {"multi_res_loss_weight": 0.0}},
+    "C1_w1": {},
+    "C1_sweep": {},
+    "E3_w0": {"checkpoint_variant": "A1", "infer_override": "guide_w=0"},
+    "E3_gate_one": {"checkpoint_variant": "A1", "infer_override": "text_gate_mode=one"},
+    "E3_gate_constant": {"checkpoint_variant": "A1", "infer_override": "text_gate_mode=constant"},
+    "E3_cyclic_shift": {"checkpoint_variant": "A1", "infer_override": "text_shift_mode=cyclic_per_source"},
+    "E3_mask_raw": {"checkpoint_variant": "A1", "infer_override": "mask_sources=raw"},
+}
+RESERVED_VARIANT_KEYS = ("checkpoint_variant", "infer_override")
 TRAINING_VARIANTS = (
     "A1",
     "T0_numeric_only",
@@ -144,6 +219,27 @@ TRAINING_VARIANTS = (
     "N3_no_multires_loss",
     "C1_w1",
     "C1_sweep",
+)
+E3_VARIANTS = (
+    "E3_w0",
+    "E3_gate_one",
+    "E3_gate_constant",
+    "E3_cyclic_shift",
+    "E3_mask_raw",
+)
+ALL_VARIANTS = TRAINING_VARIANTS + E3_VARIANTS
+# Agriculture and Traffic still have these files under config/xattn/ablation/.
+YAML_BACKED_VARIANTS = (
+    "T0_numeric_only",
+    "T1_router_text",
+    "T2_gate_one",
+    "T3_gate_constant",
+    "T4a_shuffle_text",
+    "S1_raw_only",
+    "S4_cot_source",
+    "N1_naive",
+    "N1_dlinear",
+    "N1_none",
 )
 
 
@@ -172,84 +268,69 @@ def load_protocol_seeds(path=None):
     return [int(seed) for seed in payload["seeds"]]
 
 
-def load_unified_config(path=None):
-    with open(path or UNIFIED_CONFIG) as handle:
-        return yaml.safe_load(handle)
+def canonical_variant(variant):
+    name = VARIANT_ALIASES.get(str(variant or "A1"), str(variant or "A1"))
+    if name not in VARIANT_SPECS:
+        known = ", ".join(ALL_VARIANTS)
+        raise ValueError("unknown variant %r. Known variants: %s" % (variant, known))
+    return name
 
 
-def resolve_unified_config(config, domain="", variant="A1"):
-    """Flatten one dataset and one overlay.
-
-    A config without a ``domains`` table is returned unchanged, so the
-    per-domain YAMLs keep their old hyperparameters.
-    """
-    if not isinstance(config, dict) or not isinstance(config.get("domains"), dict):
-        if str(domain or "").strip():
-            raise ValueError("--domain is only valid for config/xattn/unified.yaml")
-        return config, None
-    domain_key = _normalize_domain(domain)
-    if not domain_key:
-        known = ", ".join(sorted(config["domains"]))
-        raise ValueError("unified config requires --domain or DOMAIN. Known datasets: %s" % known)
-    if domain_key not in config["domains"]:
-        known = ", ".join(sorted(config["domains"]))
+def domain_cli(domain):
+    key = _normalize_domain(domain)
+    if key not in DOMAIN_CLI:
+        known = ", ".join(DOMAIN_ORDER)
         raise ValueError("unknown domain %r. Known datasets: %s" % (domain, known))
-    variant_key = VARIANT_ALIASES.get(str(variant or "A1"), str(variant or "A1"))
-    variants = config.get("variants") or {}
-    if variant_key not in variants:
-        known = ", ".join(sorted(variants))
-        raise ValueError("unknown variant %r. Known overlays: %s" % (variant, known))
-    spec = variants[variant_key]
+    return key, dict(DOMAIN_CLI[key])
+
+
+def apply_variant(config, variant="A1", domain=""):
+    """Return the domain config with one variant's overrides merged in.
+
+    A1 with an empty domain returns the same object. Every other call copies
+    the config and changes only the keys in ``VARIANT_SPECS``. Dataset
+    hyperparameters stay on the values stored in that domain's YAML.
+    """
+    if not isinstance(config, dict):
+        raise TypeError("config must be a mapping")
+    variant_key = canonical_variant(variant)
+    spec = VARIANT_SPECS[variant_key]
+    domain_key = _normalize_domain(domain) if str(domain or "").strip() else ""
+    if domain_key and domain_key not in DOMAIN_CONFIGS:
+        known = ", ".join(DOMAIN_ORDER)
+        raise ValueError("unknown domain %r. Known datasets: %s" % (domain, known))
+    patch = {key: value for key, value in spec.items() if key not in RESERVED_VARIANT_KEYS}
+    needs_run = bool(domain_key) or bool(patch) or bool(spec.get("checkpoint_variant")) or bool(spec.get("infer_override")) or variant_key != "A1"
+    if not needs_run:
+        return config
     resolved = deepcopy(config)
-    for reserved in ("domains", "variants", "protocol_notes"):
-        resolved.pop(reserved, None)
-    patch = {key: value for key, value in spec.items() if key not in ("checkpoint_variant", "infer_override")}
-    _deep_merge(resolved, patch)
-    domain_spec = config["domains"][domain_key]
-    freq = str(domain_spec["freq"])
-    model_cfg = resolved.setdefault("model", {})
-    model_cfg["season_period"] = int(FREQ_SEASON_PERIOD[freq])
-    model_cfg["cot_cache_dir"] = ".rag_cot_cache/%s" % domain_key
-    resolved.setdefault("dataset", {})["use_all_numeric_features"] = True
+    if patch:
+        _deep_merge(resolved, patch)
     resolved["run"] = {
         "domain": domain_key,
         "variant": variant_key,
         "checkpoint_variant": spec.get("checkpoint_variant"),
         "infer_override": spec.get("infer_override") or "",
     }
-    runtime = {
-        "domain": domain_key,
-        "variant": variant_key,
-        "data_path": domain_spec["data_path"],
-        "seq_len": int(domain_spec["seq_len"]),
-        "pred_len": int(domain_spec["pred_len"]),
-        "freq": freq,
-        "target": str(domain_spec.get("target", "OT")),
-        "text_len": int(model_cfg.get("text_len", 36)),
-        "season_period": int(model_cfg["season_period"]),
-        "documented_numeric_columns": int(domain_spec["documented_numeric_columns"]),
-    }
-    return resolved, runtime
+    return resolved
 
 
-def _variant_group(config, ablation):
+def variant_names(ablation):
     name = str(ablation or "A1")
     if name == "all":
-        return list(TRAINING_VARIANTS) + _variant_group(config, "E3")
+        return list(ALL_VARIANTS)
     if name == "E3":
-        return [
-            key for key, spec in config.get("variants", {}).items()
-            if spec.get("checkpoint_variant")
-        ]
-    return [VARIANT_ALIASES.get(name, name)]
+        return list(E3_VARIANTS)
+    return [canonical_variant(name)]
 
 
-def plan_unified_runs(domain="all", ablation="A1", seeds=None, root_path="../Time-MMD-main", device="cpu", guide_list="0,0.5,1.0,1.5,2.0", nsample=None, config_path="xattn/unified.yaml"):
+def plan_variant_runs(domain="all", ablation="A1", seeds=None, root_path="../Time-MMD-main", device="cpu", guide_list="0,0.5,1.0,1.5,2.0", nsample=None):
     """Argv lists for one variant on the requested datasets and seeds.
 
-    ``seeds`` left empty uses config/xattn/protocol_seeds.yaml.
+    Each command loads that dataset's own xattn YAML. The variant is a
+    ``--variant`` override, not a second config file. ``seeds`` left empty
+    uses config/xattn/protocol_seeds.yaml.
     """
-    payload = load_unified_config()
     if seeds is None or seeds == "" or seeds == []:
         seed_list = load_protocol_seeds()
     elif isinstance(seeds, str):
@@ -257,13 +338,14 @@ def plan_unified_runs(domain="all", ablation="A1", seeds=None, root_path="../Tim
     else:
         seed_list = [int(item) for item in seeds]
     if str(domain) == "all":
-        domains = list(payload["domains"])
+        domains = list(DOMAIN_ORDER)
     else:
-        domains = [_normalize_domain(domain)]
+        domains = [domain_cli(domain)[0]]
     commands = []
-    for variant_name in _variant_group(payload, ablation):
+    for variant_name in variant_names(ablation):
+        spec = VARIANT_SPECS[variant_name]
         for domain_name in domains:
-            resolved, runtime = resolve_unified_config(payload, domain_name, variant_name)
+            cli = DOMAIN_CLI[domain_name]
             for seed in seed_list:
                 guide_w = "1"
                 extra_guide = None
@@ -272,10 +354,15 @@ def plan_unified_runs(domain="all", ablation="A1", seeds=None, root_path="../Tim
                     extra_guide = guide_list
                 argv = [
                     "python3", "-u", "exe_forecasting.py",
-                    "--config", config_path,
-                    "--domain", runtime["domain"],
-                    "--variant", runtime["variant"],
+                    "--config", DOMAIN_CONFIGS[domain_name],
+                    "--domain", domain_name,
+                    "--variant", variant_name,
                     "--root_path", root_path,
+                    "--data_path", cli["data_path"],
+                    "--seq_len", str(cli["seq_len"]),
+                    "--pred_len", str(cli["pred_len"]),
+                    "--freq", cli["freq"],
+                    "--text_len", str(cli["text_len"]),
                     "--device", device,
                     "--num_workers", "0",
                     "--seed", str(seed),
@@ -285,10 +372,10 @@ def plan_unified_runs(domain="all", ablation="A1", seeds=None, root_path="../Tim
                     argv.extend(["--guide_list", extra_guide])
                 if nsample is not None and str(nsample) != "":
                     argv.extend(["--nsample", str(nsample)])
-                checkpoint = resolved["run"].get("checkpoint_variant")
+                checkpoint = spec.get("checkpoint_variant")
                 if checkpoint:
-                    argv.extend(["--modelfolder", "%s_%s_seed%s" % (runtime["domain"], checkpoint, seed)])
-                override = resolved["run"].get("infer_override") or ""
+                    argv.extend(["--modelfolder", "%s_%s_seed%s" % (domain_name, checkpoint, seed)])
+                override = spec.get("infer_override") or ""
                 if override:
                     argv.extend(["--infer_override", override])
                     if override.startswith("guide_w="):

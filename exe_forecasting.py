@@ -12,12 +12,12 @@ from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate, fit_forecast_calibrator
 from utils.infer_override import apply_infer_override, parse_infer_override
-from utils.xattn_config import apply_entrypoint_overrides, resolve_unified_config, resolve_xattn_guide_w, unified_output_dir
+from utils.xattn_config import apply_entrypoint_overrides, apply_variant, domain_cli, resolve_xattn_guide_w, variant_output_dir
 
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
-parser.add_argument("--domain", type=str, default="", help="dataset key in config/xattn/unified.yaml")
-parser.add_argument("--variant", type=str, default="A1", help="overlay name in the unified config")
+parser.add_argument("--domain", type=str, default="", help="dataset name; selects that domain's data path, history length, and horizon")
+parser.add_argument("--variant", type=str, default="A1", help="override applied on the domain YAML; A1 leaves the file unchanged")
 parser.add_argument("--datatype", type=str, default="multimodal")
 parser.add_argument('--device', default='cuda:0', help='Device for Attack')
 parser.add_argument("--seed", type=int, default=2025)
@@ -421,14 +421,15 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
-config, unified_runtime = resolve_unified_config(config, domain=args.domain, variant=args.variant)
-if unified_runtime is not None:
-    args.data_path = unified_runtime["data_path"]
-    args.seq_len = int(unified_runtime["seq_len"])
-    args.pred_len = int(unified_runtime["pred_len"])
-    args.freq = unified_runtime["freq"]
-    args.target = unified_runtime["target"]
-    args.text_len = int(unified_runtime["text_len"])
+config = apply_variant(config, variant=args.variant, domain=args.domain)
+if str(args.domain or "").strip():
+    _domain_key, _domain_cli = domain_cli(args.domain)
+    args.domain = _domain_key
+    args.data_path = _domain_cli["data_path"]
+    args.seq_len = int(_domain_cli["seq_len"])
+    args.pred_len = int(_domain_cli["pred_len"])
+    args.freq = _domain_cli["freq"]
+    args.text_len = int(_domain_cli["text_len"])
 # Legacy configs keep the forced text/timestep switches. xattn configs opt out.
 apply_entrypoint_overrides(config, freq=args.freq)
 args.guide_w = resolve_xattn_guide_w(config, args.guide_w, args.guide_list)
@@ -669,7 +670,7 @@ if int(args.nsample) < 0:
 current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 run_meta = config.get("run") or {}
 if bool(config.get("train", {}).get("named_output_dir", False)) and run_meta.get("domain") and run_meta.get("variant"):
-    foldername = unified_output_dir(run_meta["domain"], run_meta["variant"], args.seed)
+    foldername = variant_output_dir(run_meta["domain"], run_meta["variant"], args.seed)
 elif bool(config.get("train", {}).get("named_output_dir", False)):
     config_stem = os.path.splitext(os.path.basename(args.config))[0]
     foldername = "./save/%s_seed%s/" % (config_stem, args.seed)

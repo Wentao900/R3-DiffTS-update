@@ -42,6 +42,11 @@ train:
   pattern_expert_weight: 0.05
   valid_loss_main_only: true
   deterministic_valid: true
+  eval_reseed: true
+  save_window_metrics: true
+  point_metric_pairing: true
+  valid_t_schedule: all
+  named_output_dir: true
   forecast_calibrator: false
 diffusion:
   layers: 6
@@ -64,6 +69,9 @@ diffusion:
   sampler_fix: true
   tower_dropout: 0.0
   estimable_window_norm: true
+  time_attn_dropout: 0.1
+  ddim_x0_endpoint: true
+  ddim_unique_steps: true
 model:
   cot_model: ./gpt2-medium
   cot_temperature: 0.2
@@ -142,6 +150,16 @@ model:
   idf_fit_train_only: true
   text_encoder_eval: true
   text_placeholder_absent: true
+  ext_text_mode: time_aligned
+  ext_future_year_filter: true
+  raw_placeholder_filter: true
+  text_sources: auto_from_train
+  gate_beta: auto_identifiable
+  text_shift_mode: none
+  gate_constant_source: last_epoch
+  gate_ref_shared_dropout: true
+  rag_query_unaugmented: true
+  log_control_calls: true
 dataset:
   use_all_numeric_features: true
   aug_noise_std: 0.01

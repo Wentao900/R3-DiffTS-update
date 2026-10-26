@@ -51,6 +51,16 @@ def apply_entrypoint_overrides(config, freq="m"):
     model_cfg["idf_fit_train_only"] = bool(model_cfg.get("idf_fit_train_only", False))
     model_cfg["text_encoder_eval"] = bool(model_cfg.get("text_encoder_eval", False))
     model_cfg["text_placeholder_absent"] = bool(model_cfg.get("text_placeholder_absent", False))
+    model_cfg["ext_text_mode"] = str(model_cfg.get("ext_text_mode", "tfidf")).lower()
+    model_cfg["ext_future_year_filter"] = bool(model_cfg.get("ext_future_year_filter", False))
+    model_cfg["raw_placeholder_filter"] = bool(model_cfg.get("raw_placeholder_filter", False))
+    model_cfg["text_sources"] = str(model_cfg.get("text_sources", "configured")).lower()
+    model_cfg["gate_beta"] = str(model_cfg.get("gate_beta", "all")).lower()
+    model_cfg["text_shift_mode"] = str(model_cfg.get("text_shift_mode", "none")).lower()
+    model_cfg["gate_constant_source"] = str(model_cfg.get("gate_constant_source", "cumulative")).lower()
+    model_cfg["gate_ref_shared_dropout"] = bool(model_cfg.get("gate_ref_shared_dropout", False))
+    model_cfg["rag_query_unaugmented"] = bool(model_cfg.get("rag_query_unaugmented", False))
+    model_cfg["log_control_calls"] = bool(model_cfg.get("log_control_calls", False))
 
     diffusion_cfg = config.setdefault("diffusion", {})
     diffusion_cfg["mask_noisy_target"] = bool(diffusion_cfg.get("mask_noisy_target", False))
@@ -58,10 +68,18 @@ def apply_entrypoint_overrides(config, freq="m"):
     train_cfg = config.setdefault("train", {})
     train_cfg["valid_loss_main_only"] = bool(train_cfg.get("valid_loss_main_only", False))
     train_cfg["deterministic_valid"] = bool(train_cfg.get("deterministic_valid", False))
+    train_cfg["eval_reseed"] = bool(train_cfg.get("eval_reseed", False))
+    train_cfg["save_window_metrics"] = bool(train_cfg.get("save_window_metrics", False))
+    train_cfg["point_metric_pairing"] = bool(train_cfg.get("point_metric_pairing", False))
+    train_cfg["valid_t_schedule"] = str(train_cfg.get("valid_t_schedule", "all")).lower()
+    train_cfg["named_output_dir"] = bool(train_cfg.get("named_output_dir", False))
     if model_cfg["baseline_form"] == "none":
         model_cfg["pattern_residual_diffusion"] = False
     diffusion_cfg["sampler_fix"] = bool(diffusion_cfg.get("sampler_fix", False))
     diffusion_cfg["estimable_window_norm"] = bool(diffusion_cfg.get("estimable_window_norm", False))
+    diffusion_cfg["time_attn_dropout"] = float(diffusion_cfg.get("time_attn_dropout", 0.1))
+    diffusion_cfg["ddim_x0_endpoint"] = bool(diffusion_cfg.get("ddim_x0_endpoint", False))
+    diffusion_cfg["ddim_unique_steps"] = bool(diffusion_cfg.get("ddim_unique_steps", False))
     return config
 
 

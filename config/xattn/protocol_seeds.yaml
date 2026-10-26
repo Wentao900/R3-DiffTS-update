@@ -1,0 +1,12 @@
+# Six seeds for the paired sign test in 最优方案 R4.
+# n_min = 6 because 2 * 0.5^6 = 0.03125 <= 0.05, while n = 5 gives 0.0625.
+# The values are exe_forecasting.py's existing default seed 2025 and the next five integers.
+alpha: 0.05
+n_min: 6
+seeds:
+  - 2025
+  - 2026
+  - 2027
+  - 2028
+  - 2029
+  - 2030

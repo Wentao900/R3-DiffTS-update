@@ -55,6 +55,12 @@ def apply_a1(config, season_period, pred_len):
         "uncertainty_forecast_weight": 0.0,
         "valid_loss_main_only": True,
         "deterministic_valid": True,
+        "eval_reseed": True,
+        "save_window_metrics": True,
+        "point_metric_pairing": True,
+        # C14 is optional and stays off. "all" keeps selection on every diffusion index.
+        "valid_t_schedule": "all",
+        "named_output_dir": True,
         "forecast_calibrator": False,
     })
     diffusion = config.setdefault("diffusion", {})
@@ -64,6 +70,10 @@ def apply_a1(config, season_period, pred_len):
     # passes identical. Legacy configs omit the key and stay at 0.1.
     diffusion["tower_dropout"] = 0.0
     diffusion["estimable_window_norm"] = True
+    # 0.1 is the historical FullAttention default, now a config value. C7.
+    diffusion["time_attn_dropout"] = 0.1
+    diffusion["ddim_x0_endpoint"] = True
+    diffusion["ddim_unique_steps"] = True
     model = config.setdefault("model", {})
     model.update({
         "force_legacy_entrypoint": False,
@@ -103,6 +113,17 @@ def apply_a1(config, season_period, pred_len):
         "idf_fit_train_only": True,
         "text_encoder_eval": True,
         "text_placeholder_absent": True,
+        "ext_text_mode": "time_aligned",
+        "ext_future_year_filter": True,
+        "raw_placeholder_filter": True,
+        "text_sources": "auto_from_train",
+        "gate_beta": "auto_identifiable",
+        # C5 cyclic shift is the E3/E7 control, not the main method, so A1 leaves it off.
+        "text_shift_mode": "none",
+        "gate_constant_source": "last_epoch",
+        "gate_ref_shared_dropout": True,
+        "rag_query_unaugmented": True,
+        "log_control_calls": True,
     })
     config.setdefault("dataset", {})["text_features_mode"] = "none"
     return config
